@@ -8,6 +8,7 @@ members = [
     "crates/dsl-kit-mcp",
     "examples/flow-example",
     "examples/expr-example",
+    "examples/custom-mcp-example",
 ]
 
 [workspace.package]

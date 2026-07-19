@@ -1,0 +1,23 @@
+[package]
+name = "custom-mcp-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Demonstrates the dsl-kit-mcp builder: a light MCP framework with fn-reflection tools and opt-in dsl-kit DSL bodies."
+
+[[bin]]
+name = "custom-mcp-example"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-mcp  = { workspace = true }
+dsl-kit-flow = { workspace = true }
+rmcp         = { version = "0.16", features = ["server", "transport-io"] }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde        = { version = "1", features = ["derive"] }
+schemars     = "0.8"
+anyhow       = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

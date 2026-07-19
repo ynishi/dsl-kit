@@ -9,10 +9,12 @@
 //! wraps the `dsl-kit-flow` reference DSL; the default binary shipped
 //! with the crate serves that host.
 
+pub mod builder;
 pub mod flow_host;
 pub mod handler;
 pub mod host;
 
+pub use builder::{DslMcpBuilder, DslMcpServer, ToolCtx};
 pub use flow_host::FlowHost;
 pub use handler::DslMcpHandler;
 pub use host::{
