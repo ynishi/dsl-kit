@@ -1,0 +1,6 @@
+[package]
+name = "dsl-kit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Engine primitives for dsl-kit: node ID, call frame, stepper, event stream."

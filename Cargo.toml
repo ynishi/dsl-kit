@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dsl-kit-core",
+    "crates/dsl-kit-macros",
+    "crates/dsl-kit",
+    "examples/flow",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+dsl-kit-core   = { path = "crates/dsl-kit-core",   version = "0.0.0" }
+dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.0.0" }
+dsl-kit        = { path = "crates/dsl-kit",        version = "0.0.0" }

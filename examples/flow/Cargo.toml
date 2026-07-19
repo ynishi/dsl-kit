@@ -1,0 +1,10 @@
+[package]
+name = "flow-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-core = { workspace = true }

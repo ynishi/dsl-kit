@@ -1,0 +1,10 @@
+[package]
+name = "dsl-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An engine kit for building small, AI-native DSLs in Rust."
+
+[dependencies]
+dsl-kit-core   = { workspace = true }
+dsl-kit-macros = { workspace = true }
