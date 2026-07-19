@@ -26,37 +26,95 @@ use syn::{
 
 #[derive(Clone, Copy)]
 enum Recursion {
+    /// `T`
     Direct,
+    /// `Box<T>`
     Boxed,
+    /// `Option<T>`
     Optional,
+    /// `Option<Box<T>>`
+    OptionalBoxed,
+    /// `Vec<T>`
     Many,
+    /// `Vec<Box<T>>`
+    ManyBoxed,
 }
 
-fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
+/// Returns the last path segment of a `Type::Path`, if that's what `ty` is.
+fn last_segment<'a>(ty: &'a Type) -> Option<&'a syn::PathSegment> {
     let Type::Path(TypePath { path, .. }) = ty else {
         return None;
     };
-    let last = path.segments.last()?;
-    if last.ident == *enum_name && matches!(last.arguments, PathArguments::None) {
-        return Some(Recursion::Direct);
-    }
-    let PathArguments::AngleBracketed(args) = &last.arguments else {
+    path.segments.last()
+}
+
+/// If `seg` is `Wrapper<Inner>` (single generic type argument), returns
+/// `Inner`.
+fn single_generic_type(seg: &syn::PathSegment) -> Option<&Type> {
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
         return None;
     };
     let GenericArgument::Type(inner) = args.args.first()? else {
         return None;
     };
-    let Type::Path(TypePath { path: inner_path, .. }) = inner else {
-        return None;
-    };
-    let inner_last = inner_path.segments.last()?;
-    if inner_last.ident != *enum_name {
-        return None;
+    Some(inner)
+}
+
+/// Returns true if `ty` is a `Type::Path` whose last segment matches
+/// `enum_name` and carries no generic arguments.
+fn matches_enum(ty: &Type, enum_name: &Ident) -> bool {
+    match last_segment(ty) {
+        Some(seg) => seg.ident == *enum_name && matches!(seg.arguments, PathArguments::None),
+        None => false,
     }
-    match last.ident.to_string().as_str() {
-        "Box" => Some(Recursion::Boxed),
-        "Option" => Some(Recursion::Optional),
-        "Vec" => Some(Recursion::Many),
+}
+
+fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
+    if matches_enum(ty, enum_name) {
+        return Some(Recursion::Direct);
+    }
+
+    let seg = last_segment(ty)?;
+    let inner = single_generic_type(seg)?;
+
+    match seg.ident.to_string().as_str() {
+        "Box" => {
+            if matches_enum(inner, enum_name) {
+                Some(Recursion::Boxed)
+            } else {
+                None
+            }
+        }
+        "Option" => {
+            if matches_enum(inner, enum_name) {
+                Some(Recursion::Optional)
+            } else if let Some(inner_seg) = last_segment(inner) {
+                if inner_seg.ident == "Box" {
+                    let inner_inner = single_generic_type(inner_seg)?;
+                    if matches_enum(inner_inner, enum_name) {
+                        return Some(Recursion::OptionalBoxed);
+                    }
+                }
+                None
+            } else {
+                None
+            }
+        }
+        "Vec" => {
+            if matches_enum(inner, enum_name) {
+                Some(Recursion::Many)
+            } else if let Some(inner_seg) = last_segment(inner) {
+                if inner_seg.ident == "Box" {
+                    let inner_inner = single_generic_type(inner_seg)?;
+                    if matches_enum(inner_inner, enum_name) {
+                        return Some(Recursion::ManyBoxed);
+                    }
+                }
+                None
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -131,7 +189,13 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             Recursion::Optional => quote! {
                 if let Some(inner) = #field_ident.as_ref() { _v.push(inner); }
             },
+            Recursion::OptionalBoxed => quote! {
+                if let Some(inner) = #field_ident.as_deref() { _v.push(inner); }
+            },
             Recursion::Many => quote! { _v.extend(#field_ident.iter()); },
+            Recursion::ManyBoxed => quote! {
+                _v.extend(#field_ident.iter().map(::std::convert::AsRef::as_ref));
+            },
         });
         let field_binds = recursive.iter().map(|(id, _)| quote!(#id));
         child_arms.push(quote! {
@@ -149,7 +213,13 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             Recursion::Optional => quote! {
                 if let Some(inner) = #field_ident.as_mut() { _v.push(inner); }
             },
+            Recursion::OptionalBoxed => quote! {
+                if let Some(inner) = #field_ident.as_deref_mut() { _v.push(inner); }
+            },
             Recursion::Many => quote! { _v.extend(#field_ident.iter_mut()); },
+            Recursion::ManyBoxed => quote! {
+                _v.extend(#field_ident.iter_mut().map(::std::convert::AsMut::as_mut));
+            },
         });
         let field_binds_mut = recursive.iter().map(|(id, _)| quote!(#id));
         child_mut_arms.push(quote! {

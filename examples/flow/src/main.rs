@@ -12,7 +12,7 @@
 //! 4. The `EngineError` type carries a full `NodeContext`, so a failure
 //!    is enough to locate the offending node.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use dsl_kit::{
@@ -48,7 +48,7 @@ fn pretty(flow: &Flow) -> String {
             for _ in 0..depth {
                 out.push_str("  ");
             }
-            let _ = writeln!(out, "{} {}", node.node_id(), variant_name(node));
+            let _ = writeln!(out, "{} {}", node.node_id(), summary(node));
             depth += 1;
         }
         Phase::Post => {
@@ -58,13 +58,13 @@ fn pretty(flow: &Flow) -> String {
     out
 }
 
-fn variant_name(flow: &Flow) -> &'static str {
+fn summary(flow: &Flow) -> String {
     match flow {
-        Flow::Seq { .. } => "Seq",
-        Flow::Par { .. } => "Par",
-        Flow::Call { .. } => "Call",
-        Flow::Scope { .. } => "Scope",
-        Flow::Maybe { .. } => "Maybe",
+        Flow::Seq { .. } => "Seq".into(),
+        Flow::Par { .. } => "Par".into(),
+        Flow::Call { label, .. } => format!("Call {label:?}"),
+        Flow::Scope { label, .. } => format!("Scope {label:?}"),
+        Flow::Maybe { .. } => "Maybe".into(),
     }
 }
 
@@ -97,9 +97,10 @@ fn check_unique_ids(flow: &Flow) -> EngineResult<()> {
 
 struct FlowStepper<'a> {
     stack: Vec<Frame<'a>>,
-    events: PrintSink,
+    events: CountingSink,
     next_frame: u64,
     suspend_pending: bool,
+    results: HashMap<NodeId, String>,
 }
 
 struct Frame<'a> {
@@ -121,11 +122,47 @@ enum FrameState<'a> {
     CallDone,
 }
 
-struct PrintSink;
+/// Silent sink that keeps a small histogram of event kinds; useful when
+/// the demo wants to summarise "how much happened" without spelling out
+/// every step.
+#[derive(Default)]
+struct CountingSink {
+    visit_pre: u32,
+    visit_post: u32,
+    frame_enter: u32,
+    frame_leave: u32,
+    iteration_tick: u32,
+    suspend: u32,
+    resume: u32,
+}
 
-impl EventSink for PrintSink {
+impl EventSink for CountingSink {
     fn emit(&mut self, event: &Event) {
-        println!("{event:?}");
+        match event {
+            Event::VisitPre { .. } => self.visit_pre += 1,
+            Event::VisitPost { .. } => self.visit_post += 1,
+            Event::FrameEnter { .. } => self.frame_enter += 1,
+            Event::FrameLeave { .. } => self.frame_leave += 1,
+            Event::IterationTick { .. } => self.iteration_tick += 1,
+            Event::Suspend { .. } => self.suspend += 1,
+            Event::Resume { .. } => self.resume += 1,
+            _ => {}
+        }
+    }
+}
+
+impl CountingSink {
+    fn summarise(&self) -> String {
+        format!(
+            "pre={} post={} frame_enter={} frame_leave={} iter={} suspend={} resume={}",
+            self.visit_pre,
+            self.visit_post,
+            self.frame_enter,
+            self.frame_leave,
+            self.iteration_tick,
+            self.suspend,
+            self.resume,
+        )
     }
 }
 
@@ -134,9 +171,10 @@ impl<'a> FlowStepper<'a> {
         let path = Path::root().push(root.node_id());
         Self {
             stack: vec![Frame { node: root, path, state: FrameState::Enter, frame_id: None }],
-            events: PrintSink,
+            events: CountingSink::default(),
             next_frame: 1,
             suspend_pending: false,
+            results: HashMap::new(),
         }
     }
 
@@ -148,6 +186,33 @@ impl<'a> FlowStepper<'a> {
             depth: self.stack.len() as u32,
             iteration: None,
         }
+    }
+
+    /// Returns the `(id, label)` of the `Call` node that suspended the
+    /// stepper, if the stepper is currently suspended on a call.
+    fn suspended_call(&self) -> Option<(NodeId, &str)> {
+        let frame = self.stack.last()?;
+        if !matches!(frame.state, FrameState::CallSuspending) {
+            return None;
+        }
+        match frame.node {
+            Flow::Call { id, label } => Some((*id, label.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Records the result the host produced while the stepper was
+    /// suspended.
+    fn record_result(&mut self, id: NodeId, result: String) {
+        self.results.insert(id, result);
+    }
+
+    fn into_results(self) -> HashMap<NodeId, String> {
+        self.results
+    }
+
+    fn event_summary(&self) -> String {
+        self.events.summarise()
     }
 }
 
@@ -187,16 +252,14 @@ impl<'a> Stepper for FlowStepper<'a> {
                         ctx.depth = depth_before;
                         self.events.emit(&Event::FrameEnter { at: ctx });
                     }
-                    Flow::Scope { body, label, .. } => {
-                        println!("<scope> {label}");
+                    Flow::Scope { body, .. } => {
                         frame.state = FrameState::ScopePending { body: body.as_ref() };
                     }
                     Flow::Maybe { body, .. } => {
                         frame.state =
                             FrameState::MaybePending { body: body.as_deref() };
                     }
-                    Flow::Call { label, .. } => {
-                        println!("<call> {label}");
+                    Flow::Call { .. } => {
                         frame.state = FrameState::CallSuspending;
                         self.suspend_pending = true;
                         self.events.emit(&Event::Suspend {
@@ -306,62 +369,117 @@ impl<'a> Stepper for FlowStepper<'a> {
     }
 }
 
-// ---------- Demo ---------------------------------------------------------
+// ---------- Effect resolver ---------------------------------------------
 
-fn build_program(ids: &IdGen) -> Flow {
+/// Canned responses keyed by call label.
+///
+/// A real host would forward each call to an LLM, a tool, or an MCP
+/// server. Here we return prewritten strings so the demo runs offline.
+fn canned_response(label: &str) -> String {
+    match label {
+        "fetch_query" => "How does miette structure diagnostics?".into(),
+        "search_arxiv" => "arxiv: 3 papers on structured diagnostics".into(),
+        "search_github" => "github: miette (rust-lang), ariadne, codespan-reporting".into(),
+        "search_web" => "web: rust blog posts, docs.rs entries".into(),
+        "synthesise" => {
+            "miette layers a Diagnostic trait over thiserror errors, adding code / severity / labels."
+                .into()
+        }
+        "citation_check" => "citations: 3 sources cross-verified".into(),
+        "write_report" => "report: 380 words, 3 citations, ready".into(),
+        other => format!("<no handler for {other}>"),
+    }
+}
+
+// ---------- Demo pipeline -----------------------------------------------
+
+/// Builds a small research pipeline expressed in the flow DSL.
+///
+/// The shape is:
+///
+/// ```text
+/// Seq(
+///     Call "fetch_query",
+///     Scope "web_research" {
+///         Par(
+///             Call "search_arxiv",
+///             Call "search_github",
+///             Call "search_web",
+///         )
+///     },
+///     Call "synthesise",
+///     Maybe(
+///         Call "citation_check",
+///     ),
+///     Call "write_report",
+/// )
+/// ```
+fn research_pipeline(ids: &IdGen) -> Flow {
     Flow::Seq {
         id: ids.node(),
         children: vec![
-            Flow::Call { id: ids.node(), label: "greet".into() },
+            Flow::Call { id: ids.node(), label: "fetch_query".into() },
             Flow::Scope {
                 id: ids.node(),
-                label: "research".into(),
+                label: "web_research".into(),
                 body: Box::new(Flow::Par {
                     id: ids.node(),
                     children: vec![
-                        Flow::Call { id: ids.node(), label: "search".into() },
-                        Flow::Call { id: ids.node(), label: "summarise".into() },
+                        Flow::Call { id: ids.node(), label: "search_arxiv".into() },
+                        Flow::Call { id: ids.node(), label: "search_github".into() },
+                        Flow::Call { id: ids.node(), label: "search_web".into() },
                     ],
                 }),
             },
+            Flow::Call { id: ids.node(), label: "synthesise".into() },
             Flow::Maybe {
                 id: ids.node(),
-                body: Some(Box::new(Flow::Call { id: ids.node(), label: "review".into() })),
+                body: Some(Box::new(Flow::Call {
+                    id: ids.node(),
+                    label: "citation_check".into(),
+                })),
             },
+            Flow::Call { id: ids.node(), label: "write_report".into() },
         ],
     }
 }
 
 fn main() -> miette::Result<()> {
     let ids = IdGen::new();
-    let program = build_program(&ids);
+    let program = research_pipeline(&ids);
 
-    println!("--- AST ---");
+    println!("=== Research pipeline: AST ===");
     print!("{}", pretty(&program));
 
     check_unique_ids(&program)?;
 
-    println!("\n--- Nodes located by ID ---");
-    if let Some(node) = program.find_by_id(NodeId(4)) {
-        println!("find_by_id({}) = {}", NodeId(4), variant_name(node));
-    }
-
-    println!("\n--- Stepped execution ---");
+    println!("\n=== Running the pipeline ===");
     let mut stepper = FlowStepper::new(&program);
     loop {
         match stepper.run_to_yield()? {
             StepOutcome::Advanced => {}
-            StepOutcome::Suspended(reason) => {
-                println!("<host> resolving effect ({reason})");
+            StepOutcome::Suspended(_) => {
+                if let Some((id, label)) = stepper.suspended_call() {
+                    let response = canned_response(label);
+                    println!("  {id:>4} {label:<15} -> {response}");
+                    stepper.record_result(id, response);
+                }
             }
-            StepOutcome::Done(()) => {
-                println!("<done>");
-                break;
-            }
+            StepOutcome::Done(()) => break,
         }
     }
 
-    println!("\n--- Error rendering ---");
+    println!("\n=== Event summary ===");
+    println!("  {}", stepper.event_summary());
+
+    println!("\n=== Recorded results ===");
+    let mut results: Vec<(NodeId, String)> = stepper.into_results().into_iter().collect();
+    results.sort_by_key(|(id, _)| id.0);
+    for (id, text) in &results {
+        println!("  {id}: {text}");
+    }
+
+    println!("\n=== Error rendering (malformed AST) ===");
     let broken = Flow::Seq {
         id: NodeId(100),
         children: vec![
