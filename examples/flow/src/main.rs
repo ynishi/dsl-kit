@@ -16,8 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use dsl_kit::{
-    CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, IdGen, Iteration, NodeContext,
-    NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
+    BreakCondition, BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event,
+    EventSink, IdGen, Iteration, NodeContext, NodeId, Path, Phase, StepOutcome, Stepper,
+    SuspendReason, Walk,
 };
 
 #[derive(Debug, DslNode)]
@@ -354,7 +355,10 @@ impl<'a> Stepper for FlowStepper<'a> {
             FrameState::CallSuspending => {
                 if self.suspend_pending {
                     self.suspend_pending = false;
-                    return Ok(StepOutcome::Suspended(SuspendReason::AwaitEffect));
+                    return Ok(StepOutcome::Suspended {
+                        reason: SuspendReason::AwaitEffect,
+                        at: ctx,
+                    });
                 }
                 self.events.emit(&Event::Resume { at: ctx });
                 frame.state = FrameState::CallDone;
@@ -444,6 +448,70 @@ fn research_pipeline(ids: &IdGen) -> Flow {
     }
 }
 
+/// Illustrates the breakpoint condition surface by walking the AST once
+/// and reporting which nodes each condition matches.
+///
+/// A real host would keep a `BreakpointSet` alive across a debug session
+/// and consult it inside the stepper's suspend logic; this demo runs
+/// them off-line so the output stays focused on the matching rules.
+fn demonstrate_breakpoints(program: &Flow) {
+    let mut set = BreakpointSet::new();
+    let by_id = set.add(BreakCondition::at_node(NodeId(4)));
+    let deep = set.add(BreakCondition::at_depth_at_least(4));
+    let inside_research = set.add(BreakCondition::under_path(
+        Path::root().push(NodeId(0)).push(NodeId(2)),
+    ));
+    let combined = set.add(
+        BreakCondition::at_depth_at_least(3).and(BreakCondition::at_iteration(2)),
+    );
+
+    println!("  registered:");
+    println!("    {by_id}: at node n4");
+    println!("    {deep}: depth >= 4");
+    println!("    {inside_research}: under path /n0/n2");
+    println!("    {combined}: depth >= 3 AND iteration == 2");
+
+    // Walk the tree, synthesising a NodeContext per node and printing any
+    // breakpoint hits. Real steppers would emit these from their event
+    // loop; the demo builds them by hand so the code is shorter.
+    fn walk(
+        node: &Flow,
+        path: &Path,
+        depth: u32,
+        set: &BreakpointSet,
+        hits: &mut Vec<(NodeId, Vec<dsl_kit::BreakpointId>)>,
+    ) {
+        let ctx = NodeContext {
+            node: node.node_id(),
+            path: path.clone(),
+            frame: None,
+            depth,
+            iteration: None,
+        };
+        let m = set.matches(&ctx);
+        if !m.is_empty() {
+            hits.push((node.node_id(), m));
+        }
+        for child in node.children() {
+            let child_path = path.push(child.node_id());
+            walk(child, &child_path, depth + 1, set, hits);
+        }
+    }
+
+    let mut hits = Vec::new();
+    let root_path = Path::root().push(program.node_id());
+    walk(program, &root_path, 1, &set, &mut hits);
+
+    println!("  hits:");
+    for (node, ids) in &hits {
+        let names: Vec<String> = ids.iter().map(ToString::to_string).collect();
+        println!("    {node}: {}", names.join(", "));
+    }
+    if hits.is_empty() {
+        println!("    (none)");
+    }
+}
+
 fn main() -> miette::Result<()> {
     let ids = IdGen::new();
     let program = research_pipeline(&ids);
@@ -458,10 +526,10 @@ fn main() -> miette::Result<()> {
     loop {
         match stepper.run_to_yield()? {
             StepOutcome::Advanced => {}
-            StepOutcome::Suspended(_) => {
+            StepOutcome::Suspended { reason: _, at } => {
                 if let Some((id, label)) = stepper.suspended_call() {
                     let response = canned_response(label);
-                    println!("  {id:>4} {label:<15} -> {response}");
+                    println!("  {id:>4} {label:<15} -> {response}   ({at})");
                     stepper.record_result(id, response);
                 }
             }
@@ -478,6 +546,9 @@ fn main() -> miette::Result<()> {
     for (id, text) in &results {
         println!("  {id}: {text}");
     }
+
+    println!("\n=== Breakpoints ===");
+    demonstrate_breakpoints(&program);
 
     println!("\n=== Error rendering (malformed AST) ===");
     let broken = Flow::Seq {

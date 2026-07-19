@@ -114,7 +114,7 @@ impl IdGen {
 /// now?" — enough for a debugger UI to jump to the node, for an error
 /// message to point at the source, and for a replay recorder to reconstruct
 /// the state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeContext {
     pub node: NodeId,
     pub path: Path,
@@ -285,8 +285,13 @@ pub type EngineResult<T> = Result<T, EngineError>;
 pub enum StepOutcome<V> {
     /// The stepper advanced one node and is ready to be stepped again.
     Advanced,
-    /// The stepper yielded and is waiting to be resumed.
-    Suspended(SuspendReason),
+    /// The stepper yielded and is waiting to be resumed. The `at` field
+    /// pinpoints where the suspension happened so hosts can resolve
+    /// effects without asking the stepper for extra state.
+    Suspended {
+        reason: SuspendReason,
+        at: NodeContext,
+    },
     /// Evaluation completed with a value.
     Done(V),
 }
@@ -295,8 +300,8 @@ pub enum StepOutcome<V> {
 ///
 /// Implementors are typically produced by an interpreter over a specific
 /// DSL. The trait is deliberately synchronous at its surface: async effects
-/// appear as `Suspended(AwaitEffect)` yields and the host drives the effect
-/// externally before resuming.
+/// appear as `Suspended { reason: AwaitEffect, .. }` yields and the host
+/// drives the effect externally before resuming.
 pub trait Stepper {
     type Value;
     type Error;
@@ -315,6 +320,78 @@ pub trait Stepper {
     }
 }
 
+/// Async counterpart of [`Stepper`].
+///
+/// Implementors let the visit code await external work (network calls,
+/// tool invocations, MCP round-trips) inside the semantics rather than
+/// externalising them through suspend / resume. When the sync surface is
+/// enough — which it usually is — prefer [`Stepper`]: it composes better
+/// with debuggers and with the [`drive_async`] helper below.
+pub trait AsyncStepper {
+    type Value;
+    type Error;
+
+    /// Runs the next node's semantics, awaiting any effect the semantics
+    /// wants to perform inline.
+    fn step_async(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<StepOutcome<Self::Value>, Self::Error>>;
+
+    /// Drives async steps until completion, suspension, or error.
+    fn run_to_yield_async(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<StepOutcome<Self::Value>, Self::Error>>
+    {
+        async {
+            loop {
+                match self.step_async().await? {
+                    StepOutcome::Advanced => continue,
+                    other => return Ok(other),
+                }
+            }
+        }
+    }
+}
+
+/// Host-side callback invoked whenever a stepper yields with
+/// [`SuspendReason::AwaitEffect`].
+///
+/// The resolver performs the external effect and, on success, is expected
+/// to have arranged for the stepper's state to be updated before returning
+/// (typically via a channel, a shared map, or a method on the concrete
+/// stepper type).
+pub trait EffectResolver {
+    type Error;
+
+    fn resolve(
+        &mut self,
+        at: &NodeContext,
+        reason: &SuspendReason,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+}
+
+/// Drives an [`AsyncStepper`] to completion, handing each `AwaitEffect`
+/// suspension to a resolver.
+///
+/// Breakpoint suspensions are passed to the resolver too; a resolver that
+/// wants to distinguish them can inspect `reason` and short-circuit.
+pub async fn drive_async<S, R>(stepper: &mut S, resolver: &mut R) -> Result<S::Value, S::Error>
+where
+    S: AsyncStepper,
+    R: EffectResolver,
+    R::Error: Into<S::Error>,
+{
+    loop {
+        match stepper.step_async().await? {
+            StepOutcome::Advanced => continue,
+            StepOutcome::Suspended { reason, at } => {
+                resolver.resolve(&at, &reason).await.map_err(Into::into)?;
+            }
+            StepOutcome::Done(v) => return Ok(v),
+        }
+    }
+}
+
 /// Marker trait for AST enums recognised by the kit.
 ///
 /// The derive macro in `dsl-kit-macros` implements this trait automatically;
@@ -322,6 +399,230 @@ pub trait Stepper {
 pub trait DslNode {
     /// Returns the stable ID assigned to this node.
     fn node_id(&self) -> NodeId;
+}
+
+// ---------- Breakpoints --------------------------------------------------
+
+/// Identifier assigned by a [`BreakpointSet`] to each added condition.
+///
+/// Callers keep the id so they can later remove or disable the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BreakpointId(pub u64);
+
+impl fmt::Display for BreakpointId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bp{}", self.0)
+    }
+}
+
+/// A boolean predicate over [`NodeContext`] used to describe conditional
+/// breakpoints.
+///
+/// Conditions can be combined with [`and`](Self::and), [`or`](Self::or),
+/// and [`not`](Self::not); the composed tree is evaluated against each
+/// context the stepper produces. Because the underlying data
+/// (`NodeId` / `Path` / `depth` / `iteration` / call frame) is uniform
+/// across every DSL built with the kit, an agent can synthesise a
+/// condition purely from the observable event stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakCondition {
+    /// Matches when the node ID is exactly `id`.
+    Node(NodeId),
+    /// Matches when the current path has the given prefix.
+    PathPrefix(Path),
+    /// Matches when the current path equals the given path exactly.
+    PathExact(Path),
+    /// Matches when the current call-frame depth is at least `n`.
+    DepthAtLeast(u32),
+    /// Matches when the current call-frame depth is at most `n`.
+    DepthAtMost(u32),
+    /// Matches when the current call-frame depth equals `n` exactly.
+    DepthEquals(u32),
+    /// Matches when the iteration counter equals `n`. Nodes without an
+    /// active iteration never match this variant.
+    Iteration(u64),
+    /// Matches when the current call frame equals `frame`.
+    CallFrame(CallFrameId),
+    /// Matches when any child matches.
+    Any(Vec<BreakCondition>),
+    /// Matches when every child matches.
+    All(Vec<BreakCondition>),
+    /// Matches when the inner does not match.
+    Not(Box<BreakCondition>),
+    /// Always matches (useful as a debugger's "break on every node" mode).
+    Always,
+    /// Never matches (useful as a disabled placeholder).
+    Never,
+}
+
+impl BreakCondition {
+    /// Convenience constructor.
+    pub fn at_node(id: NodeId) -> Self {
+        Self::Node(id)
+    }
+
+    /// Convenience constructor.
+    pub fn under_path(path: Path) -> Self {
+        Self::PathPrefix(path)
+    }
+
+    /// Convenience constructor.
+    pub fn at_path(path: Path) -> Self {
+        Self::PathExact(path)
+    }
+
+    /// Convenience constructor.
+    pub fn at_depth_at_least(n: u32) -> Self {
+        Self::DepthAtLeast(n)
+    }
+
+    /// Convenience constructor.
+    pub fn at_depth_at_most(n: u32) -> Self {
+        Self::DepthAtMost(n)
+    }
+
+    /// Convenience constructor.
+    pub fn at_depth(n: u32) -> Self {
+        Self::DepthEquals(n)
+    }
+
+    /// Convenience constructor.
+    pub fn at_iteration(n: u64) -> Self {
+        Self::Iteration(n)
+    }
+
+    /// Convenience constructor.
+    pub fn in_call_frame(frame: CallFrameId) -> Self {
+        Self::CallFrame(frame)
+    }
+
+    /// Logical AND.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All(mut xs), Self::All(ys)) => {
+                xs.extend(ys);
+                Self::All(xs)
+            }
+            (Self::All(mut xs), other) => {
+                xs.push(other);
+                Self::All(xs)
+            }
+            (this, Self::All(mut ys)) => {
+                ys.insert(0, this);
+                Self::All(ys)
+            }
+            (this, other) => Self::All(vec![this, other]),
+        }
+    }
+
+    /// Logical OR.
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Any(mut xs), Self::Any(ys)) => {
+                xs.extend(ys);
+                Self::Any(xs)
+            }
+            (Self::Any(mut xs), other) => {
+                xs.push(other);
+                Self::Any(xs)
+            }
+            (this, Self::Any(mut ys)) => {
+                ys.insert(0, this);
+                Self::Any(ys)
+            }
+            (this, other) => Self::Any(vec![this, other]),
+        }
+    }
+
+    /// Logical NOT.
+    pub fn not(self) -> Self {
+        Self::Not(Box::new(self))
+    }
+
+    /// Evaluates the condition against a context.
+    pub fn matches(&self, ctx: &NodeContext) -> bool {
+        match self {
+            Self::Node(id) => ctx.node == *id,
+            Self::PathPrefix(prefix) => {
+                ctx.path.0.len() >= prefix.0.len()
+                    && ctx.path.0[..prefix.0.len()] == prefix.0[..]
+            }
+            Self::PathExact(path) => ctx.path == *path,
+            Self::DepthAtLeast(n) => ctx.depth >= *n,
+            Self::DepthAtMost(n) => ctx.depth <= *n,
+            Self::DepthEquals(n) => ctx.depth == *n,
+            Self::Iteration(n) => ctx.iteration.map(|i| i.0 == *n).unwrap_or(false),
+            Self::CallFrame(frame) => ctx.frame == Some(*frame),
+            Self::Any(children) => children.iter().any(|c| c.matches(ctx)),
+            Self::All(children) => children.iter().all(|c| c.matches(ctx)),
+            Self::Not(inner) => !inner.matches(ctx),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+/// A registry of breakpoint conditions and their assigned IDs.
+///
+/// Hosts typically hold one `BreakpointSet` per debug session, add
+/// conditions in response to user or agent instructions, and query
+/// [`matches`](Self::matches) against every stepper event they observe.
+/// The set is deliberately host-side data: the [`Stepper`] trait knows
+/// nothing about it, which keeps the engine's contract minimal.
+#[derive(Debug, Default)]
+pub struct BreakpointSet {
+    next: u64,
+    entries: Vec<(BreakpointId, BreakCondition)>,
+}
+
+impl BreakpointSet {
+    /// Creates an empty set.
+    pub fn new() -> Self {
+        Self { next: 1, entries: Vec::new() }
+    }
+
+    /// Adds a condition and returns its assigned id.
+    pub fn add(&mut self, condition: BreakCondition) -> BreakpointId {
+        let id = BreakpointId(self.next);
+        self.next += 1;
+        self.entries.push((id, condition));
+        id
+    }
+
+    /// Removes an entry by id. Returns whether an entry was found.
+    pub fn remove(&mut self, id: BreakpointId) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|(entry_id, _)| *entry_id != id);
+        self.entries.len() != before
+    }
+
+    /// Returns the ids of all entries whose condition matches `ctx`.
+    ///
+    /// The empty vector means "no breakpoint fires here"; the caller
+    /// typically checks `.is_empty()` before deciding whether to yield
+    /// with [`SuspendReason::Breakpoint`].
+    pub fn matches(&self, ctx: &NodeContext) -> Vec<BreakpointId> {
+        self.entries
+            .iter()
+            .filter(|(_, cond)| cond.matches(ctx))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Returns whether the set has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of entries currently registered.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterates over the registered `(id, condition)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (BreakpointId, &BreakCondition)> {
+        self.entries.iter().map(|(id, c)| (*id, c))
+    }
 }
 
 // ---------- Traversal ----------------------------------------------------
@@ -451,6 +752,128 @@ mod tests {
             at: NodeContext::at(NodeId(0), Path::root()),
         };
         sink.emit(&event);
+    }
+
+    fn ctx_at(node: NodeId, path: Path, depth: u32) -> NodeContext {
+        NodeContext { node, path, frame: None, depth, iteration: None }
+    }
+
+    #[test]
+    fn breakpoint_node_matches_exact_id() {
+        let cond = BreakCondition::at_node(NodeId(7));
+        assert!(cond.matches(&ctx_at(NodeId(7), Path::root().push(NodeId(7)), 1)));
+        assert!(!cond.matches(&ctx_at(NodeId(8), Path::root().push(NodeId(8)), 1)));
+    }
+
+    #[test]
+    fn breakpoint_path_prefix_matches_descendants() {
+        let prefix = Path::root().push(NodeId(1)).push(NodeId(2));
+        let cond = BreakCondition::under_path(prefix.clone());
+        let inside = ctx_at(NodeId(3), prefix.push(NodeId(3)), 3);
+        let outside = ctx_at(NodeId(5), Path::root().push(NodeId(5)), 1);
+        assert!(cond.matches(&inside));
+        assert!(!cond.matches(&outside));
+    }
+
+    #[test]
+    fn breakpoint_depth_bounds() {
+        let cond = BreakCondition::at_depth_at_least(3).and(BreakCondition::at_depth_at_most(5));
+        assert!(!cond.matches(&ctx_at(NodeId(0), Path::root(), 2)));
+        assert!(cond.matches(&ctx_at(NodeId(0), Path::root(), 3)));
+        assert!(cond.matches(&ctx_at(NodeId(0), Path::root(), 5)));
+        assert!(!cond.matches(&ctx_at(NodeId(0), Path::root(), 6)));
+    }
+
+    #[test]
+    fn breakpoint_composition_flattens() {
+        let a = BreakCondition::at_node(NodeId(1));
+        let b = BreakCondition::at_node(NodeId(2));
+        let c = BreakCondition::at_node(NodeId(3));
+        let combined = a.and(b).and(c);
+        match combined {
+            BreakCondition::All(ref xs) => assert_eq!(xs.len(), 3),
+            _ => panic!("expected All variant"),
+        }
+    }
+
+    #[test]
+    fn breakpoint_set_add_matches_remove() {
+        let mut set = BreakpointSet::new();
+        let hit = set.add(BreakCondition::at_node(NodeId(4)));
+        let miss = set.add(BreakCondition::at_node(NodeId(99)));
+
+        let ctx = ctx_at(NodeId(4), Path::root().push(NodeId(4)), 1);
+        assert_eq!(set.matches(&ctx), vec![hit]);
+
+        assert!(set.remove(hit));
+        assert!(set.matches(&ctx).is_empty());
+        assert_eq!(set.len(), 1);
+        assert!(set.iter().any(|(id, _)| id == miss));
+    }
+
+    #[test]
+    fn breakpoint_iteration_and_frame() {
+        let cond = BreakCondition::at_iteration(3).and(BreakCondition::in_call_frame(CallFrameId(9)));
+        let mut ctx = ctx_at(NodeId(0), Path::root(), 1);
+        assert!(!cond.matches(&ctx));
+        ctx.iteration = Some(Iteration(3));
+        ctx.frame = Some(CallFrameId(9));
+        assert!(cond.matches(&ctx));
+    }
+
+    // ---- Async stepper smoke test ---------------------------------------
+
+    struct CountdownStepper {
+        remaining: u32,
+        yielded_once: bool,
+    }
+
+    impl AsyncStepper for CountdownStepper {
+        type Value = u32;
+        type Error = EngineError;
+
+        async fn step_async(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
+            if self.remaining == 0 {
+                return Ok(StepOutcome::Done(0));
+            }
+            if !self.yielded_once {
+                self.yielded_once = true;
+                return Ok(StepOutcome::Suspended {
+                    reason: SuspendReason::AwaitEffect,
+                    at: NodeContext::at(NodeId(self.remaining as u64), Path::root()),
+                });
+            }
+            self.remaining -= 1;
+            self.yielded_once = false;
+            Ok(StepOutcome::Advanced)
+        }
+    }
+
+    struct NoopResolver {
+        calls: u32,
+    }
+
+    impl EffectResolver for NoopResolver {
+        type Error = EngineError;
+
+        async fn resolve(
+            &mut self,
+            _at: &NodeContext,
+            _reason: &SuspendReason,
+        ) -> Result<(), Self::Error> {
+            self.calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn drive_async_runs_stepper_and_calls_resolver() {
+        let mut stepper = CountdownStepper { remaining: 3, yielded_once: false };
+        let mut resolver = NoopResolver { calls: 0 };
+        let value = futures::executor::block_on(drive_async(&mut stepper, &mut resolver))
+            .expect("drive succeeded");
+        assert_eq!(value, 0);
+        assert_eq!(resolver.calls, 3);
     }
 
     #[test]

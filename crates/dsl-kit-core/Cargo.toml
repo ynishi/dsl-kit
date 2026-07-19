@@ -8,3 +8,6 @@ description = "Engine primitives for dsl-kit: node ID, call frame, stepper, even
 [dependencies]
 miette    = { version = "7", features = ["fancy"] }
 thiserror = "2"
+
+[dev-dependencies]
+futures = "0.3"
