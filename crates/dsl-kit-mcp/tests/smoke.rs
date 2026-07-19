@@ -59,6 +59,13 @@ async fn call_reset(h: &DslMcpHandler) -> Value {
     parse(&h.dsl_kit_reset().await.expect("reset ok"))
 }
 
+async fn call_explain(h: &DslMcpHandler, code: Option<&str>) -> Result<Value, String> {
+    let body = dsl_kit_mcp::handler::ExplainParams {
+        code: code.map(str::to_owned),
+    };
+    h.dsl_kit_explain(Parameters(body)).await.map(|s| parse(&s))
+}
+
 #[tokio::test]
 async fn info_reports_flow_dsl() {
     let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
@@ -146,6 +153,39 @@ async fn breakpoint_pauses_stepper_at_matching_node() {
     assert_eq!(third["kind"], "suspended");
     assert_eq!(third["reason"], "await-effect");
     assert_eq!(third["at"]["node"], 4);
+}
+
+#[tokio::test]
+async fn explain_returns_help_for_known_code() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
+    let body = call_explain(&handler, Some("dsl_kit::eval::aborted"))
+        .await
+        .expect("known code");
+    assert_eq!(body["code"], "dsl_kit::eval::aborted");
+    assert!(body["help"].as_str().unwrap().contains("Aborted"));
+}
+
+#[tokio::test]
+async fn explain_lists_catalog_when_code_omitted() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
+    let body = call_explain(&handler, None).await.expect("catalog");
+    let codes: Vec<&str> = body["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"dsl_kit::eval::aborted"));
+    assert!(codes.contains(&"dsl_kit::stepper::protocol"));
+}
+
+#[tokio::test]
+async fn explain_rejects_unknown_code() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
+    let err = call_explain(&handler, Some("dsl_kit::does_not_exist"))
+        .await
+        .expect_err("unknown code should error");
+    assert!(err.contains("unknown error code"));
 }
 
 #[tokio::test]

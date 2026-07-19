@@ -162,4 +162,11 @@ pub trait DslHost: Send + Sync {
 
     /// Reset the stepper to a fresh state.
     fn reset(&mut self);
+
+    /// Host-specific error catalogue entries appended to the built-in
+    /// [`dsl_kit::engine_error_catalog`] when a client calls
+    /// `dsl_kit_explain`. The default returns an empty vector.
+    fn catalog(&self) -> Vec<dsl_kit::ErrorCatalogEntry> {
+        Vec::new()
+    }
 }

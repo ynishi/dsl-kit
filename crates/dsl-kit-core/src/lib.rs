@@ -330,6 +330,53 @@ pub enum EngineError {
 /// Result alias for engine and evaluator operations.
 pub type EngineResult<T> = Result<T, EngineError>;
 
+/// One entry in an error catalogue: a stable machine-readable code paired
+/// with the human-readable help text explaining how to react to it.
+///
+/// Produced by [`engine_error_catalog`] for the built-in [`EngineError`]
+/// variants, and extensible by DSL hosts that want to expose their own
+/// codes through the same channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorCatalogEntry {
+    /// Stable diagnostic code, e.g. `"dsl_kit::eval::aborted"`.
+    pub code: String,
+    /// Help text mirroring the miette `help(..)` attribute on the variant.
+    pub help: String,
+}
+
+/// Returns the built-in [`EngineError`] catalogue.
+///
+/// Each entry is produced by instantiating a sample of the variant with a
+/// dummy [`NodeContext`] and asking miette for its `code()` and `help()`
+/// strings — so the catalogue stays in lock-step with the derive attributes
+/// on `EngineError` without a second source of truth.
+pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
+    use miette::Diagnostic;
+
+    fn ctx() -> NodeContext {
+        NodeContext::at(NodeId(0), Path::root())
+    }
+
+    let samples: Vec<EngineError> = vec![
+        EngineError::Aborted { at: ctx(), reason: String::new() },
+        EngineError::EvalFailed {
+            at: ctx(),
+            source: Box::new(std::io::Error::other("")),
+        },
+        EngineError::Malformed { at: ctx(), detail: String::new() },
+        EngineError::StepperProtocol { at: ctx(), detail: String::new() },
+    ];
+
+    samples
+        .into_iter()
+        .filter_map(|e| {
+            let code = e.code()?.to_string();
+            let help = e.help()?.to_string();
+            Some(ErrorCatalogEntry { code, help })
+        })
+        .collect()
+}
+
 // ---------- Stepper ------------------------------------------------------
 
 /// One step of evaluation.
@@ -938,6 +985,19 @@ mod tests {
             .expect("drive succeeded");
         assert_eq!(value, 0);
         assert_eq!(resolver.calls, 3);
+    }
+
+    #[test]
+    fn engine_error_catalog_covers_every_variant() {
+        let entries = engine_error_catalog();
+        let codes: Vec<&str> = entries.iter().map(|e| e.code.as_str()).collect();
+        assert!(codes.contains(&"dsl_kit::eval::aborted"));
+        assert!(codes.contains(&"dsl_kit::eval::failed"));
+        assert!(codes.contains(&"dsl_kit::ast::malformed"));
+        assert!(codes.contains(&"dsl_kit::stepper::protocol"));
+        for entry in &entries {
+            assert!(!entry.help.is_empty(), "help empty for {}", entry.code);
+        }
     }
 
     #[test]

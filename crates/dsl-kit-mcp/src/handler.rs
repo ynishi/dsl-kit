@@ -17,6 +17,8 @@
 //! - `dsl_kit_breakpoint_add` — add a compound breakpoint condition.
 //! - `dsl_kit_breakpoint_list` — list every active breakpoint.
 //! - `dsl_kit_breakpoint_remove` — remove a breakpoint by id.
+//! - `dsl_kit_explain` — look up help text for a stable diagnostic code
+//!   (built-in engine codes plus any the host contributes).
 //! - `dsl_kit_reset` — reset the host's stepper.
 
 use std::sync::Arc;
@@ -80,6 +82,14 @@ pub struct BreakpointAddParams {
 pub struct BreakpointRemoveParams {
     /// Breakpoint id returned by `dsl_kit_breakpoint_add`.
     pub id: u64,
+}
+
+/// Parameters accepted by the `dsl_kit_explain` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExplainParams {
+    /// Stable diagnostic code to look up, e.g. `"dsl_kit::eval::aborted"`.
+    /// When omitted, the tool lists every known code without help text.
+    pub code: Option<String>,
 }
 
 // ---------- Handler state -----------------------------------------------
@@ -259,6 +269,36 @@ impl DslMcpHandler {
         let mut guard = self.state.lock().await;
         let removed = guard.breakpoints.remove(BreakpointId(params.id));
         Ok(json!({ "removed": removed }).to_string())
+    }
+
+    /// Look up the help text for a stable diagnostic code. When `code`
+    /// is omitted, the full catalogue is returned (codes only).
+    #[tool(name = "dsl_kit_explain")]
+    pub async fn dsl_kit_explain(
+        &self,
+        Parameters(params): Parameters<ExplainParams>,
+    ) -> Result<String, String> {
+        let guard = self.state.lock().await;
+        let mut entries = dsl_kit::engine_error_catalog();
+        entries.extend(guard.host.catalog());
+
+        match params.code {
+            None => {
+                let codes: Vec<&str> = entries.iter().map(|e| e.code.as_str()).collect();
+                Ok(json!({ "codes": codes }).to_string())
+            }
+            Some(code) => match entries.iter().find(|e| e.code == code) {
+                Some(entry) => {
+                    Ok(json!({ "code": entry.code, "help": entry.help }).to_string())
+                }
+                None => {
+                    let known: Vec<&str> = entries.iter().map(|e| e.code.as_str()).collect();
+                    Err(format!(
+                        "unknown error code {code:?}. Known codes: {known:?}"
+                    ))
+                }
+            },
+        }
     }
 
     /// Reset the host's stepper. Breakpoints are left untouched.
