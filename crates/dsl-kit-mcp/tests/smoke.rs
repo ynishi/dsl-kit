@@ -4,7 +4,7 @@
 //! round-trip; the goal is to catch schema / logic drift, not to
 //! exercise the transport (rmcp has its own tests for that).
 
-use dsl_kit_mcp::DslMcpHandler;
+use dsl_kit_mcp::{DslMcpHandler, FlowHost};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
 
@@ -61,7 +61,7 @@ async fn call_reset(h: &DslMcpHandler) -> Value {
 
 #[tokio::test]
 async fn info_reports_flow_dsl() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let info = call_info(&handler).await;
     assert_eq!(info["kit"], "dsl-kit");
     assert_eq!(info["dsl"], "flow");
@@ -70,7 +70,7 @@ async fn info_reports_flow_dsl() {
 
 #[tokio::test]
 async fn ast_pretty_contains_expected_labels() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let ast = call_ast(&handler).await;
     let pretty = ast["pretty"].as_str().expect("pretty is a string");
     assert!(pretty.contains("Seq"));
@@ -80,7 +80,7 @@ async fn ast_pretty_contains_expected_labels() {
 
 #[tokio::test]
 async fn stepping_to_done_resolves_every_call() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let outcome = call_step(&handler, "to_done").await;
     assert_eq!(outcome["kind"], "done");
 
@@ -92,7 +92,7 @@ async fn stepping_to_done_resolves_every_call() {
 
 #[tokio::test]
 async fn manual_resolve_after_yield() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     // Step until the first call yields.
     let first = call_step(&handler, "to_yield").await;
     assert_eq!(first["kind"], "suspended");
@@ -109,7 +109,7 @@ async fn manual_resolve_after_yield() {
 
 #[tokio::test]
 async fn breakpoints_survive_list() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let added = call_bp_add(&handler, 4).await;
     let id = added["id"].as_u64().unwrap();
 
@@ -121,8 +121,36 @@ async fn breakpoints_survive_list() {
 }
 
 #[tokio::test]
+async fn breakpoint_pauses_stepper_at_matching_node() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
+
+    // Pause on node 4 (Call "search_arxiv").
+    call_bp_add(&handler, 4).await;
+
+    // Run to yield: should first hit the initial call at n1 (AwaitEffect).
+    let first = call_step(&handler, "to_yield").await;
+    assert_eq!(first["kind"], "suspended");
+    assert_eq!(first["reason"], "await-effect");
+    assert_eq!(first["at"]["node"], 1);
+    call_resolve(&handler, Some("ok")).await;
+
+    // Continue: should now hit the breakpoint at n4 before any await.
+    let second = call_step(&handler, "to_yield").await;
+    assert_eq!(second["kind"], "suspended");
+    assert_eq!(second["reason"], "breakpoint");
+    assert_eq!(second["at"]["node"], 4);
+
+    // Stepping again transitions past the breakpoint and reaches the
+    // n4 Call's own AwaitEffect suspension.
+    let third = call_step(&handler, "to_yield").await;
+    assert_eq!(third["kind"], "suspended");
+    assert_eq!(third["reason"], "await-effect");
+    assert_eq!(third["at"]["node"], 4);
+}
+
+#[tokio::test]
 async fn reset_starts_from_scratch() {
-    let handler = DslMcpHandler::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let _ = call_step(&handler, "to_done").await;
     let before = call_state(&handler).await;
     assert!(before["results"].as_array().unwrap().len() > 0);

@@ -1,27 +1,27 @@
-//! `#[tool_router]` handler exposing the flow DSL to MCP clients.
+//! `#[tool_router]` handler that speaks to any [`DslHost`].
+//!
+//! The nine MCP tools are DSL-neutral: they operate on generic
+//! `NodeId` / `Path` / `depth` shapes, so a caller that swaps
+//! [`DslHost`] implementations sees the same contract.
 //!
 //! Tools:
 //!
-//! - `dsl_kit_info` — kit identity and a one-line DSL summary.
+//! - `dsl_kit_info` — kit identity and the loaded DSL's summary.
 //! - `dsl_kit_ast` — indented pretty-print of the AST.
 //! - `dsl_kit_state` — current stepper state (depth, pending call,
 //!   accumulated results, event counters, active breakpoints).
 //! - `dsl_kit_step` — advance the stepper (one step, until next yield,
 //!   or until completion) and return the resulting outcome.
 //! - `dsl_kit_resolve` — supply a response for the currently suspended
-//!   `Call`, so the next step can continue.
+//!   call, so the next step can continue.
 //! - `dsl_kit_breakpoint_add` — add a compound breakpoint condition.
 //! - `dsl_kit_breakpoint_list` — list every active breakpoint.
 //! - `dsl_kit_breakpoint_remove` — remove a breakpoint by id.
-//! - `dsl_kit_reset` — rebuild the stepper from the embedded program.
+//! - `dsl_kit_reset` — reset the host's stepper.
 
 use std::sync::Arc;
 
-use dsl_kit::{
-    BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId, Path, Phase,
-    StepOutcome, Stepper, Walk,
-};
-use dsl_kit_flow::{Flow, FlowStepper, canned_response, pretty, research_pipeline};
+use dsl_kit::{BreakCondition, BreakpointId, BreakpointSet, NodeId, Path};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -32,6 +32,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+use crate::host::{DslHost, HostOutcome};
+
 // ---------- Parameter types ---------------------------------------------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -41,17 +43,15 @@ pub struct StepParams {
     /// - `"one"` (default): a single `step()` call.
     /// - `"to_yield"`: keep stepping until the stepper suspends,
     ///   completes, or errors.
-    /// - `"to_done"`: keep running (looping through `to_yield` +
-    ///   automatic canned-response resolution) until the stepper
-    ///   reaches `Done`.
+    /// - `"to_done"`: keep running (using the host's default
+    ///   resolver) until the stepper reaches `Done`.
     pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveParams {
     /// Response text to record against the currently suspended call.
-    /// When omitted, the built-in canned response for the call's label
-    /// is used.
+    /// When omitted, the host's default response is used.
     pub result: Option<String>,
 }
 
@@ -65,7 +65,7 @@ pub struct BreakpointAddParams {
     pub at_depth_at_least: Option<u32>,
     /// Match every context whose depth is at most this value.
     pub at_depth_at_most: Option<u32>,
-    /// Match a specific iteration counter (Seq / Par).
+    /// Match a specific iteration counter.
     pub at_iteration: Option<u64>,
     /// Match every context whose path begins with the given sequence
     /// of node ids.
@@ -81,43 +81,24 @@ pub struct BreakpointRemoveParams {
 // ---------- Handler state -----------------------------------------------
 
 struct HandlerState {
-    stepper: FlowStepper<'static>,
+    host: Box<dyn DslHost>,
     breakpoints: BreakpointSet,
 }
 
-impl HandlerState {
-    fn new(program: &'static Flow) -> Self {
-        Self { stepper: FlowStepper::new(program), breakpoints: BreakpointSet::new() }
-    }
-}
-
-/// MCP handler that owns a single embedded flow program and drives a
-/// stepper over it.
+/// MCP handler that owns a single embedded DSL host and exposes it
+/// to any MCP client.
 #[derive(Clone)]
 pub struct DslMcpHandler {
     tool_router: ToolRouter<Self>,
-    program: &'static Flow,
     state: Arc<Mutex<HandlerState>>,
 }
 
 impl DslMcpHandler {
-    /// Builds a handler around the default research-pipeline program.
-    ///
-    /// The program is allocated once and leaked so the stepper can
-    /// hold a `'static` reference to it — the leak is bounded (a
-    /// single program per server process).
-    pub fn new_with_default_program() -> Self {
-        let ids = IdGen::new();
-        let program: &'static Flow = Box::leak(Box::new(research_pipeline(&ids)));
-        Self::new(program)
-    }
-
-    /// Builds a handler around a caller-supplied program.
-    pub fn new(program: &'static Flow) -> Self {
+    /// Builds a handler around any [`DslHost`] implementation.
+    pub fn new(host: Box<dyn DslHost>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            program,
-            state: Arc::new(Mutex::new(HandlerState::new(program))),
+            state: Arc::new(Mutex::new(HandlerState { host, breakpoints: BreakpointSet::new() })),
         }
     }
 }
@@ -129,14 +110,15 @@ impl DslMcpHandler {
     /// Report kit identity and a one-line DSL summary.
     #[tool(name = "dsl_kit_info")]
     pub async fn dsl_kit_info(&self) -> Result<String, String> {
-        let ast_size = count_nodes(self.program);
+        let guard = self.state.lock().await;
+        let host = &*guard.host;
         let body = json!({
             "kit": "dsl-kit",
             "kit_version": env!("CARGO_PKG_VERSION"),
-            "dsl": "flow",
-            "dsl_root": self.program.node_id().0,
-            "dsl_summary": self.program.summary(),
-            "ast_size": ast_size,
+            "dsl": host.dsl_name(),
+            "dsl_root": host.root_node_id(),
+            "dsl_summary": host.root_summary(),
+            "ast_size": host.ast_size(),
         });
         Ok(body.to_string())
     }
@@ -144,33 +126,30 @@ impl DslMcpHandler {
     /// Return an indented text tree of the embedded program.
     #[tool(name = "dsl_kit_ast")]
     pub async fn dsl_kit_ast(&self) -> Result<String, String> {
+        let guard = self.state.lock().await;
+        let host = &*guard.host;
         let body = json!({
-            "root": self.program.node_id().0,
-            "pretty": pretty(self.program),
+            "root": host.root_node_id(),
+            "pretty": host.ast_pretty(),
         });
         Ok(body.to_string())
     }
 
-    /// Report the stepper's current state: depth, active path, whether
-    /// a call is pending, accumulated results, event counters, and the
-    /// registered breakpoints.
+    /// Report the stepper's current state.
     #[tool(name = "dsl_kit_state")]
     pub async fn dsl_kit_state(&self) -> Result<String, String> {
         let guard = self.state.lock().await;
-        let counts = guard.stepper.events();
-        let mut results: Vec<(NodeId, String)> =
-            guard.stepper.results().iter().map(|(k, v)| (*k, v.clone())).collect();
-        results.sort_by_key(|(id, _)| id.0);
-        let results_json: Vec<Value> = results
+        let snap = guard.host.snapshot();
+
+        let suspended = snap
+            .suspended_call
+            .map(|s| json!({ "node": s.node, "label": s.label }));
+
+        let results_json: Vec<Value> = snap
+            .results
             .into_iter()
-            .map(|(id, text)| json!({ "node": id.0, "result": text }))
+            .map(|(node, result)| json!({ "node": node, "result": result }))
             .collect();
-
-        let suspended = guard.stepper.suspended_call().map(|(id, label)| {
-            json!({ "node": id.0, "label": label })
-        });
-
-        let path_json = guard.stepper.current_path().map(|p| path_ids(&p));
 
         let bps: Vec<Value> = guard
             .breakpoints
@@ -179,18 +158,18 @@ impl DslMcpHandler {
             .collect();
 
         let body = json!({
-            "depth": guard.stepper.depth(),
-            "current_path": path_json,
+            "depth": snap.depth,
+            "current_path": snap.current_path,
             "suspended_call": suspended,
             "results": results_json,
             "events": {
-                "visit_pre": counts.visit_pre,
-                "visit_post": counts.visit_post,
-                "frame_enter": counts.frame_enter,
-                "frame_leave": counts.frame_leave,
-                "iteration_tick": counts.iteration_tick,
-                "suspend": counts.suspend,
-                "resume": counts.resume,
+                "visit_pre": snap.events.visit_pre,
+                "visit_post": snap.events.visit_post,
+                "frame_enter": snap.events.frame_enter,
+                "frame_leave": snap.events.frame_leave,
+                "iteration_tick": snap.events.iteration_tick,
+                "suspend": snap.events.suspend,
+                "resume": snap.events.resume,
             },
             "breakpoints": bps,
         });
@@ -205,59 +184,36 @@ impl DslMcpHandler {
     ) -> Result<String, String> {
         let mode = params.mode.as_deref().unwrap_or("one");
         let mut guard = self.state.lock().await;
+        let HandlerState { host, breakpoints } = &mut *guard;
 
-        match mode {
-            "one" => {
-                let outcome = guard.stepper.step().map_err(|e| e.to_string())?;
-                Ok(outcome_to_json(&outcome).to_string())
+        let outcome = match mode {
+            "one" => host.step_one(breakpoints),
+            "to_yield" => host.step_to_yield(breakpoints),
+            "to_done" => host.step_to_done(breakpoints),
+            other => {
+                return Err(format!(
+                    "unknown mode {other:?}; use \"one\", \"to_yield\", or \"to_done\""
+                ));
             }
-            "to_yield" => {
-                let outcome = guard.stepper.run_to_yield().map_err(|e| e.to_string())?;
-                Ok(outcome_to_json(&outcome).to_string())
-            }
-            "to_done" => {
-                let mut steps = 0u32;
-                let final_outcome = loop {
-                    let outcome = guard.stepper.run_to_yield().map_err(|e| e.to_string())?;
-                    steps += 1;
-                    match outcome {
-                        StepOutcome::Suspended { .. } => {
-                            if let Some((id, label)) = guard.stepper.suspended_call() {
-                                let response = canned_response(label);
-                                guard.stepper.record_result(id, response);
-                            }
-                        }
-                        other => break other,
-                    }
-                    if steps > 4096 {
-                        return Err("stepper exceeded to_done safety limit".into());
-                    }
-                };
-                Ok(outcome_to_json(&final_outcome).to_string())
-            }
-            other => Err(format!("unknown mode {other:?}; use \"one\", \"to_yield\", or \"to_done\"")),
-        }
+        }?;
+
+        Ok(outcome_to_json(&outcome).to_string())
     }
 
     /// Provide a response for the currently suspended call.
-    ///
-    /// When `result` is omitted the built-in canned response for the
-    /// call's label is used.
     #[tool(name = "dsl_kit_resolve")]
     pub async fn dsl_kit_resolve(
         &self,
         Parameters(params): Parameters<ResolveParams>,
     ) -> Result<String, String> {
         let mut guard = self.state.lock().await;
-        let (id, label) = guard
-            .stepper
-            .suspended_call()
-            .map(|(id, label)| (id, label.to_string()))
-            .ok_or_else(|| "no suspended call to resolve".to_string())?;
-        let result = params.result.unwrap_or_else(|| canned_response(&label));
-        guard.stepper.record_result(id, result.clone());
+        let resolved = guard.host.resolve(params.result)?;
         Ok(json!({
-            "resolved": { "node": id.0, "label": label, "result": result }
+            "resolved": {
+                "node": resolved.node,
+                "label": resolved.label,
+                "result": resolved.result,
+            }
         })
         .to_string())
     }
@@ -301,12 +257,11 @@ impl DslMcpHandler {
         Ok(json!({ "removed": removed }).to_string())
     }
 
-    /// Reset the stepper. The AST is rebuilt from scratch and the
-    /// breakpoint set is left untouched.
+    /// Reset the host's stepper. Breakpoints are left untouched.
     #[tool(name = "dsl_kit_reset")]
     pub async fn dsl_kit_reset(&self) -> Result<String, String> {
         let mut guard = self.state.lock().await;
-        guard.stepper = FlowStepper::new(self.program);
+        guard.host.reset();
         Ok(json!({ "reset": true }).to_string())
     }
 }
@@ -318,8 +273,9 @@ impl ServerHandler for DslMcpHandler {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "dsl-kit MCP server. Exposes a small orchestration DSL (Seq / Par / \
-                 Call / Scope / Maybe) through a debugger-style tool surface.\n\n\
+                "dsl-kit MCP server. Drives a stepper over a DSL loaded by \
+                 the host, exposing traversal, breakpoints, suspend / resume, \
+                 and inspection through a debugger-style tool surface.\n\n\
                  Typical workflow:\n\
                  1. dsl_kit_info + dsl_kit_ast to see the loaded program.\n\
                  2. dsl_kit_breakpoint_add to pause on interesting nodes.\n\
@@ -337,39 +293,21 @@ impl ServerHandler for DslMcpHandler {
 
 // ---------- Helpers ------------------------------------------------------
 
-fn count_nodes(flow: &Flow) -> usize {
-    let mut count = 0usize;
-    flow.walk(&mut |_, phase| {
-        if phase == Phase::Pre {
-            count += 1;
-        }
-    });
-    count
-}
-
-fn path_ids(path: &Path) -> Vec<u64> {
-    path.0.iter().map(|n| n.0).collect()
-}
-
-fn ctx_json(ctx: &NodeContext) -> Value {
-    json!({
-        "node": ctx.node.0,
-        "path": path_ids(&ctx.path),
-        "depth": ctx.depth,
-        "frame": ctx.frame.map(|f| f.0),
-        "iteration": ctx.iteration.map(|i| i.0),
-    })
-}
-
-fn outcome_to_json(outcome: &StepOutcome<()>) -> Value {
+fn outcome_to_json(outcome: &HostOutcome) -> Value {
     match outcome {
-        StepOutcome::Advanced => json!({ "kind": "advanced" }),
-        StepOutcome::Suspended { reason, at } => json!({
+        HostOutcome::Advanced => json!({ "kind": "advanced" }),
+        HostOutcome::Suspended { reason, at } => json!({
             "kind": "suspended",
-            "reason": format!("{reason}"),
-            "at": ctx_json(at),
+            "reason": reason,
+            "at": {
+                "node": at.node,
+                "path": at.path,
+                "depth": at.depth,
+                "frame": at.frame,
+                "iteration": at.iteration,
+            },
         }),
-        StepOutcome::Done(()) => json!({ "kind": "done" }),
+        HostOutcome::Done => json!({ "kind": "done" }),
     }
 }
 
@@ -413,10 +351,10 @@ fn describe_condition(cond: &BreakCondition) -> Value {
     match cond {
         BreakCondition::Node(id) => json!({ "kind": "node", "id": id.0 }),
         BreakCondition::PathPrefix(path) => {
-            json!({ "kind": "path_prefix", "path": path_ids(path) })
+            json!({ "kind": "path_prefix", "path": path.0.iter().map(|n| n.0).collect::<Vec<_>>() })
         }
         BreakCondition::PathExact(path) => {
-            json!({ "kind": "path_exact", "path": path_ids(path) })
+            json!({ "kind": "path_exact", "path": path.0.iter().map(|n| n.0).collect::<Vec<_>>() })
         }
         BreakCondition::DepthAtLeast(n) => json!({ "kind": "depth_at_least", "value": n }),
         BreakCondition::DepthAtMost(n) => json!({ "kind": "depth_at_most", "value": n }),

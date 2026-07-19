@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use dsl_kit::{
-    CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, IdGen, Iteration,
-    NodeContext, NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
+    BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, IdGen,
+    Iteration, NodeContext, NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
 };
 
 /// AST of the flow DSL.
@@ -226,6 +226,10 @@ pub struct FlowStepper<'a> {
     next_frame: u64,
     suspend_pending: bool,
     results: HashMap<NodeId, String>,
+    /// Set on the step that follows a breakpoint yield, so the next
+    /// `step_with_breakpoints` call skips the recheck and lets the
+    /// underlying `step()` proceed with normal semantics.
+    breakpoint_yielded: bool,
 }
 
 struct Frame<'a> {
@@ -257,6 +261,57 @@ impl<'a> FlowStepper<'a> {
             next_frame: 1,
             suspend_pending: false,
             results: HashMap::new(),
+            breakpoint_yielded: false,
+        }
+    }
+
+    /// Runs a single step, first checking whether the next node's
+    /// `Enter` phase matches any registered breakpoint. When a
+    /// breakpoint fires the stepper yields
+    /// `Suspended { reason: Breakpoint, .. }` without advancing;
+    /// the next call transitions normally.
+    pub fn step_with_breakpoints(
+        &mut self,
+        breakpoints: &BreakpointSet,
+    ) -> Result<StepOutcome<()>, EngineError> {
+        if self.breakpoint_yielded {
+            self.breakpoint_yielded = false;
+            return self.step();
+        }
+        if breakpoints.is_empty() || self.stack.is_empty() {
+            return self.step();
+        }
+
+        let frame = self.stack.last().expect("non-empty");
+        if matches!(frame.state, FrameState::Enter) {
+            let ctx = self.ctx(frame);
+            if !breakpoints.matches(&ctx).is_empty() {
+                self.breakpoint_yielded = true;
+                self.events.emit(&Event::Suspend {
+                    at: ctx.clone(),
+                    reason: SuspendReason::Breakpoint,
+                });
+                return Ok(StepOutcome::Suspended {
+                    reason: SuspendReason::Breakpoint,
+                    at: ctx,
+                });
+            }
+        }
+
+        self.step()
+    }
+
+    /// Loops [`Self::step_with_breakpoints`] until suspension,
+    /// completion, or error.
+    pub fn run_to_yield_with_breakpoints(
+        &mut self,
+        breakpoints: &BreakpointSet,
+    ) -> Result<StepOutcome<()>, EngineError> {
+        loop {
+            match self.step_with_breakpoints(breakpoints)? {
+                StepOutcome::Advanced => continue,
+                other => return Ok(other),
+            }
         }
     }
 

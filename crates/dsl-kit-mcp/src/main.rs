@@ -1,4 +1,4 @@
-use dsl_kit_mcp::DslMcpHandler;
+use dsl_kit_mcp::{DslMcpHandler, FlowHost};
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{self, EnvFilter};
 
@@ -11,10 +11,11 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!("dsl-kit-mcp starting");
+    tracing::info!("dsl-kit-mcp starting (flow host)");
 
-    let server = DslMcpHandler::new_with_default_program();
-    let service = server.serve(stdio()).await?;
+    let host = FlowHost::new_with_default_program();
+    let handler = DslMcpHandler::new(Box::new(host));
+    let service = handler.serve(stdio()).await?;
     service.waiting().await?;
 
     Ok(())
