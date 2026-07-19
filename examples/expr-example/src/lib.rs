@@ -263,6 +263,7 @@ impl ExprHost {
     }
 }
 
+#[async_trait::async_trait]
 impl DslHost for ExprHost {
     fn dsl_name(&self) -> &str {
         "expr"
@@ -313,7 +314,7 @@ impl DslHost for ExprHost {
         }
     }
 
-    fn step_one(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+    async fn step_one(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
         self.step_count += 1;
         if let Some(hit) = self.check_breakpoint(breakpoints) {
             return Ok(hit);
@@ -321,14 +322,14 @@ impl DslHost for ExprHost {
         self.try_evaluate()
     }
 
-    fn step_to_yield(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
-        self.step_one(breakpoints)
+    async fn step_to_yield(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+        self.step_one(breakpoints).await
     }
 
-    fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+    async fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
         let mut safety = 0u32;
         loop {
-            match self.step_one(breakpoints)? {
+            match self.step_one(breakpoints).await? {
                 HostOutcome::Advanced => {}
                 HostOutcome::Suspended { reason, .. } if reason == "await-effect" => {
                     if let Some((_, name)) = self.pending.clone() {
@@ -351,7 +352,7 @@ impl DslHost for ExprHost {
         }
     }
 
-    fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String> {
+    async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String> {
         let (node, name) = self
             .pending
             .take()

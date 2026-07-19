@@ -215,6 +215,7 @@ name = "dsl-kit-mcp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dsl-kit",
  "dsl-kit-flow",
  "rmcp",
@@ -246,10 +247,12 @@ dependencies = [
 name = "expr-example"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "dsl-kit",
  "dsl-kit-core",
  "dsl-kit-mcp",
  "miette",
+ "tokio",
 ]
 
 [[package]]
@@ -264,7 +267,9 @@ version = "0.0.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-flow",
+ "futures",
  "miette",
+ "tokio",
 ]
 
 [[package]]

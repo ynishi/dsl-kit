@@ -71,6 +71,15 @@ pub enum HostOutcome {
 }
 
 /// DSL-agnostic surface the MCP handler drives.
+///
+/// The step / resolve methods are `async` so hosts whose semantics
+/// need to await external work (network calls, tool invocations,
+/// MCP round-trips) can do so directly. Purely synchronous hosts
+/// simply wrap sync bodies in `async { … }` at zero runtime cost.
+///
+/// The trait uses [`async_trait`] to stay `dyn`-compatible; the MCP
+/// handler holds a `Box<dyn DslHost>`.
+#[async_trait::async_trait]
 pub trait DslHost: Send + Sync {
     /// Short name of the DSL, e.g. `"flow"`. Reported by `dsl_kit_info`.
     fn dsl_name(&self) -> &str;
@@ -94,13 +103,13 @@ pub trait DslHost: Send + Sync {
     /// expected to yield `Suspended { reason: "breakpoint", .. }`
     /// before executing a node whose context matches any registered
     /// condition.
-    fn step_one(
+    async fn step_one(
         &mut self,
         breakpoints: &dsl_kit::BreakpointSet,
     ) -> Result<HostOutcome, String>;
 
     /// Run steps until the next suspend / done / error.
-    fn step_to_yield(
+    async fn step_to_yield(
         &mut self,
         breakpoints: &dsl_kit::BreakpointSet,
     ) -> Result<HostOutcome, String>;
@@ -110,7 +119,7 @@ pub trait DslHost: Send + Sync {
     /// mid-run — they suspend the loop just like an `AwaitEffect`, and
     /// resolution is performed on breakpoint yields too so the stepper
     /// keeps making progress.
-    fn step_to_done(
+    async fn step_to_done(
         &mut self,
         breakpoints: &dsl_kit::BreakpointSet,
     ) -> Result<HostOutcome, String>;
@@ -119,7 +128,7 @@ pub trait DslHost: Send + Sync {
     ///
     /// When `result` is `None`, the host provides a default (usually
     /// its canned response for the call's label).
-    fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String>;
+    async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String>;
 
     /// Reset the stepper to a fresh state.
     fn reset(&mut self);

@@ -17,7 +17,8 @@ use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId, StepOutcome, Stepper
 use dsl_kit_mcp::host::DslHost;
 use expr_example::{ExprHost, demo_program, evaluate_all, pretty};
 
-fn main() -> miette::Result<()> {
+#[tokio::main]
+async fn main() -> miette::Result<()> {
     // ---- 1. Synchronous evaluation ---------------------------------
     let ids = IdGen::new();
     let program = demo_program(&ids);
@@ -38,17 +39,17 @@ fn main() -> miette::Result<()> {
     let bp = BreakpointSet::new();
 
     // First step: the host yields on the first unbound variable it sees.
-    let first = host.step_one(&bp).expect("step ok");
+    let first = host.step_one(&bp).await.expect("step ok");
     print_outcome("step 1", &first);
-    let resolved = host.resolve(Some("5".into())).expect("resolve ok");
+    let resolved = host.resolve(Some("5".into())).await.expect("resolve ok");
     println!("resolved: {} = {}", resolved.label, resolved.result);
 
-    let second = host.step_one(&bp).expect("step ok");
+    let second = host.step_one(&bp).await.expect("step ok");
     print_outcome("step 2", &second);
-    let resolved = host.resolve(Some("2".into())).expect("resolve ok");
+    let resolved = host.resolve(Some("2".into())).await.expect("resolve ok");
     println!("resolved: {} = {}", resolved.label, resolved.result);
 
-    let third = host.step_one(&bp).expect("step ok");
+    let third = host.step_one(&bp).await.expect("step ok");
     print_outcome("step 3", &third);
 
     let snap = host.snapshot();
@@ -68,10 +69,9 @@ fn main() -> miette::Result<()> {
         println!("breakpoint set on {y_id} (Var \"y\")");
     }
 
-    match host.step_one(&bp).expect("step") {
-        outcome => print_outcome("first step (should hit await-effect on y)", &outcome),
-    }
-    if let Ok(outcome) = host.step_one(&bp) {
+    let outcome = host.step_one(&bp).await.expect("step");
+    print_outcome("first step (should hit await-effect on y)", &outcome);
+    if let Ok(outcome) = host.step_one(&bp).await {
         print_outcome("second step (breakpoint on y should fire before eval)", &outcome);
     }
 

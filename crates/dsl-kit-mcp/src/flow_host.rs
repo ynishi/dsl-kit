@@ -44,6 +44,7 @@ fn count_nodes(flow: &Flow) -> usize {
     count
 }
 
+#[async_trait::async_trait]
 impl DslHost for FlowHost {
     fn dsl_name(&self) -> &str {
         "flow"
@@ -98,7 +99,7 @@ impl DslHost for FlowHost {
         }
     }
 
-    fn step_one(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+    async fn step_one(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
         let outcome = self
             .stepper
             .step_with_breakpoints(breakpoints)
@@ -106,7 +107,7 @@ impl DslHost for FlowHost {
         Ok(outcome_to_host(outcome))
     }
 
-    fn step_to_yield(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+    async fn step_to_yield(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
         let outcome = self
             .stepper
             .run_to_yield_with_breakpoints(breakpoints)
@@ -114,7 +115,7 @@ impl DslHost for FlowHost {
         Ok(outcome_to_host(outcome))
     }
 
-    fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+    async fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
         let mut steps = 0u32;
         loop {
             let outcome = self
@@ -141,7 +142,7 @@ impl DslHost for FlowHost {
         }
     }
 
-    fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String> {
+    async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String> {
         let (id, label) = self
             .stepper
             .suspended_call()

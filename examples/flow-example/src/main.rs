@@ -1,17 +1,26 @@
 //! Reference demo for the flow DSL.
 //!
-//! This binary uses `dsl-kit-flow` to build a small research pipeline,
-//! walks it with the derived traversal, runs it through the stepper
-//! while a canned resolver answers each effect, exercises the
-//! breakpoint surface, and finishes by rendering a diagnostic error.
+//! The binary is structured in four sections:
+//!
+//! 1. Walks the AST with the derived traversal, prints an indented
+//!    tree.
+//! 2. Runs the pipeline synchronously with a canned resolver.
+//! 3. Runs the same pipeline through `AsyncStepper` inside a tokio
+//!    runtime, using `tokio::time::sleep` to simulate real network
+//!    latency, and runs two pipelines concurrently to show that the
+//!    async surface actually overlaps work.
+//! 4. Exercises the breakpoint surface and renders a diagnostic error.
+
+use std::time::{Duration, Instant};
 
 use dsl_kit::{
-    BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId, Path,
-    StepOutcome, Stepper, Walk,
+    AsyncStepper, BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId,
+    Path, StepOutcome, Stepper, Walk,
 };
 use dsl_kit_flow::{
     Flow, FlowStepper, canned_response, check_unique_ids, pretty, research_pipeline,
 };
+use futures::future::join;
 
 /// Illustrates the breakpoint condition surface by walking the AST once
 /// and reporting which nodes each condition matches.
@@ -64,7 +73,36 @@ fn demonstrate_breakpoints(program: &Flow) {
     }
 }
 
-fn main() -> miette::Result<()> {
+/// Drives a flow through `AsyncStepper` using a real async resolver
+/// that sleeps for `latency` before answering each `Call`.
+///
+/// Returns the elapsed wall-clock time so the caller can compare
+/// sequential vs concurrent runs.
+async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Duration, usize) {
+    let start = Instant::now();
+    let mut stepper = FlowStepper::new(program);
+    let mut resolved = 0usize;
+    loop {
+        // Explicit await point: every step goes through the async trait.
+        let outcome = stepper.step_async().await.expect("step");
+        match outcome {
+            StepOutcome::Advanced => continue,
+            StepOutcome::Suspended { .. } => {
+                if let Some((id, label)) = stepper.suspended_call() {
+                    tokio::time::sleep(latency).await;
+                    let response = format!("[{tag}] {}", canned_response(label));
+                    stepper.record_result(id, response);
+                    resolved += 1;
+                }
+            }
+            StepOutcome::Done(()) => break,
+        }
+    }
+    (start.elapsed(), resolved)
+}
+
+#[tokio::main]
+async fn main() -> miette::Result<()> {
     let ids = IdGen::new();
     let program = research_pipeline(&ids);
 
@@ -98,6 +136,32 @@ fn main() -> miette::Result<()> {
     for (id, text) in &results {
         println!("  {id}: {text}");
     }
+
+    println!("\n=== Async run (single pipeline, real tokio sleeps) ===");
+    let (single_elapsed, single_calls) =
+        run_flow_async(&program, "solo", Duration::from_millis(50)).await;
+    println!(
+        "  solo pipeline: resolved {single_calls} calls in {:.0} ms (50 ms per suspend x {single_calls})",
+        single_elapsed.as_millis()
+    );
+
+    println!("\n=== Async run (two pipelines concurrently) ===");
+    let start = Instant::now();
+    let ((elapsed_a, calls_a), (elapsed_b, calls_b)) = join(
+        run_flow_async(&program, "A", Duration::from_millis(50)),
+        run_flow_async(&program, "B", Duration::from_millis(50)),
+    )
+    .await;
+    let joint_elapsed = start.elapsed();
+    println!(
+        "  A: {calls_a} calls in {:.0} ms  B: {calls_b} calls in {:.0} ms",
+        elapsed_a.as_millis(),
+        elapsed_b.as_millis()
+    );
+    println!(
+        "  concurrent wall clock: {:.0} ms (each pipeline still {calls_a} suspends x 50 ms; overlap is real)",
+        joint_elapsed.as_millis()
+    );
 
     println!("\n=== Breakpoints ===");
     demonstrate_breakpoints(&program);

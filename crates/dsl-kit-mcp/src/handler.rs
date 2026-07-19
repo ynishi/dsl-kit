@@ -187,9 +187,9 @@ impl DslMcpHandler {
         let HandlerState { host, breakpoints } = &mut *guard;
 
         let outcome = match mode {
-            "one" => host.step_one(breakpoints),
-            "to_yield" => host.step_to_yield(breakpoints),
-            "to_done" => host.step_to_done(breakpoints),
+            "one" => host.step_one(breakpoints).await,
+            "to_yield" => host.step_to_yield(breakpoints).await,
+            "to_done" => host.step_to_done(breakpoints).await,
             other => {
                 return Err(format!(
                     "unknown mode {other:?}; use \"one\", \"to_yield\", or \"to_done\""
@@ -207,7 +207,7 @@ impl DslMcpHandler {
         Parameters(params): Parameters<ResolveParams>,
     ) -> Result<String, String> {
         let mut guard = self.state.lock().await;
-        let resolved = guard.host.resolve(params.result)?;
+        let resolved = guard.host.resolve(params.result).await?;
         Ok(json!({
             "resolved": {
                 "node": resolved.node,

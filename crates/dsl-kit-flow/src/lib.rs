@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use dsl_kit::{
-    BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, IdGen,
-    Iteration, NodeContext, NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
+    AsyncStepper, BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink,
+    IdGen, Iteration, NodeContext, NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
 };
 
 /// AST of the flow DSL.
@@ -527,5 +527,22 @@ impl<'a> Stepper for FlowStepper<'a> {
                 Ok(StepOutcome::Advanced)
             }
         }
+    }
+}
+
+/// Async wrapper over the sync [`Stepper::step`].
+///
+/// Flow's semantics themselves do not need to await — externalising
+/// each effect through a `Suspended { reason: AwaitEffect, .. }` yield
+/// is the design's whole point. The `AsyncStepper` impl exists so that
+/// callers who are already in an async context (a tokio handler, an
+/// MCP tool, etc.) can drop the stepper into `drive_async` and its
+/// friends without a shim.
+impl<'a> AsyncStepper for FlowStepper<'a> {
+    type Value = ();
+    type Error = EngineError;
+
+    async fn step_async(&mut self) -> Result<StepOutcome<()>, EngineError> {
+        self.step()
     }
 }
