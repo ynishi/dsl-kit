@@ -6,7 +6,8 @@ members = [
     "crates/dsl-kit",
     "crates/dsl-kit-flow",
     "crates/dsl-kit-mcp",
-    "examples/flow",
+    "examples/flow-example",
+    "examples/expr-example",
 ]
 
 [workspace.package]

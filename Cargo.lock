@@ -243,6 +243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "expr-example"
+version = "0.0.0"
+dependencies = [
+ "dsl-kit",
+ "dsl-kit-core",
+ "dsl-kit-mcp",
+ "miette",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
