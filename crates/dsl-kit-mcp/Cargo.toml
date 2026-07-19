@@ -1,0 +1,22 @@
+[package]
+name = "dsl-kit-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server (stdio) that exposes a dsl-kit stepper — walk the AST, step, inspect state, and manage breakpoints from any MCP client."
+
+[[bin]]
+name = "dsl-kit-mcp"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-flow = { workspace = true }
+rmcp         = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio        = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow       = "1"
+schemars     = "0.8"
