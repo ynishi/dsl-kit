@@ -14,12 +14,19 @@
 /// One event kind's counter, as reported by [`DslHost::snapshot`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EventCounts {
+    /// Number of `VisitPre` events observed.
     pub visit_pre: u32,
+    /// Number of `VisitPost` events observed.
     pub visit_post: u32,
+    /// Number of `FrameEnter` events observed.
     pub frame_enter: u32,
+    /// Number of `FrameLeave` events observed.
     pub frame_leave: u32,
+    /// Number of `IterationTick` events observed.
     pub iteration_tick: u32,
+    /// Number of `Suspend` events observed.
     pub suspend: u32,
+    /// Number of `Resume` events observed.
     pub resume: u32,
 }
 
@@ -27,15 +34,20 @@ pub struct EventCounts {
 /// stepper is currently suspended on.
 #[derive(Debug, Clone)]
 pub struct SuspendedCall {
+    /// Node id of the pending call.
     pub node: u64,
+    /// Host-defined label identifying the effect.
     pub label: String,
 }
 
 /// A call that has just been resolved.
 #[derive(Debug, Clone)]
 pub struct ResolvedCall {
+    /// Node id whose call was resolved.
     pub node: u64,
+    /// Host-defined label identifying the effect.
     pub label: String,
+    /// Value the host supplied for the call, serialised as text.
     pub result: String,
 }
 
@@ -45,28 +57,46 @@ pub struct ResolvedCall {
 /// hosts do not have to worry about JSON shape.
 #[derive(Debug, Clone)]
 pub struct HostSnapshot {
+    /// Current stack depth of the stepper (0 when idle / finished).
     pub depth: usize,
+    /// Path to the currently active node, when the stepper is active.
     pub current_path: Option<Vec<u64>>,
+    /// Details of the pending call, when the stepper is suspended.
     pub suspended_call: Option<SuspendedCall>,
+    /// Results recorded so far, keyed by node id.
     pub results: Vec<(u64, String)>,
+    /// Cumulative event counters.
     pub events: EventCounts,
 }
 
 /// Location context of a suspension, in generic (JSON-friendly) form.
 #[derive(Debug, Clone)]
 pub struct HostLocation {
+    /// Node id at which the suspension happened.
     pub node: u64,
+    /// Root-to-node id chain leading to `node`.
     pub path: Vec<u64>,
+    /// Stack depth at the suspension point.
     pub depth: u32,
+    /// Active call frame at the suspension point.
     pub frame: Option<u64>,
+    /// Iteration counter when the surrounding node is loop-shaped.
     pub iteration: Option<u64>,
 }
 
 /// Outcome of a step against a `DslHost`.
 #[derive(Debug, Clone)]
 pub enum HostOutcome {
+    /// The stepper advanced one node.
     Advanced,
-    Suspended { reason: String, at: HostLocation },
+    /// The stepper is suspended and awaiting resolution.
+    Suspended {
+        /// Reason for the yield (e.g. `"await-effect"`, `"breakpoint"`).
+        reason: String,
+        /// Where the suspension happened.
+        at: HostLocation,
+    },
+    /// Evaluation completed.
     Done,
 }
 

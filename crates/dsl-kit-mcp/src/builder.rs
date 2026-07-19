@@ -109,6 +109,7 @@ impl Default for DslMcpBuilder {
 }
 
 impl DslMcpBuilder {
+    /// Creates an empty builder.
     pub fn new() -> Self {
         Self { instructions: None, tools: Vec::new() }
     }

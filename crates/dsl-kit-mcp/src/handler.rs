@@ -36,6 +36,7 @@ use crate::host::{DslHost, HostOutcome};
 
 // ---------- Parameter types ---------------------------------------------
 
+/// Parameters accepted by the `dsl_kit_step` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StepParams {
     /// How to advance the stepper. Accepted values:
@@ -48,6 +49,7 @@ pub struct StepParams {
     pub mode: Option<String>,
 }
 
+/// Parameters accepted by the `dsl_kit_resolve` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResolveParams {
     /// Response text to record against the currently suspended call.
@@ -55,6 +57,7 @@ pub struct ResolveParams {
     pub result: Option<String>,
 }
 
+/// Parameters accepted by the `dsl_kit_breakpoint_add` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BreakpointAddParams {
     /// Match a specific node id.
@@ -72,6 +75,7 @@ pub struct BreakpointAddParams {
     pub under_path: Option<Vec<u64>>,
 }
 
+/// Parameters accepted by the `dsl_kit_breakpoint_remove` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BreakpointRemoveParams {
     /// Breakpoint id returned by `dsl_kit_breakpoint_add`.

@@ -6,6 +6,24 @@
 //! trait that models evaluation as a state machine, an AST traversal trait,
 //! and a structured error type that always carries the location at which the
 //! error happened.
+//!
+//! ## Architecture
+//!
+//! - `NodeId` / `CallFrameId` / `Iteration` / `Path` — the observation
+//!   primitives every event and every error carry.
+//! - `Event` / `EventSink` — the tap between the evaluator and any
+//!   observer (tracer, debugger, MCP tool, replay recorder).
+//! - `Stepper` / `AsyncStepper` — evaluators expressed as state
+//!   machines driven from the outside, with `Suspended` yields
+//!   externalising every effect.
+//! - `Walk` / `WalkMut` / `DslNode` — the traversal contract every
+//!   AST derives via the `#[derive(DslNode)]` macro in `dsl-kit-macros`.
+//! - `EngineError` / `NodeContext` — structured errors that always
+//!   know where they happened.
+//! - `BreakCondition` / `BreakpointSet` — composable boolean predicates
+//!   over `NodeContext` used to describe conditional breakpoints.
+
+#![warn(missing_docs)]
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,6 +111,7 @@ pub struct IdGen {
 }
 
 impl IdGen {
+    /// Creates a fresh generator initialised at zero.
     pub const fn new() -> Self {
         Self { next: AtomicU64::new(0) }
     }
@@ -116,10 +135,15 @@ impl IdGen {
 /// the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeContext {
+    /// The node currently being evaluated.
     pub node: NodeId,
+    /// The root-to-node path leading to `node`.
     pub path: Path,
+    /// The active call frame, if any.
     pub frame: Option<CallFrameId>,
+    /// Depth of the current call / evaluation stack.
     pub depth: u32,
+    /// Iteration counter when the surrounding node is loop-shaped.
     pub iteration: Option<Iteration>,
 }
 
@@ -152,19 +176,42 @@ impl fmt::Display for NodeContext {
 #[non_exhaustive]
 pub enum Event {
     /// Emitted before a node's semantics run.
-    VisitPre { at: NodeContext },
+    VisitPre {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
     /// Emitted after a node's semantics complete.
-    VisitPost { at: NodeContext },
+    VisitPost {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
     /// A function-like node started a new call frame.
-    FrameEnter { at: NodeContext },
+    FrameEnter {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
     /// A function-like node's frame ended.
-    FrameLeave { at: NodeContext },
+    FrameLeave {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
     /// A loop node advanced to a new iteration.
-    IterationTick { at: NodeContext },
+    IterationTick {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
     /// The stepper is about to yield to the outside world.
-    Suspend { at: NodeContext, reason: SuspendReason },
+    Suspend {
+        /// Where the observation happened.
+        at: NodeContext,
+        /// Why the stepper is yielding.
+        reason: SuspendReason,
+    },
     /// The stepper resumed after a yield.
-    Resume { at: NodeContext },
+    Resume {
+        /// Where the observation happened.
+        at: NodeContext,
+    },
 }
 
 /// Why the stepper yielded control.
@@ -194,6 +241,7 @@ impl fmt::Display for SuspendReason {
 /// The trait is intentionally simple: implementors decide whether to trace,
 /// print, forward over MCP, or record for replay.
 pub trait EventSink {
+    /// Consumes one event.
     fn emit(&mut self, event: &Event);
 }
 
@@ -230,7 +278,9 @@ pub enum EngineError {
         help("The interpreter returned an `Aborted` outcome. Inspect the reason and the node context to locate the abort site.")
     )]
     Aborted {
+        /// Where the abort happened.
         at: NodeContext,
+        /// Why the evaluator aborted.
         reason: String,
     },
 
@@ -241,7 +291,9 @@ pub enum EngineError {
         help("The interpreter returned an error while evaluating this node. The `#[source]` chain points at the underlying failure.")
     )]
     EvalFailed {
+        /// Where the failure happened.
         at: NodeContext,
+        /// The underlying error returned by the interpreter.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -254,7 +306,9 @@ pub enum EngineError {
         help("An AST invariant was violated. This usually means a hand-constructed tree omitted a required child.")
     )]
     Malformed {
+        /// Where the invariant violation was detected.
         at: NodeContext,
+        /// Human-readable description of the invariant that failed.
         detail: String,
     },
 
@@ -266,7 +320,9 @@ pub enum EngineError {
         help("The stepper's suspend/resume contract was broken. Each `Suspended` outcome must be resumed exactly once before further steps.")
     )]
     StepperProtocol {
+        /// Where the protocol violation was detected.
         at: NodeContext,
+        /// Human-readable description of the misuse.
         detail: String,
     },
 }
@@ -289,7 +345,9 @@ pub enum StepOutcome<V> {
     /// pinpoints where the suspension happened so hosts can resolve
     /// effects without asking the stepper for extra state.
     Suspended {
+        /// Why the stepper is yielding.
         reason: SuspendReason,
+        /// Where the suspension happened.
         at: NodeContext,
     },
     /// Evaluation completed with a value.
@@ -303,7 +361,9 @@ pub enum StepOutcome<V> {
 /// appear as `Suspended { reason: AwaitEffect, .. }` yields and the host
 /// drives the effect externally before resuming.
 pub trait Stepper {
+    /// Value the stepper produces on completion.
     type Value;
+    /// Error type surfaced from `step` and `run_to_yield`.
     type Error;
 
     /// Runs the next node's semantics.
@@ -328,7 +388,9 @@ pub trait Stepper {
 /// enough — which it usually is — prefer [`Stepper`]: it composes better
 /// with debuggers and with the [`drive_async`] helper below.
 pub trait AsyncStepper {
+    /// Value the stepper produces on completion.
     type Value;
+    /// Error type surfaced from `step_async` and `run_to_yield_async`.
     type Error;
 
     /// Runs the next node's semantics, awaiting any effect the semantics
@@ -361,8 +423,10 @@ pub trait AsyncStepper {
 /// (typically via a channel, a shared map, or a method on the concrete
 /// stepper type).
 pub trait EffectResolver {
+    /// Error surfaced from `resolve` when the effect cannot be produced.
     type Error;
 
+    /// Performs the effect corresponding to `reason` at location `at`.
     fn resolve(
         &mut self,
         at: &NodeContext,

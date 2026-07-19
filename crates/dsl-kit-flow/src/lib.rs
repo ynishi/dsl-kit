@@ -9,6 +9,8 @@
 //! primitive (traversal, breakpoints, suspend / resume, structured
 //! errors) end to end.
 
+#![warn(missing_docs)]
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -24,19 +26,46 @@ use dsl_kit::{
 #[derive(Debug, DslNode)]
 pub enum Flow {
     /// Runs its children in order.
-    Seq { id: NodeId, children: Vec<Flow> },
+    Seq {
+        /// Stable node id.
+        id: NodeId,
+        /// Children evaluated in declaration order.
+        children: Vec<Flow>,
+    },
     /// Runs its children concurrently (this reference stepper schedules
     /// them sequentially, which is enough to demonstrate the event
     /// shape).
-    Par { id: NodeId, children: Vec<Flow> },
+    Par {
+        /// Stable node id.
+        id: NodeId,
+        /// Children scheduled concurrently.
+        children: Vec<Flow>,
+    },
     /// Denotes an external effect; the stepper yields once and resumes
     /// once the host has provided a result.
-    Call { id: NodeId, label: String },
+    Call {
+        /// Stable node id.
+        id: NodeId,
+        /// Label identifying the effect to the host resolver.
+        label: String,
+    },
     /// Wraps a single inner flow with a label; the wrapper adds no
     /// semantics of its own beyond delineating a section.
-    Scope { id: NodeId, label: String, body: Box<Flow> },
+    Scope {
+        /// Stable node id.
+        id: NodeId,
+        /// Human-readable label for the section.
+        label: String,
+        /// Inner flow evaluated within the scope.
+        body: Box<Flow>,
+    },
     /// Optionally runs an inner flow.
-    Maybe { id: NodeId, body: Option<Box<Flow>> },
+    Maybe {
+        /// Stable node id.
+        id: NodeId,
+        /// Inner flow, evaluated when present.
+        body: Option<Box<Flow>>,
+    },
 }
 
 impl Flow {
@@ -174,12 +203,19 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
 /// out.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CountingSink {
+    /// Number of `VisitPre` events observed.
     pub visit_pre: u32,
+    /// Number of `VisitPost` events observed.
     pub visit_post: u32,
+    /// Number of `FrameEnter` events observed.
     pub frame_enter: u32,
+    /// Number of `FrameLeave` events observed.
     pub frame_leave: u32,
+    /// Number of `IterationTick` events observed.
     pub iteration_tick: u32,
+    /// Number of `Suspend` events observed.
     pub suspend: u32,
+    /// Number of `Resume` events observed.
     pub resume: u32,
 }
 
@@ -199,6 +235,7 @@ impl EventSink for CountingSink {
 }
 
 impl CountingSink {
+    /// Returns a single-line human-readable event histogram.
     pub fn summarise(&self) -> String {
         format!(
             "pre={} post={} frame_enter={} frame_leave={} iter={} suspend={} resume={}",

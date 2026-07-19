@@ -9,6 +9,8 @@
 //! wraps the `dsl-kit-flow` reference DSL; the default binary shipped
 //! with the crate serves that host.
 
+#![warn(missing_docs)]
+
 pub mod builder;
 pub mod flow_host;
 pub mod handler;

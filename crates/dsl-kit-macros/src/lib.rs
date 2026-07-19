@@ -4,17 +4,19 @@
 //! fields, exactly one of which is called `id` and typed `NodeId`. The
 //! macro generates three impls in one shot:
 //!
-//! - [`DslNode`] — returns the `id` field for each variant.
-//! - [`Walk`] — returns direct children by inspecting each variant's
+//! - `DslNode` — returns the `id` field for each variant.
+//! - `Walk` — returns direct children by inspecting each variant's
 //!   field types. Any field of type `T`, `Box<T>`, `Option<T>`, or
 //!   `Vec<T>`, where `T` is the enum itself, is treated as a child.
-//! - [`WalkMut`] — mutable counterpart of `Walk`.
+//! - `WalkMut` — mutable counterpart of `Walk`.
 //!
 //! Variants may carry additional fields of unrelated types (payload); those
 //! fields are ignored by the traversal.
 //!
 //! Advanced shapes (indirect recursion through a struct, mixed tuple /
 //! named variants, generic ASTs) can implement the traits by hand.
+
+#![warn(missing_docs)]
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -119,6 +121,11 @@ fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
     }
 }
 
+/// Derives `dsl_kit_core::DslNode`, `Walk`, and `WalkMut` for an enum
+/// whose variants use named fields and carry an `id: NodeId` slot.
+///
+/// See the crate-level docs for the expected shape and the way
+/// recursive fields are picked up.
 #[proc_macro_derive(DslNode)]
 pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
