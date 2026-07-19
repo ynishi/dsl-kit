@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 dsl-kit      = { workspace = true }
 dsl-kit-core = { workspace = true }
+miette       = { version = "7", features = ["fancy"] }
