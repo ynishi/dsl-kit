@@ -31,7 +31,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod drive;
 mod engine;
+pub use drive::{AsyncEffectResolver, DriveOutcome, EffectResolver, drive, drive_async};
 pub use engine::{Ast, Engine, ExecError, NodeKind};
 
 // ---------- Observation primitives --------------------------------------

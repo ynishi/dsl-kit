@@ -175,6 +175,33 @@ pub enum NodeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FrameHandle(usize);
 
+/// One deferred spawn scheduled on [`Engine::spawn_stack`].
+///
+/// The stack is the engine's single spawn schedule: every frame other
+/// than lazily-spawned `Seq` children enters the arena by being popped
+/// from it, one frame per `step_once` pass. LIFO order with children
+/// pushed in reverse preserves the original recursive DFS pre-order,
+/// while giving the breakpoint peek a uniform halt point before *any*
+/// spawn — `Par` kids, `Scope` / `Maybe` bodies, and the root itself.
+struct SpawnEntry {
+    node: NodeId,
+    path: Path,
+    parent: SpawnParent,
+}
+
+/// Where a popped [`SpawnEntry`] wires its freshly-allocated frame.
+enum SpawnParent {
+    /// The entry is the root frame; store the handle on `Engine::root`.
+    Root,
+    /// Append to the parent `Par`'s `children` (declaration order is
+    /// preserved because kids are pushed reversed and popped LIFO).
+    ParChild(FrameHandle),
+    /// Fill the parent `Scope`'s `body` slot.
+    ScopeBody(FrameHandle),
+    /// Fill the parent `Maybe`'s `body` slot.
+    MaybeBody(FrameHandle),
+}
+
 /// A single node in the engine's arena. Each variant corresponds to one
 /// running / suspended / completed AST node.
 #[allow(dead_code)]
@@ -205,12 +232,14 @@ enum InternalFrame<A: Ast> {
         completion_order: Vec<ChildIndex>,
         joined: bool,
     },
-    /// A `Scope` in progress.
+    /// A `Scope` in progress. `body` is `None` while the body's spawn
+    /// is still queued on the spawn stack (transient, at most until the
+    /// enclosing `step` call drains the stack).
     Scope {
         node: NodeId,
         path: Path,
         label: String,
-        body: FrameHandle,
+        body: Option<FrameHandle>,
         body_value: Option<A::Value>,
     },
     /// A `Maybe` in progress.
@@ -278,8 +307,19 @@ pub struct Engine<A: Ast> {
     registry: Arc<ReducerRegistry<A::Value, A::Delta, A::EffectError>>,
 
     frames: Vec<Option<InternalFrame<A>>>,
-    root: FrameHandle,
+    /// Root frame handle. `None` until the first `step` pops the root's
+    /// [`SpawnEntry`] off the spawn stack (the root is scheduled, not
+    /// spawned, at construction — so even root entry is breakpointable).
+    root: Option<FrameHandle>,
     parent: HashMap<FrameHandle, FrameHandle>,
+
+    /// The single spawn schedule (see [`SpawnEntry`]). Drained one
+    /// entry per `step_once` pass, before join-firing and value
+    /// propagation. Empty whenever the engine is blocked on the host —
+    /// except while halted on a breakpoint, where the remaining spawns
+    /// stay queued and the frame tree faithfully shows the partially
+    /// spawned state.
+    spawn_stack: Vec<SpawnEntry>,
 
     pending: Vec<Pending>,
     /// Pending created since the last `step()` return. Drained per
@@ -331,19 +371,31 @@ impl<A: Ast> Engine<A> {
     /// Build a fresh engine anchored at `ast.root()` with the supplied
     /// reducer registry.
     ///
-    /// Returns [`EngineError::Malformed`] if the root or any spawned
-    /// node fails the design-doc §3.5 validation table.
+    /// The whole AST is validated eagerly (design-doc §3.5 table plus
+    /// reducer-id resolution) via a pure `node_kind` pre-walk, so a
+    /// malformed node anywhere in the tree fails here rather than at
+    /// the step that would have spawned it. No frame is spawned and no
+    /// event is emitted at construction: the root itself is only
+    /// *scheduled* on the spawn stack and enters the arena on the first
+    /// `step` — construction is not part of the walk (design doc §5.1).
     pub fn new(
         ast: A,
         registry: Arc<ReducerRegistry<A::Value, A::Delta, A::EffectError>>,
     ) -> Result<Self, EngineError> {
+        Self::validate_ast(&ast, &registry)?;
         let root_id = ast.root();
-        let mut engine = Self {
+        let root_path = Path::root().push(root_id);
+        Ok(Self {
             ast,
             registry,
             frames: Vec::new(),
-            root: FrameHandle(0),
+            root: None,
             parent: HashMap::new(),
+            spawn_stack: vec![SpawnEntry {
+                node: root_id,
+                path: root_path,
+                parent: SpawnParent::Root,
+            }],
             pending: Vec::new(),
             newly_pending: Vec::new(),
             sid_to_frame: HashMap::new(),
@@ -356,20 +408,49 @@ impl<A: Ast> Engine<A> {
             next_call_frame: 1,
             frame_tree_cache: std::sync::OnceLock::new(),
             external_sink: None,
-        };
-        let root_path = Path::root().push(root_id);
-        let root_frame = engine.spawn_frame(root_id, root_path)?;
-        engine.root = root_frame;
-        // `spawn_frame` emits `VisitPre` for every frame it constructs.
-        // Design doc §5.1 defines the event stream as "as it walks",
-        // i.e. as an artefact of `step()` — construction is not part of
-        // the walk. Zero the counter here so the freshly-built engine
-        // reports an empty histogram until the first `step`.
-        engine.events = CountingSink::default();
-        Ok(engine)
+        })
+    }
+
+    /// Pure structural validation of the whole AST: `Par` shape rules
+    /// plus reducer-id resolution, without spawning anything. Shared
+    /// node ids are validated once (`seen` guard also keeps a cyclic
+    /// `node_kind` graph from looping the walk).
+    fn validate_ast(
+        ast: &A,
+        registry: &ReducerRegistry<A::Value, A::Delta, A::EffectError>,
+    ) -> Result<(), EngineError> {
+        let mut stack = vec![ast.root()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match ast.node_kind(id) {
+                NodeKind::Seq { children } => stack.extend(children),
+                NodeKind::Par { children, policy, reducer_id } => {
+                    Self::validate_par(id, &children, policy)?;
+                    registry.resolve(&reducer_id, policy.fail)?;
+                    stack.extend(children);
+                }
+                NodeKind::Scope { body, .. } => stack.push(body),
+                NodeKind::Maybe { body } => {
+                    if let Some(b) = body {
+                        stack.push(b);
+                    }
+                }
+                NodeKind::Call { .. } => {}
+            }
+        }
+        Ok(())
     }
 
     // ---- Public projections (debugger convenience, not on Stepper) --
+
+    /// The AST root node id this engine is anchored on. Stable across
+    /// the whole interpretation; available before the first step.
+    pub fn root_node(&self) -> NodeId {
+        self.ast.root()
+    }
 
     /// Snapshot of the engine's event counter. Exposed for hosts that
     /// want to surface a lightweight activity histogram (see
@@ -392,9 +473,9 @@ impl<A: Ast> Engine<A> {
     /// combinator sink (e.g. one that internally fans out) when more
     /// than one downstream observer is needed.
     ///
-    /// Events emitted while `Engine::new` spawns the root frame are
-    /// **not** forwarded to any attached sink — attach after `new`
-    /// returns.
+    /// Construction emits nothing (the root is scheduled, not spawned,
+    /// in `Engine::new`), so a sink attached right after `new` observes
+    /// the complete walk-time event stream from the first `step` on.
     pub fn attach_sink(
         &mut self,
         sink: Box<dyn EventSink + Send + Sync>,
@@ -457,51 +538,149 @@ impl<A: Ast> Engine<A> {
     // ---- Breakpoint-aware stepping ---------------------------------
 
     /// Same as [`Stepper::step`] but yields a synthetic
-    /// `Pending { reason: Breakpoint }` on the call before advancing
-    /// into a node whose context matches any entry in `bps`.
+    /// `Pending { reason: Breakpoint }` before spawning a frame whose
+    /// context matches any entry in `bps`.
+    ///
+    /// Every spawn passes through the same schedule (the spawn stack
+    /// for `Par` kids / `Scope` and `Maybe` bodies / the root, plus the
+    /// lazy `Seq`-child site), and the check runs between every
+    /// micro-pass of the internal step loop — so a breakpoint halts
+    /// **before the matched frame spawns**, at any depth, including
+    /// under a `Par` cascade and on the root itself. While halted, the
+    /// frame tree and `pending()` faithfully expose the partially
+    /// spawned state; nothing is faked or rolled back.
     ///
     /// The yield is one-shot: the next call to `step_with_breakpoints`
-    /// drops the marker and proceeds. Breakpoint checking currently
-    /// covers frames that are spawned lazily on entry (`Seq` children,
-    /// `Scope` bodies, `Maybe` bodies, and the root); the eager-spawn
-    /// cascade under `Par` construction is not inspected because those
-    /// children are all committed to the frame arena in one atomic
-    /// spawn — matching a `Par` kid's ctx is a known follow-up (Round
-    /// 15 handoff note).
+    /// drops the marker, performs the halted spawn unchecked, and then
+    /// resumes checking (so a subsequent matching site halts again).
+    /// Rarely, when an unrelated `Par` join fires between the resume
+    /// and the halted spawn, the same context can report a second
+    /// consecutive hit; each resume still makes progress.
     pub fn step_with_breakpoints(
         &mut self,
         bps: &BreakpointSet,
     ) -> Result<StepOutcome<A::Value>, ExecError<A::EffectError>> {
         // Resume: previous call yielded on BP — drop the synthetic
-        // pending and delegate to the normal step().
-        if let Some(sid) = self.pending_bp.take() {
+        // pending and let the first micro-pass run unchecked so the
+        // halted spawn actually happens.
+        let resumed = if let Some(sid) = self.pending_bp.take() {
             self.pending.retain(|p| p.id != sid);
             self.newly_pending.retain(|p| p.id != sid);
-            return self.step();
+            true
+        } else {
+            false
+        };
+        self.step_inner(Some(bps), resumed)
+    }
+
+    /// Shared body of [`Stepper::step`] and
+    /// [`Self::step_with_breakpoints`]: run micro-passes
+    /// ([`Self::step_once`]) until the interpretation blocks or
+    /// completes. When `bps` is supplied, peek the next spawn site
+    /// between passes and yield a synthetic breakpoint suspension
+    /// before a matching frame spawns. `skip_first_check` suppresses
+    /// exactly one peek so a just-resumed halt can perform its spawn
+    /// instead of re-halting on the same context.
+    fn step_inner(
+        &mut self,
+        bps: Option<&BreakpointSet>,
+        mut skip_first_check: bool,
+    ) -> Result<StepOutcome<A::Value>, ExecError<A::EffectError>> {
+        // Any successful step may mutate the internal frames. Drop the
+        // cached projection so the next `frame_tree(&self)` rebuilds.
+        self.frame_tree_cache.take();
+        if self.done {
+            if let Some(v) = self.root_value.clone() {
+                return Ok(StepOutcome::Done(v));
+            }
+            // Terminal failure state; caller must treat prior Err as terminal.
+            return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
         }
-        if !bps.is_empty() {
-            if let Some(ctx) = self.peek_next_spawn() {
-                if !bps.matches(&ctx).is_empty() {
-                    let sid = SuspensionId(self.next_sid);
-                    self.next_sid += 1;
-                    let pending = Pending {
-                        id: sid,
-                        reason: SuspendReason::Breakpoint,
-                        at: ctx.clone(),
-                    };
-                    self.pending.push(pending.clone());
-                    self.pending_bp = Some(sid);
-                    self.emit_event(&Event::Suspend {
-                        at: ctx,
-                        reason: SuspendReason::Breakpoint,
-                    });
-                    return Ok(StepOutcome::Blocked {
-                        newly_pending: SmallVec::from_iter([pending]),
-                    });
-                }
+
+        // Root-already-Value fast path — a `Call` root whose leaf was
+        // resolved before this call ran needs to be promoted to Done
+        // here because no interior state machine will fire.
+        if let Some(root) = self.root {
+            if let InternalFrame::Value { value, .. } = self.get(root) {
+                let v = value.clone();
+                self.done = true;
+                self.root_value = Some(v.clone());
+                self.newly_pending.clear();
+                return Ok(StepOutcome::Done(v));
             }
         }
-        self.step()
+
+        loop {
+            if let Some(bps) = bps {
+                if !skip_first_check && !bps.is_empty() {
+                    if let Some(ctx) = self.peek_next_spawn() {
+                        if !bps.matches(&ctx).is_empty() {
+                            let sid = SuspensionId(self.next_sid);
+                            self.next_sid += 1;
+                            let pending = Pending {
+                                id: sid,
+                                reason: SuspendReason::Breakpoint,
+                                at: ctx.clone(),
+                            };
+                            self.pending.push(pending.clone());
+                            self.pending_bp = Some(sid);
+                            self.emit_event(&Event::Suspend {
+                                at: ctx,
+                                reason: SuspendReason::Breakpoint,
+                            });
+                            // Report suspensions spawned earlier in this
+                            // call alongside the synthetic one.
+                            let mut newly: SmallVec<[Pending; 1]> =
+                                std::mem::take(&mut self.newly_pending)
+                                    .into_iter()
+                                    .collect();
+                            newly.push(pending);
+                            return Ok(StepOutcome::Blocked { newly_pending: newly });
+                        }
+                    }
+                }
+                skip_first_check = false;
+            }
+            match self.step_once()? {
+                StepStep::Ready => {
+                    // Check root — extract first, then mutate.
+                    let root_value = match self.root {
+                        Some(root) => {
+                            if let InternalFrame::Value { value, .. } = self.get(root) {
+                                Some(value.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
+                    if let Some(v) = root_value {
+                        self.done = true;
+                        self.root_value = Some(v.clone());
+                        self.newly_pending.clear();
+                        return Ok(StepOutcome::Done(v));
+                    }
+                    // Keep looping to advance further — per design §5.1,
+                    // step() advances as far as possible; the presence
+                    // of newly_pending only dominates the return
+                    // *state* (Blocked, not Ready), not the loop-exit
+                    // decision.
+                    continue;
+                }
+                StepStep::Blocked => {
+                    let newly: SmallVec<[Pending; 1]> =
+                        std::mem::take(&mut self.newly_pending).into_iter().collect();
+                    return Ok(StepOutcome::Blocked { newly_pending: newly });
+                }
+                StepStep::Done => {
+                    if let Some(v) = self.root_value.clone() {
+                        return Ok(StepOutcome::Done(v));
+                    }
+                    return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
+                }
+                StepStep::_Phantom(_) => unreachable!(),
+            }
+        }
     }
 
     /// Loop [`Self::step_with_breakpoints`] until it returns anything
@@ -518,11 +697,16 @@ impl<A: Ast> Engine<A> {
         }
     }
 
-    /// The node context that the next `step()` call would spawn a
-    /// frame at, if any. Used by [`Self::step_with_breakpoints`] to
-    /// decide whether to yield a synthetic breakpoint before advancing.
+    /// The node context that the next micro-pass would spawn a frame
+    /// at, if any. The spawn stack top dominates (it is drained before
+    /// anything else advances); with the stack empty, fall back to the
+    /// lazy `Seq`-child peek. Used by the breakpoint check to yield a
+    /// synthetic suspension before the spawn happens.
     fn peek_next_spawn(&self) -> Option<NodeContext> {
-        self.peek_at(self.root)
+        if let Some(entry) = self.spawn_stack.last() {
+            return Some(Self::synthetic_ctx(entry.node, entry.path.clone()));
+        }
+        self.root.and_then(|r| self.peek_at(r))
     }
 
     fn peek_at(&self, h: FrameHandle) -> Option<NodeContext> {
@@ -556,12 +740,13 @@ impl<A: Ast> Engine<A> {
             InternalFrame::Par { children, .. } => {
                 children.iter().find_map(|c| self.peek_at(*c))
             }
-            InternalFrame::Scope { body, .. } => self.peek_at(*body),
+            InternalFrame::Scope { body: Some(b), .. } => self.peek_at(*b),
             InternalFrame::Maybe { body: Some(b), .. } => self.peek_at(*b),
             InternalFrame::Pending { .. }
             | InternalFrame::Value { .. }
             | InternalFrame::Failed { .. }
             | InternalFrame::Cancelled { .. }
+            | InternalFrame::Scope { body: None, .. }
             | InternalFrame::Maybe { body: None, .. } => None,
         }
     }
@@ -599,8 +784,42 @@ impl<A: Ast> Engine<A> {
 
     // ---- Spawning a frame from a NodeId -----------------------------
 
-    /// Spawn an arena frame for `node_id`. Validates `Par` shape.
-    fn spawn_frame(
+    /// Pop one entry off the spawn stack, spawn its frame, and wire it
+    /// to its parent slot. One call per `step_once` pass — this is the
+    /// uniform halt granularity the breakpoint peek rides on.
+    fn drain_spawn(&mut self, entry: SpawnEntry) -> Result<(), EngineError> {
+        let h = self.spawn_one(entry.node, entry.path)?;
+        match entry.parent {
+            SpawnParent::Root => {
+                self.root = Some(h);
+            }
+            SpawnParent::ParChild(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Par { children, .. } = self.get_mut(p) {
+                    children.push(h);
+                }
+            }
+            SpawnParent::ScopeBody(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Scope { body, .. } = self.get_mut(p) {
+                    *body = Some(h);
+                }
+            }
+            SpawnParent::MaybeBody(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Maybe { body, .. } = self.get_mut(p) {
+                    *body = Some(h);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn an arena frame for `node_id` alone. Composite kinds do not
+    /// cascade: their children / bodies are pushed onto the spawn stack
+    /// (in reverse, preserving DFS pre-order across pops) and enter the
+    /// arena on subsequent passes. Validates `Par` shape.
+    fn spawn_one(
         &mut self,
         node_id: NodeId,
         path: Path,
@@ -637,43 +856,46 @@ impl<A: Ast> Engine<A> {
                     completion_order: Vec::new(),
                     joined: false,
                 });
-                // Spawn every child eagerly.
-                let mut child_handles = Vec::with_capacity(n);
-                for child_id in children {
-                    let child_path = path.push(child_id);
-                    let child = self.spawn_frame(child_id, child_path)?;
-                    self.set_parent(child, par_handle);
-                    child_handles.push(child);
-                }
-                if let InternalFrame::Par { children, .. } = self.get_mut(par_handle) {
-                    *children = child_handles;
+                // Schedule every child; reverse push keeps pop order in
+                // declaration order, so `children` fills positionally
+                // aligned with `slots`.
+                for &child_id in children.iter().rev() {
+                    self.spawn_stack.push(SpawnEntry {
+                        node: child_id,
+                        path: path.push(child_id),
+                        parent: SpawnParent::ParChild(par_handle),
+                    });
                 }
                 Ok(par_handle)
             }
             NodeKind::Scope { label, body } => {
-                let body_path = path.push(body);
-                let body_handle = self.spawn_frame(body, body_path)?;
                 let scope_handle = self.allocate(InternalFrame::Scope {
                     node: node_id,
-                    path,
+                    path: path.clone(),
                     label,
-                    body: body_handle,
+                    body: None,
                     body_value: None,
                 });
-                self.set_parent(body_handle, scope_handle);
+                self.spawn_stack.push(SpawnEntry {
+                    node: body,
+                    path: path.push(body),
+                    parent: SpawnParent::ScopeBody(scope_handle),
+                });
                 Ok(scope_handle)
             }
             NodeKind::Maybe { body } => match body {
                 Some(body_id) => {
-                    let body_path = path.push(body_id);
-                    let body_handle = self.spawn_frame(body_id, body_path)?;
                     let maybe_handle = self.allocate(InternalFrame::Maybe {
                         node: node_id,
-                        path,
-                        body: Some(body_handle),
+                        path: path.clone(),
+                        body: None,
                         body_value: None,
                     });
-                    self.set_parent(body_handle, maybe_handle);
+                    self.spawn_stack.push(SpawnEntry {
+                        node: body_id,
+                        path: path.push(body_id),
+                        parent: SpawnParent::MaybeBody(maybe_handle),
+                    });
                     Ok(maybe_handle)
                 }
                 None => {
@@ -768,18 +990,34 @@ impl<A: Ast> Engine<A> {
         }
 
         // First, look for a failed leaf and propagate FailFast if any.
-        if let Some(failed_leaf) = self.find_failed_leaf(self.root) {
-            return self.propagate_failure(failed_leaf);
+        // Failure preempts everything, including scheduled spawns (any
+        // entries left on the stack after a breakpoint halt simply
+        // never spawn once the engine is done).
+        if let Some(root) = self.root {
+            if let Some(failed_leaf) = self.find_failed_leaf(root) {
+                return self.propagate_failure(failed_leaf);
+            }
         }
 
+        // Then, drain one scheduled spawn. One frame per pass is the
+        // uniform granularity the breakpoint peek interposes on.
+        if let Some(entry) = self.spawn_stack.pop() {
+            self.drain_spawn(entry).map_err(ExecError::Engine)?;
+            return Ok(StepStep::Ready);
+        }
+
+        // Stack empty ⇒ the root has been spawned (Engine::new always
+        // schedules it as the first entry).
+        let root = self.root.expect("spawn stack drained before root spawn");
+
         // Then, try to fold a fireable Par (shape satisfied).
-        if let Some(par_handle) = self.find_fireable_par(self.root) {
+        if let Some(par_handle) = self.find_fireable_par(root) {
             return self.fire_par(par_handle).map_err(ExecError::Engine);
         }
 
         // Then, look for a Seq whose current child produced a value or
         // is unspawned, or a Scope/Maybe whose body produced a value.
-        if self.advance_completed(self.root).map_err(ExecError::Engine)? {
+        if self.advance_completed(root).map_err(ExecError::Engine)? {
             return Ok(StepStep::Ready);
         }
 
@@ -811,9 +1049,10 @@ impl<A: Ast> Engine<A> {
                 Ok(false)
             }
             InternalFrame::Scope { body, .. } => {
-                let body = *body;
-                if self.advance_completed(body)? {
-                    return Ok(true);
+                if let Some(body) = *body {
+                    if self.advance_completed(body)? {
+                        return Ok(true);
+                    }
                 }
                 self.try_scope_promote(h)
             }
@@ -880,7 +1119,7 @@ impl<A: Ast> Engine<A> {
             self.emit_event(&Event::IterationTick {
                 at: Self::synthetic_ctx(node, path.clone()),
             });
-            let child = self.spawn_frame(next_id, child_path)?;
+            let child = self.spawn_one(next_id, child_path)?;
             self.set_parent(child, h);
             if let InternalFrame::Seq {
                 current, next_child, ..
@@ -916,6 +1155,10 @@ impl<A: Ast> Engine<A> {
             (*node, *body, path.clone())
         } else {
             unreachable!()
+        };
+        let Some(body) = body else {
+            // Body spawn still queued on the spawn stack.
+            return Ok(false);
         };
         if let InternalFrame::Value { value, .. } = self.get(body) {
             let value = value.clone();
@@ -978,7 +1221,14 @@ impl<A: Ast> Engine<A> {
                 children,
                 ..
             } => {
-                if !*joined && self.par_shape_fires(policy, completion_order, slots, failures) {
+                // A Par is not fireable until every child frame has
+                // spawned (`children` fills up to `slots.len()` as the
+                // spawn stack drains) — guards against a premature fold
+                // while the cascade is halted on a breakpoint.
+                if !*joined
+                    && children.len() == slots.len()
+                    && self.par_shape_fires(policy, completion_order, slots, failures)
+                {
                     return Some(h);
                 }
                 // Also descend into children.
@@ -992,7 +1242,7 @@ impl<A: Ast> Engine<A> {
             InternalFrame::Seq { current, .. } => {
                 current.and_then(|c| self.find_fireable_par(c))
             }
-            InternalFrame::Scope { body, .. } => self.find_fireable_par(*body),
+            InternalFrame::Scope { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             InternalFrame::Maybe { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             _ => None,
         }
@@ -1154,7 +1404,7 @@ impl<A: Ast> Engine<A> {
                 }
                 None
             }
-            InternalFrame::Scope { body, .. } => self.find_failed_leaf(*body),
+            InternalFrame::Scope { body, .. } => body.and_then(|b| self.find_failed_leaf(b)),
             InternalFrame::Maybe { body, .. } => body.and_then(|b| self.find_failed_leaf(b)),
             _ => None,
         }
@@ -1225,7 +1475,7 @@ impl<A: Ast> Engine<A> {
             }
             InternalFrame::Seq { current, .. } => current.iter().copied().collect::<Vec<_>>(),
             InternalFrame::Par { children, .. } => children.clone(),
-            InternalFrame::Scope { body, .. } => vec![*body],
+            InternalFrame::Scope { body, .. } => body.iter().copied().collect(),
             InternalFrame::Maybe { body, .. } => body.iter().copied().collect(),
         };
         let node = self.get(h).node();
@@ -1321,7 +1571,9 @@ impl<A: Ast> Engine<A> {
                 FrameTree { root: Frame::Par(par), kids }
             }
             InternalFrame::Scope { label, body, .. } => {
-                let kids = vec![self.project_tree(*body)];
+                // `body: None` (spawn still queued) projects as a
+                // Scope with no kids — the honest partial-spawn view.
+                let kids = body.iter().map(|b| self.project_tree(*b)).collect();
                 FrameTree {
                     root: Frame::Scope {
                         label: label.clone(),
@@ -1395,66 +1647,7 @@ impl<A: Ast> Stepper for Engine<A> {
     type Error = ExecError<A::EffectError>;
 
     fn step(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
-        // Any successful step may mutate the internal frames. Drop the
-        // cached projection so the next `frame_tree(&self)` rebuilds.
-        self.frame_tree_cache.take();
-        if self.done {
-            if let Some(v) = self.root_value.clone() {
-                return Ok(StepOutcome::Done(v));
-            }
-            // Terminal failure state; caller must treat prior Err as terminal.
-            return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
-        }
-
-        // Root-already-Value fast path — a `Call` root whose leaf was
-        // resolved before step() ran needs to be promoted to Done here
-        // because no interior state machine will fire.
-        if let InternalFrame::Value { value, .. } = self.get(self.root) {
-            let v = value.clone();
-            self.done = true;
-            self.root_value = Some(v.clone());
-            self.newly_pending.clear();
-            return Ok(StepOutcome::Done(v));
-        }
-
-        loop {
-            match self.step_once()? {
-                StepStep::Ready => {
-                    // Check root — extract first, then mutate.
-                    let root_value = if let InternalFrame::Value { value, .. } =
-                        self.get(self.root)
-                    {
-                        Some(value.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(v) = root_value {
-                        self.done = true;
-                        self.root_value = Some(v.clone());
-                        self.newly_pending.clear();
-                        return Ok(StepOutcome::Done(v));
-                    }
-                    // Keep looping to advance further — per design §5.1,
-                    // step() advances as far as possible; the presence
-                    // of newly_pending only dominates the return
-                    // *state* (Blocked, not Ready), not the loop-exit
-                    // decision.
-                    continue;
-                }
-                StepStep::Blocked => {
-                    let newly: SmallVec<[Pending; 1]> =
-                        std::mem::take(&mut self.newly_pending).into_iter().collect();
-                    return Ok(StepOutcome::Blocked { newly_pending: newly });
-                }
-                StepStep::Done => {
-                    if let Some(v) = self.root_value.clone() {
-                        return Ok(StepOutcome::Done(v));
-                    }
-                    return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
-                }
-                StepStep::_Phantom(_) => unreachable!(),
-            }
-        }
+        self.step_inner(None, false)
     }
 
     fn resolve(
@@ -1567,7 +1760,25 @@ impl<A: Ast> Stepper for Engine<A> {
         // mutation rebuilds the tree and every subsequent read hands
         // back the same allocation until the next mutation.
         self.frame_tree_cache
-            .get_or_init(|| Box::new(self.project_tree(self.root)))
+            .get_or_init(|| {
+                Box::new(match self.root {
+                    Some(root) => self.project_tree(root),
+                    // Root spawn still scheduled (no step yet, or halted
+                    // on a root breakpoint): project a bare node frame
+                    // for the root id with no kids.
+                    None => FrameTree {
+                        root: Frame::Node {
+                            node: self.ast.root(),
+                            env: EnvRef(Arc::new(crate::Env {
+                                delta: A::Delta::default(),
+                                parent: None,
+                            })),
+                            cursor: A::Cursor::default(),
+                        },
+                        kids: Vec::new(),
+                    },
+                })
+            })
             .as_ref()
     }
 
@@ -1583,7 +1794,7 @@ impl<A: Ast> Stepper for Engine<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BufferingSink, Reducer, ReducerCollectAll};
+    use crate::{BreakCondition, BufferingSink, Reducer, ReducerCollectAll};
 
     // ---- A minimal in-core test DSL --------------------------------
 
@@ -2674,16 +2885,319 @@ mod tests {
 
     #[test]
     fn frame_enter_zero_immediately_after_new_when_root_is_call() {
-        // Round 17 invariant: CountingSink is reset at the end of
-        // Engine::new, so root-spawn FrameEnter (as well as VisitPre
-        // and Suspend) must not leak into the observed histogram even
-        // when the root is a Call. Suspend was already covered by the
-        // Round 17 `reset_starts_from_scratch` test; the new FrameEnter
-        // emission needs the same guarantee.
+        // Construction schedules the root on the spawn stack without
+        // spawning it, so no event of any kind is emitted (and no
+        // counter-reset hack is needed) even when the root is a Call.
         let e = build(N::Call("root".into()));
         assert_eq!(e.events().visit_pre, 0);
         assert_eq!(e.events().frame_enter, 0);
         assert_eq!(e.events().frame_leave, 0);
         assert_eq!(e.events().suspend, 0);
+        // The Call has not spawned yet, so nothing is pending either.
+        assert!(e.pending().is_empty(), "no pending before the first step");
+    }
+
+    // ---- F1-b: uniform breakpoint scope (spawn-stack schedule) ------
+
+    fn bp_at(node: u64) -> BreakpointSet {
+        let mut bps = BreakpointSet::new();
+        bps.add(BreakCondition::at_node(NodeId(node)));
+        bps
+    }
+
+    /// Extract the sole Breakpoint-reason pending, if the outcome is a
+    /// breakpoint halt.
+    fn bp_halt(outcome: &StepOutcome<V>) -> Option<NodeId> {
+        if let StepOutcome::Blocked { newly_pending } = outcome {
+            newly_pending
+                .iter()
+                .find(|p| matches!(p.reason, SuspendReason::Breakpoint))
+                .map(|p| p.at.node)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn breakpoint_on_root_halts_before_any_spawn() {
+        // Root is node 1. The BP must fire before the root frame (or
+        // anything else) enters the arena.
+        let ast = N::Seq(vec![N::Call("a".into())]);
+        let mut e = build(ast);
+        let bps = bp_at(1);
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(1)), "halted on root ctx");
+        assert_eq!(e.events().visit_pre, 0, "nothing spawned at halt");
+        // Frame tree faithfully shows the not-yet-started root.
+        let tree = format!("{:?}", e.frame_tree());
+        assert!(tree.contains("Node"), "bare root placeholder projected: {tree}");
+        // Resume: the halted spawn proceeds and the run reaches the Call.
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                assert!(matches!(newly_pending[0].reason, SuspendReason::Call { .. }));
+            }
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breakpoint_on_par_kid_halts_before_that_spawn() {
+        // Seq(1) → Par(2) → Call a(3), Call b(4). BP on kid `b`: the
+        // halt must land after `a` spawned (pending) but before `b`
+        // enters the arena — the partially spawned state is the truth
+        // the debugger sees.
+        let ast = N::Seq(vec![N::Par {
+            children: vec![N::Call("a".into()), N::Call("b".into())],
+            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            reducer: "all_ordered",
+        }]);
+        let mut e = build(ast);
+        let bps = bp_at(4);
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(4)), "halted on kid b's ctx");
+        assert_eq!(e.events().frame_enter, 1, "only kid a spawned so far");
+        let calls: Vec<_> = e
+            .pending()
+            .iter()
+            .filter(|p| matches!(p.reason, SuspendReason::Call { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1, "kid a pending, kid b not yet spawned");
+        assert_eq!(calls[0].at.node, NodeId(3));
+        // Resume → b spawns; the Par is now fully fanned out.
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1, "b's Call joins the pending set");
+                assert_eq!(newly_pending[0].at.node, NodeId(4));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert_eq!(e.events().frame_enter, 2);
+        // Par must not have fired while partially spawned; resolving
+        // both kids completes it normally.
+        let sids: Vec<SuspensionId> = e.pending().iter().map(|p| p.id).collect();
+        for (i, sid) in sids.into_iter().enumerate() {
+            e.resolve(sid, Ok(V::S(format!("v{i}")))).unwrap();
+        }
+        match e.step_with_breakpoints(&bps).unwrap() {
+            StepOutcome::Done(V::List(vs)) => assert_eq!(vs.len(), 2),
+            other => panic!("expected Done(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breakpoints_on_consecutive_par_kids_halt_twice() {
+        // BP on both kids: continue from the first halt must re-arm and
+        // halt again on the second kid.
+        let ast = N::Seq(vec![N::Par {
+            children: vec![N::Call("a".into()), N::Call("b".into())],
+            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            reducer: "all_ordered",
+        }]);
+        let mut e = build(ast);
+        let mut bps = BreakpointSet::new();
+        bps.add(BreakCondition::at_node(NodeId(3)));
+        bps.add(BreakCondition::at_node(NodeId(4)));
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(3)), "first halt on kid a");
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(4)), "second halt on kid b");
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert!(newly_pending
+                    .iter()
+                    .all(|p| matches!(p.reason, SuspendReason::Call { .. })));
+            }
+            other => panic!("expected Blocked on Calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn breakpoint_on_scope_body_halts_before_body_spawn() {
+        // Seq(1) → Scope(2) → Call(3). Before the spawn-stack schedule,
+        // Scope bodies spawned atomically with the Scope itself and this
+        // site was unreachable for breakpoints.
+        let ast = N::Seq(vec![N::Scope("sect".into(), Box::new(N::Call("x".into())))]);
+        let mut e = build(ast);
+        let bps = bp_at(3);
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(3)), "halted on scope body ctx");
+        // Scope frame exists, body slot still empty.
+        let tree = format!("{:?}", e.frame_tree());
+        assert!(tree.contains("Scope"), "scope projected while body pending: {tree}");
+        assert_eq!(e.events().frame_enter, 0, "the Call did not spawn yet");
+        // Resume runs through to the Call suspension.
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert!(matches!(newly_pending[0].reason, SuspendReason::Call { .. }));
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+    }
+
+    // ---- F2: sans-io drive layer -----------------------------------
+
+    use crate::drive::{AsyncEffectResolver, DriveOutcome, EffectResolver, drive, drive_async};
+
+    /// Echoes each Call's label back as its value and records
+    /// cancellation notifications.
+    struct EchoResolver {
+        resolved: Vec<String>,
+        cancelled: Vec<SuspensionId>,
+    }
+
+    impl EchoResolver {
+        fn new() -> Self {
+            Self { resolved: Vec::new(), cancelled: Vec::new() }
+        }
+
+        fn answer(&mut self, pending: &Pending) -> Result<V, EE> {
+            let label = match &pending.reason {
+                SuspendReason::Call { spec } => spec.label.clone(),
+                other => panic!("resolver saw non-Call reason {other:?}"),
+            };
+            self.resolved.push(label.clone());
+            Ok(V::S(format!("r:{label}")))
+        }
+    }
+
+    impl EffectResolver<TestAst> for EchoResolver {
+        fn resolve(&mut self, pending: &Pending) -> Result<V, EE> {
+            self.answer(pending)
+        }
+
+        fn cancelled(&mut self, sid: SuspensionId) {
+            self.cancelled.push(sid);
+        }
+    }
+
+    impl AsyncEffectResolver<TestAst> for EchoResolver {
+        async fn resolve(&mut self, pending: &Pending) -> Result<V, EE> {
+            self.answer(pending)
+        }
+
+        fn cancelled(&mut self, sid: SuspensionId) {
+            self.cancelled.push(sid);
+        }
+    }
+
+    /// Minimal executor for the always-ready futures the tests build —
+    /// keeps the crate free of a dev runtime dependency.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(v) => return v,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn drive_runs_seq_of_calls_to_done() {
+        let ast = N::Seq(vec![N::Call("a".into()), N::Call("b".into())]);
+        let mut e = build(ast);
+        let mut r = EchoResolver::new();
+        let out = drive(&mut e, &mut r, &BreakpointSet::new()).unwrap();
+        match out {
+            DriveOutcome::Done(V::S(s)) => assert_eq!(s, "r:b", "last value propagates"),
+            other => panic!("expected Done, got {other:?}"),
+        }
+        assert_eq!(r.resolved, vec!["a".to_string(), "b".to_string()]);
+        assert!(r.cancelled.is_empty());
+    }
+
+    #[test]
+    fn drive_any_join_skips_losers_and_reports_cancellation() {
+        // Sequential v1 semantics: the first kid resolves, the join
+        // fires, and the loser is *cancelled* — never handed to the
+        // resolver.
+        let ast = N::Par {
+            children: vec![N::Call("a".into()), N::Call("b".into())],
+            policy: any_ff(),
+            reducer: "any_first",
+        };
+        let mut e = build(ast);
+        let mut r = EchoResolver::new();
+        let out = drive(&mut e, &mut r, &BreakpointSet::new()).unwrap();
+        assert!(matches!(out, DriveOutcome::Done(V::S(ref s)) if s == "r:a"));
+        assert_eq!(r.resolved, vec!["a".to_string()], "loser never resolved");
+        assert_eq!(r.cancelled.len(), 1, "loser reported through cancelled()");
+    }
+
+    #[test]
+    fn drive_breaks_on_breakpoint_and_resumes() {
+        // BP on the second Call (node 3): first drive run resolves `a`,
+        // halts before `b` spawns, and returns Break; the second run
+        // resumes to Done.
+        let ast = N::Seq(vec![N::Call("a".into()), N::Call("b".into())]);
+        let mut e = build(ast);
+        let mut r = EchoResolver::new();
+        let bps = bp_at(3);
+        let out = drive(&mut e, &mut r, &bps).unwrap();
+        match out {
+            DriveOutcome::Break { at } => {
+                assert!(at.iter().any(|p| matches!(p.reason, SuspendReason::Breakpoint)));
+            }
+            other => panic!("expected Break, got {other:?}"),
+        }
+        assert_eq!(r.resolved, vec!["a".to_string()], "halted before b");
+        let out = drive(&mut e, &mut r, &bps).unwrap();
+        assert!(matches!(out, DriveOutcome::Done(V::S(ref s)) if s == "r:b"));
+        assert_eq!(r.resolved, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn drive_async_mirrors_sync_loop() {
+        let ast = N::Seq(vec![
+            N::Call("a".into()),
+            N::Par {
+                children: vec![N::Call("l".into()), N::Call("r".into())],
+                policy: all_ff(),
+                reducer: "all_ordered",
+            },
+        ]);
+        let mut e = build(ast);
+        let mut r = EchoResolver::new();
+        let out = block_on(drive_async(&mut e, &mut r, &BreakpointSet::new())).unwrap();
+        match out {
+            DriveOutcome::Done(V::List(vs)) => assert_eq!(vs.len(), 2),
+            other => panic!("expected Done(List), got {other:?}"),
+        }
+        assert_eq!(
+            r.resolved,
+            vec!["a".to_string(), "l".to_string(), "r".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_par_behind_seq_fails_at_build() {
+        // Full-AST validation pre-walk: a malformed Par that the old
+        // eager cascade would only reach at step time (behind a lazy
+        // Seq child) now fails at Engine::new.
+        let ast = N::Seq(vec![
+            N::Call("first".into()),
+            N::Par {
+                children: vec![],
+                policy: JoinPolicy { shape: JoinShape::Any, fail: FailPolicy::FailFast },
+                reducer: "all_ordered",
+            },
+        ]);
+        let ast = TestAst::build(ast);
+        let err = Engine::new(ast, default_registry()).unwrap_err();
+        assert!(matches!(err, EngineError::Malformed { .. }), "got {err:?}");
     }
 }

@@ -1,29 +1,83 @@
 //! Reference demo for the flow DSL.
 //!
-//! The binary is structured in five sections:
+//! The binary is structured in six sections:
 //!
 //! 1. Walks the AST with the derived traversal, prints an indented
 //!    tree.
-//! 2. Runs the pipeline synchronously with a canned resolver.
+//! 2. Runs the pipeline synchronously through the sans-io drive layer
+//!    (`dsl_kit::drive` + an `EffectResolver` backed by canned
+//!    responses) — no hand-rolled step/resolve loop.
 //! 3. Runs one pipeline through the v3 async pattern with **real inline
 //!    fan-out**: at the `Par` node all three searches are dispatched
 //!    as concurrent `tokio::spawn` tasks and their responses are
-//!    plumbed back as each future completes.
+//!    plumbed back as each future completes. This is the hand-rolled
+//!    concurrent alternative to `drive_async` (which resolves
+//!    sequentially by design) for hosts with an executor opinion.
 //! 4. Runs a FailFast demo: one Par slot resolves with an effect
 //!    error; the next step surfaces the error and the sibling ids
 //!    appear in `Stepper::take_cancellations`.
-//! 5. Exercises the breakpoint surface and renders a diagnostic error.
+//! 5. Drives the pipeline against a live breakpoint on a `Par` kid:
+//!    the drive loop returns `DriveOutcome::Break` **before the kid
+//!    spawns** (uniform spawn-stack breakpoint scope), then resumes to
+//!    completion.
+//! 6. Exercises the static breakpoint-condition surface and renders a
+//!    diagnostic error.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dsl_kit::{
-    BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId, Path,
-    StepOutcome, Stepper, SuspensionId, Walk,
+    BreakCondition, BreakpointId, BreakpointSet, DriveOutcome, DslNode, EffectResolver, Engine,
+    IdGen, NodeContext, NodeId, Path, Pending, Phase, StepOutcome, Stepper, SuspendReason,
+    SuspensionId, Walk, drive,
 };
 use flow_dsl::{
-    Flow, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids, pretty,
-    research_pipeline,
+    Flow, FlowAst, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids,
+    flow_default_registry, pretty, research_pipeline,
 };
+
+/// Sync effect backend for the drive layer: answers every `Call` with
+/// the canned response for its label, printing a one-line trace and
+/// recording the result per node so the demo can render a results
+/// table afterwards.
+#[derive(Default)]
+struct CannedResolver {
+    results: Vec<(NodeId, String)>,
+}
+
+impl<'a> EffectResolver<FlowAst<'a>> for CannedResolver {
+    fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
+        let label = match &pending.reason {
+            SuspendReason::Call { spec } => spec.label.clone(),
+            other => unreachable!("drive only hands Call suspensions to the resolver: {other:?}"),
+        };
+        let response = canned_response(&label);
+        println!(
+            "  {:>4} {label:<15} -> {response}   ({})",
+            pending.at.node.to_string(),
+            pending.at.path
+        );
+        self.results.push((pending.at.node, response.clone()));
+        Ok(FlowValue::Text(response))
+    }
+}
+
+/// Finds the first `Call` node carrying `label` (node IDs are assigned
+/// at build time, so the demo looks the target up by label).
+fn find_call_node(flow: &Flow, target: &str) -> Option<NodeId> {
+    let mut found: Option<NodeId> = None;
+    flow.walk(&mut |node, phase| {
+        if phase != Phase::Pre {
+            return;
+        }
+        if let Flow::Call { id, label } = node {
+            if label == target && found.is_none() {
+                found = Some(*id);
+            }
+        }
+    });
+    found
+}
 
 /// Illustrates the breakpoint condition surface by walking the AST once
 /// and reporting which nodes each condition matches.
@@ -252,57 +306,22 @@ async fn main() -> miette::Result<()> {
 
     check_unique_ids(&program).map_err(miette::Report::new)?;
 
-    println!("\n=== Running the pipeline ===");
-    let mut stepper = FlowStepper::new(&program);
-    let bp = BreakpointSet::new();
-    loop {
-        let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
-        match outcome {
-            StepOutcome::Ready => {}
-            StepOutcome::Done(_) => break,
-            StepOutcome::Blocked { .. } => {
-                // Single-Call yield: prefer `suspended_call` for the
-                // pretty single-line trace. Fan-out yield: resolve
-                // every outstanding Call in one batch.
-                if let Some((sid, node_id, label)) = stepper.suspended_call() {
-                    let response = canned_response(label);
-                    let at = stepper.current_path().map(|p| p.to_string()).unwrap_or_default();
-                    println!("  {node_id:>4} {label:<15} -> {response}   ({at})");
-                    stepper
-                        .resolve(sid, Ok(FlowValue::Text(response)))
-                        .expect("resolve");
-                } else {
-                    let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
-                        .pending()
-                        .iter()
-                        .filter_map(|p| match &p.reason {
-                            dsl_kit::SuspendReason::Call { spec } => {
-                                Some((p.id, spec.label.clone()))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    if outstanding.is_empty() {
-                        break;
-                    }
-                    for (sid, label) in outstanding {
-                        let response = canned_response(&label);
-                        println!("  (par) {label:<15} -> {response}");
-                        stepper
-                            .resolve(sid, Ok(FlowValue::Text(response)))
-                            .expect("resolve");
-                    }
-                }
-            }
+    println!("\n=== Running the pipeline (sans-io drive) ===");
+    let mut engine = Engine::new(FlowAst::new(&program), Arc::new(flow_default_registry()))
+        .map_err(miette::Report::new)?;
+    let mut resolver = CannedResolver::default();
+    match drive(&mut engine, &mut resolver, &BreakpointSet::new()).expect("drive") {
+        DriveOutcome::Done(v) => println!("  pipeline value: {v:?}"),
+        DriveOutcome::Break { at } => {
+            println!("  unexpected break with {} suspension(s)", at.len());
         }
     }
 
     println!("\n=== Event summary ===");
-    println!("  {}", stepper.event_summary());
+    println!("  {}", engine.event_summary());
 
     println!("\n=== Recorded results ===");
-    let mut results: Vec<(NodeId, String)> =
-        stepper.results().iter().map(|(id, s)| (*id, s.clone())).collect();
+    let mut results = resolver.results.clone();
     results.sort_by_key(|(id, _)| id.0);
     for (id, text) in &results {
         println!("  {id}: {text}");
@@ -326,7 +345,31 @@ async fn main() -> miette::Result<()> {
     println!("\n=== FailFast demo (Par of 3, middle slot fails) ===");
     run_failfast_demo();
 
-    println!("\n=== Breakpoints ===");
+    println!("\n=== Drive with a live breakpoint (halt before a Par kid spawns) ===");
+    let target = find_call_node(&program, "search_github").expect("pipeline has search_github");
+    let mut engine = Engine::new(FlowAst::new(&program), Arc::new(flow_default_registry()))
+        .map_err(miette::Report::new)?;
+    let mut resolver = CannedResolver::default();
+    let mut bps = BreakpointSet::new();
+    bps.add(BreakCondition::at_node(target));
+    println!("  breakpoint set on {target} (Call \"search_github\", 2nd Par kid)");
+    match drive(&mut engine, &mut resolver, &bps).expect("drive to break") {
+        DriveOutcome::Break { at } => {
+            println!("  halted BEFORE {target} spawned; live suspensions at the halt:");
+            for p in &at {
+                println!("    {:>4} {}", p.at.node.to_string(), p.reason);
+            }
+        }
+        DriveOutcome::Done(_) => println!("  unexpected completion without a break"),
+    }
+    match drive(&mut engine, &mut resolver, &bps).expect("drive to done") {
+        DriveOutcome::Done(v) => println!("  resumed to completion: {v:?}"),
+        DriveOutcome::Break { at } => {
+            println!("  halted again with {} suspension(s)", at.len());
+        }
+    }
+
+    println!("\n=== Breakpoints (static condition matching) ===");
     demonstrate_breakpoints(&program);
 
     println!("\n=== Error rendering (malformed AST) ===");
