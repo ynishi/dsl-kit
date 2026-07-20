@@ -4,15 +4,21 @@
 //! [`dsl-kit-mcp`](dsl_kit_mcp). Consumed by the `flow-mcp` binary
 //! (default payload of the reference MCP server) and useful as a
 //! worked example when writing your own `DslHost` adapter.
+//!
+//! Commit A landing note: the internal `FlowStepper` now satisfies the
+//! v3 `Stepper` trait; `FlowHost` bridges its `DslHost` (`step_one` /
+//! `resolve` / …) contract to the new stepper API. The `DslHost` trait
+//! itself is untouched in Commit A; new fan-out surface (pending list,
+//! cancellation drain) lands in Commit B.
 
 #![warn(missing_docs)]
 
-use dsl_kit::{BreakpointSet, DslNode, IdGen, Phase, StepOutcome, Walk};
+use dsl_kit::{BreakpointSet, DslNode, IdGen, Phase, Stepper, Walk};
 use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, ResolvedCall, SuspendedCall,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
-use flow_dsl::{Flow, FlowStepper, canned_response, pretty, research_pipeline};
+use flow_dsl::{Flow, FlowStepper, FlowValue, InternalOutcome, canned_response, pretty, research_pipeline};
 
 const FLOW_GRAMMAR: &str = include_str!("./resources_data/grammar.md");
 const FLOW_RESEARCH_PIPELINE: &str =
@@ -83,8 +89,8 @@ impl DslHost for FlowHost {
         results.sort_by_key(|(id, _)| *id);
 
         let suspended_call =
-            self.stepper.suspended_call().map(|(id, label)| SuspendedCall {
-                node: id.0,
+            self.stepper.suspended_call().map(|(_sid, node_id, label)| SuspendedCall {
+                node: node_id.0,
                 label: label.to_string(),
             });
 
@@ -130,15 +136,13 @@ impl DslHost for FlowHost {
                 .map_err(|e| e.to_string())?;
             steps += 1;
             match outcome {
-                StepOutcome::Suspended { .. } => {
-                    if let Some((id, label)) = self.stepper.suspended_call() {
+                InternalOutcome::Suspended { .. } => {
+                    if let Some((sid, _node, label)) = self.stepper.suspended_call() {
                         let response = canned_response(label);
-                        self.stepper.record_result(id, response);
+                        self.stepper
+                            .resolve(sid, Ok(FlowValue::Text(response)))
+                            .map_err(|e| e.to_string())?;
                     }
-                    // Breakpoint yields have no call to resolve; the
-                    // next iteration transitions normally because the
-                    // stepper's `breakpoint_yielded` guard has been
-                    // cleared.
                 }
                 other => return Ok(outcome_to_host(other)),
             }
@@ -149,14 +153,16 @@ impl DslHost for FlowHost {
     }
 
     async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String> {
-        let (id, label) = self
+        let (sid, node_id, label) = self
             .stepper
             .suspended_call()
-            .map(|(id, label)| (id, label.to_string()))
+            .map(|(sid, id, label)| (sid, id, label.to_string()))
             .ok_or_else(|| "no suspended call to resolve".to_string())?;
         let response = result.unwrap_or_else(|| canned_response(&label));
-        self.stepper.record_result(id, response.clone());
-        Ok(ResolvedCall { node: id.0, label, result: response })
+        self.stepper
+            .resolve(sid, Ok(FlowValue::Text(response.clone())))
+            .map_err(|e| e.to_string())?;
+        Ok(ResolvedCall { node: node_id.0, label, result: response })
     }
 
     fn reset(&mut self) {
@@ -181,10 +187,10 @@ impl DslHost for FlowHost {
     }
 }
 
-fn outcome_to_host(outcome: StepOutcome<()>) -> HostOutcome {
+fn outcome_to_host(outcome: InternalOutcome) -> HostOutcome {
     match outcome {
-        StepOutcome::Advanced => HostOutcome::Advanced,
-        StepOutcome::Suspended { reason, at } => HostOutcome::Suspended {
+        InternalOutcome::Advanced => HostOutcome::Advanced,
+        InternalOutcome::Suspended { reason, at } => HostOutcome::Suspended {
             reason: reason.to_string(),
             at: HostLocation {
                 node: at.node.0,
@@ -194,6 +200,6 @@ fn outcome_to_host(outcome: StepOutcome<()>) -> HostOutcome {
                 iteration: at.iteration.map(|i| i.0),
             },
         },
-        StepOutcome::Done(()) => HostOutcome::Done,
+        InternalOutcome::Done => HostOutcome::Done,
     }
 }

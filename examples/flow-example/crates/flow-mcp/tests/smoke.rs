@@ -135,24 +135,24 @@ async fn breakpoint_pauses_stepper_at_matching_node() {
     // Pause on node 4 (Call "search_arxiv").
     call_bp_add(&handler, 4).await;
 
-    // Run to yield: should first hit the initial call at n1 (AwaitEffect).
+    // Run to yield: should first hit the initial Call at n1.
     let first = call_step(&handler, "to_yield").await;
     assert_eq!(first["kind"], "suspended");
-    assert_eq!(first["reason"], "await-effect");
+    assert_eq!(first["reason"], "call(fetch_query)");
     assert_eq!(first["at"]["node"], 1);
     call_resolve(&handler, Some("ok")).await;
 
-    // Continue: should now hit the breakpoint at n4 before any await.
+    // Continue: should now hit the breakpoint at n4 before any Call.
     let second = call_step(&handler, "to_yield").await;
     assert_eq!(second["kind"], "suspended");
     assert_eq!(second["reason"], "breakpoint");
     assert_eq!(second["at"]["node"], 4);
 
     // Stepping again transitions past the breakpoint and reaches the
-    // n4 Call's own AwaitEffect suspension.
+    // n4 Call's own suspension.
     let third = call_step(&handler, "to_yield").await;
     assert_eq!(third["kind"], "suspended");
-    assert_eq!(third["reason"], "await-effect");
+    assert_eq!(third["reason"], "call(search_arxiv)");
     assert_eq!(third["at"]["node"], 4);
 }
 

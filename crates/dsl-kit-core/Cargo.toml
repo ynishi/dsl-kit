@@ -3,11 +3,12 @@ name = "dsl-kit-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Engine primitives for dsl-kit: node ID, call frame, stepper, event stream."
+description = "Engine primitives for dsl-kit: node ID, call frame, stepper, event stream, structured fan-out."
 
 [dependencies]
-miette    = { version = "7", features = ["fancy"] }
-thiserror = "2"
+miette      = { version = "7", features = ["fancy"] }
+thiserror   = "2"
+serde_json  = "1"
+smallvec    = "1"
 
 [dev-dependencies]
-futures = "0.3"

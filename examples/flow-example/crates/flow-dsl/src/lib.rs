@@ -1,13 +1,14 @@
-//! Reference flow DSL for `dsl-kit`.
+//! Reference flow DSL for `dsl-kit` (v3 engine shape).
 //!
-//! This crate defines a small orchestration DSL — `Seq`, `Par`, `Call`,
-//! `Scope`, `Maybe` — with a hand-rolled stepper that drives the AST
-//! through the engine's event stream. It is used by the flow example
-//! and by the MCP server as a concrete DSL to debug.
+//! Defines a small orchestration DSL — `Seq`, `Par`, `Call`, `Scope`,
+//! `Maybe` — with a stepper that satisfies the v3 [`Stepper`] trait.
 //!
-//! The DSL is deliberately tiny; its role is to exercise every engine
-//! primitive (traversal, breakpoints, suspend / resume, structured
-//! errors) end to end.
+//! Commit A landing note: the type shape is full v3 (associated types
+//! `Value` / `Cursor` / `Delta` / `EffectError` / `Error`, N-in-flight
+//! `pending()`, `take_cancellations()`, `frame_tree()` view). `Par`
+//! semantics remain sequential internally in Commit A; real fan-out
+//! schedule + `ParFrame` bookkeeping lands in Commit B alongside the
+//! MCP fan-out surface.
 
 #![warn(missing_docs)]
 
@@ -15,15 +16,16 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use dsl_kit::{
-    AsyncStepper, BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink,
-    IdGen, Iteration, NodeContext, NodeId, Path, Phase, StepOutcome, Stepper, SuspendReason, Walk,
+    BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, Frame,
+    FrameTree, IdGen, Iteration, NodeContext, NodeId, Path, Phase, Pending, StepOutcome, Stepper,
+    SuspendReason, SuspensionId, Walk,
 };
+use smallvec::SmallVec;
+
+// ---------- AST ---------------------------------------------------------
 
 /// AST of the flow DSL.
-///
-/// Every variant carries an `id: NodeId` slot so the derive can attach
-/// traversal and identification without extra attributes.
-#[derive(Debug, DslNode)]
+#[derive(Debug, dsl_kit_macros::DslNode)]
 pub enum Flow {
     /// Runs its children in order.
     Seq {
@@ -32,9 +34,8 @@ pub enum Flow {
         /// Children evaluated in declaration order.
         children: Vec<Flow>,
     },
-    /// Runs its children concurrently (this reference stepper schedules
-    /// them sequentially, which is enough to demonstrate the event
-    /// shape).
+    /// Runs its children concurrently in principle; the Commit A
+    /// reference stepper still schedules them sequentially.
     Par {
         /// Stable node id.
         id: NodeId,
@@ -49,8 +50,7 @@ pub enum Flow {
         /// Label identifying the effect to the host resolver.
         label: String,
     },
-    /// Wraps a single inner flow with a label; the wrapper adds no
-    /// semantics of its own beyond delineating a section.
+    /// Wraps a single inner flow with a label.
     Scope {
         /// Stable node id.
         id: NodeId,
@@ -102,10 +102,6 @@ pub fn pretty(flow: &Flow) -> String {
 }
 
 /// Confirms that every `NodeId` in the tree is unique.
-///
-/// Callers usually allocate ids with a shared [`IdGen`], but hand-
-/// authored trees can accidentally reuse an id and this check exists to
-/// surface that as a structured error.
 pub fn check_unique_ids(flow: &Flow) -> EngineResult<()> {
     let mut seen: HashSet<NodeId> = HashSet::new();
     let mut duplicate: Option<NodeId> = None;
@@ -129,10 +125,6 @@ pub fn check_unique_ids(flow: &Flow) -> EngineResult<()> {
 }
 
 /// Canned effect responses keyed by call label.
-///
-/// A real host would forward each call to an LLM, a tool, or an MCP
-/// server. The reference DSL ships with prewritten strings so tests and
-/// demos run offline.
 pub fn canned_response(label: &str) -> String {
     match label {
         "fetch_query" => "How does miette structure diagnostics?".into(),
@@ -150,24 +142,6 @@ pub fn canned_response(label: &str) -> String {
 }
 
 /// Builds a small research pipeline expressed in the flow DSL.
-///
-/// ```text
-/// Seq(
-///     Call "fetch_query",
-///     Scope "web_research" {
-///         Par(
-///             Call "search_arxiv",
-///             Call "search_github",
-///             Call "search_web",
-///         )
-///     },
-///     Call "synthesise",
-///     Maybe(
-///         Call "citation_check",
-///     ),
-///     Call "write_report",
-/// )
-/// ```
 pub fn research_pipeline(ids: &IdGen) -> Flow {
     Flow::Seq {
         id: ids.node(),
@@ -198,9 +172,55 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
     }
 }
 
-/// Silent event sink that counts each event kind. Handy when the demo
-/// wants to summarise "how much happened" without spelling every step
-/// out.
+// ---------- Flow value / error types (v3 associated type instances) ----
+
+/// Value type produced by the flow DSL.
+///
+/// Individual `Call` responses arrive as `Text(String)`. Aggregate
+/// reducer output (Commit B) uses `List`. `Unit` is the value the whole
+/// interpretation returns since the top-level flow produces "just
+/// finished" and results are exposed through `results()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowValue {
+    /// No meaningful value (top-level completion marker).
+    Unit,
+    /// A textual effect response.
+    Text(String),
+    /// A list of nested values (used by CollectAll reducers).
+    List(Vec<FlowValue>),
+}
+
+/// Effect-side failure the host reports through `resolve(id, Err(_))`.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("flow effect error [{code}]: {message}")]
+pub struct FlowEffectErr {
+    /// Short machine-readable code.
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Top-level error type for the flow interpretation.
+#[derive(Debug, thiserror::Error)]
+pub enum FlowError {
+    /// An engine-level error (from `dsl-kit-core`).
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    /// An effect-side failure surfaced via `resolve`.
+    #[error(transparent)]
+    Effect(#[from] FlowEffectErr),
+}
+
+/// Placeholder cursor type. The Commit A `FlowStepper` retains its
+/// internal state machine (`Vec<Frame>` stack) and does not expose a
+/// per-node cursor; Commit B may replace the shadow stack with a real
+/// `FrameTree` walk and populate this type meaningfully.
+#[derive(Debug, Clone, Default)]
+pub struct FlowCursor;
+
+// ---------- CountingSink -----------------------------------------------
+
+/// Silent event sink that counts each event kind.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CountingSink {
     /// Number of `VisitPre` events observed.
@@ -250,26 +270,34 @@ impl CountingSink {
     }
 }
 
+// ---------- FlowStepper (internal state machine + v3 Stepper impl) -----
+
 /// Stepper over a `Flow` program.
 ///
-/// The stepper walks the AST depth-first, emitting the observable
-/// events (`VisitPre` / `VisitPost` / `FrameEnter` / `FrameLeave` /
-/// `IterationTick` / `Suspend` / `Resume`) at each transition, and
-/// yielding `Suspended { reason: AwaitEffect, .. }` at every `Call`
-/// node so the host can supply the response.
+/// Internal semantics (Commit A): sequential DFS walk with a
+/// `Vec<InternalFrame>` stack. `Par` schedules children sequentially.
+/// Every `Call` yields one `Pending` at a time (single in-flight).
+///
+/// The public [`Stepper`] impl adapts this to the v3 shape: assigns a
+/// [`SuspensionId`] on each yield, exposes it through
+/// [`Stepper::pending`], and accepts
+/// `resolve(id, Result<FlowValue, FlowEffectErr>)`.
 pub struct FlowStepper<'a> {
-    stack: Vec<Frame<'a>>,
+    stack: Vec<InternalFrame<'a>>,
     events: CountingSink,
     next_frame: u64,
     suspend_pending: bool,
-    results: HashMap<NodeId, String>,
-    /// Set on the step that follows a breakpoint yield, so the next
-    /// `step_with_breakpoints` call skips the recheck and lets the
-    /// underlying `step()` proceed with normal semantics.
     breakpoint_yielded: bool,
+    // v3 shadow state
+    next_suspension: u64,
+    pending: Vec<Pending>,
+    id_to_node: HashMap<SuspensionId, NodeId>,
+    results: HashMap<NodeId, String>,
+    done: bool,
+    frame_tree_stub: FrameTree<FlowValue, FlowCursor, ()>,
 }
 
-struct Frame<'a> {
+struct InternalFrame<'a> {
     node: &'a Flow,
     path: Path,
     state: FrameState<'a>,
@@ -293,30 +321,47 @@ impl<'a> FlowStepper<'a> {
     pub fn new(root: &'a Flow) -> Self {
         let path = Path::root().push(root.node_id());
         Self {
-            stack: vec![Frame { node: root, path, state: FrameState::Enter, frame_id: None }],
+            stack: vec![InternalFrame {
+                node: root,
+                path,
+                state: FrameState::Enter,
+                frame_id: None,
+            }],
             events: CountingSink::default(),
             next_frame: 1,
             suspend_pending: false,
-            results: HashMap::new(),
             breakpoint_yielded: false,
+            next_suspension: 1,
+            pending: Vec::new(),
+            id_to_node: HashMap::new(),
+            results: HashMap::new(),
+            done: false,
+            frame_tree_stub: FrameTree {
+                root: Frame::Node {
+                    node: root.node_id(),
+                    env: dsl_kit::EnvRef(std::sync::Arc::new(dsl_kit::Env {
+                        delta: (),
+                        parent: None,
+                    })),
+                    cursor: FlowCursor,
+                },
+                kids: Vec::new(),
+            },
         }
     }
 
-    /// Runs a single step, first checking whether the next node's
-    /// `Enter` phase matches any registered breakpoint. When a
-    /// breakpoint fires the stepper yields
-    /// `Suspended { reason: Breakpoint, .. }` without advancing;
-    /// the next call transitions normally.
+    /// Breakpoint-aware step. Emits `Suspended { reason: Breakpoint }`
+    /// once when the next `Enter` matches a registered condition.
     pub fn step_with_breakpoints(
         &mut self,
         breakpoints: &BreakpointSet,
-    ) -> Result<StepOutcome<()>, EngineError> {
+    ) -> Result<InternalOutcome, EngineError> {
         if self.breakpoint_yielded {
             self.breakpoint_yielded = false;
-            return self.step();
+            return self.step_internal();
         }
         if breakpoints.is_empty() || self.stack.is_empty() {
-            return self.step();
+            return self.step_internal();
         }
 
         let frame = self.stack.last().expect("non-empty");
@@ -328,31 +373,31 @@ impl<'a> FlowStepper<'a> {
                     at: ctx.clone(),
                     reason: SuspendReason::Breakpoint,
                 });
-                return Ok(StepOutcome::Suspended {
+                return Ok(InternalOutcome::Suspended {
                     reason: SuspendReason::Breakpoint,
                     at: ctx,
                 });
             }
         }
 
-        self.step()
+        self.step_internal()
     }
 
-    /// Loops [`Self::step_with_breakpoints`] until suspension,
-    /// completion, or error.
+    /// Loops [`Self::step_with_breakpoints`] until suspension, completion,
+    /// or error.
     pub fn run_to_yield_with_breakpoints(
         &mut self,
         breakpoints: &BreakpointSet,
-    ) -> Result<StepOutcome<()>, EngineError> {
+    ) -> Result<InternalOutcome, EngineError> {
         loop {
             match self.step_with_breakpoints(breakpoints)? {
-                StepOutcome::Advanced => continue,
+                InternalOutcome::Advanced => continue,
                 other => return Ok(other),
             }
         }
     }
 
-    fn ctx(&self, frame: &Frame<'_>) -> NodeContext {
+    fn ctx(&self, frame: &InternalFrame<'_>) -> NodeContext {
         NodeContext {
             node: frame.node.node_id(),
             path: frame.path.clone(),
@@ -362,33 +407,36 @@ impl<'a> FlowStepper<'a> {
         }
     }
 
-    /// If the stepper is currently paused on a `Call` node, returns the
-    /// node's `(id, label)`.
-    pub fn suspended_call(&self) -> Option<(NodeId, &str)> {
+    /// If the stepper is currently paused on a `Call` node, returns
+    /// `(SuspensionId, NodeId, label)`.
+    pub fn suspended_call(&self) -> Option<(SuspensionId, NodeId, &str)> {
         let frame = self.stack.last()?;
         if !matches!(frame.state, FrameState::CallSuspending) {
             return None;
         }
-        match frame.node {
-            Flow::Call { id, label } => Some((*id, label.as_str())),
-            _ => None,
-        }
+        let (node_id, label) = match frame.node {
+            Flow::Call { id, label } => (*id, label.as_str()),
+            _ => return None,
+        };
+        let sid = self.pending.iter().find(|p| p.at.node == node_id).map(|p| p.id)?;
+        Some((sid, node_id, label))
     }
 
-    /// Records the result the host produced while the stepper was
-    /// suspended.
+    /// Records the result the host produced.
+    ///
+    /// This is the low-level convenience used by hosts that don't go
+    /// through the [`Stepper::resolve`] adapter; the trait method wraps
+    /// this after converting `Result<FlowValue, FlowEffectErr>` to a
+    /// success string.
     pub fn record_result(&mut self, id: NodeId, result: String) {
         self.results.insert(id, result);
+        // Drop the corresponding pending entry (if any).
+        self.pending.retain(|p| p.at.node != id);
     }
 
     /// Read access to the results recorded so far.
     pub fn results(&self) -> &HashMap<NodeId, String> {
         &self.results
-    }
-
-    /// Consumes the stepper and returns the accumulated results.
-    pub fn into_results(self) -> HashMap<NodeId, String> {
-        self.results
     }
 
     /// One-line summary of the events observed so far.
@@ -401,7 +449,7 @@ impl<'a> FlowStepper<'a> {
         self.events
     }
 
-    /// Current stack depth (0 when finished, 1 at the root, etc.).
+    /// Current stack depth.
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
@@ -410,15 +458,14 @@ impl<'a> FlowStepper<'a> {
     pub fn current_path(&self) -> Option<Path> {
         self.stack.last().map(|f| f.path.clone())
     }
-}
 
-impl<'a> Stepper for FlowStepper<'a> {
-    type Value = ();
-    type Error = EngineError;
+    // ---- Internal step (returns InternalOutcome, then adapted to
+    //      v3 StepOutcome by the trait impl below) ------------------
 
-    fn step(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
+    fn step_internal(&mut self) -> Result<InternalOutcome, EngineError> {
         if self.stack.is_empty() {
-            return Ok(StepOutcome::Done(()));
+            self.done = true;
+            return Ok(InternalOutcome::Done);
         }
         let depth_before = self.stack.len() as u32;
 
@@ -435,14 +482,16 @@ impl<'a> Stepper for FlowStepper<'a> {
                 self.events.emit(&Event::VisitPre { at: ctx.clone() });
                 match frame.node {
                     Flow::Seq { children, .. } => {
-                        frame.state = FrameState::SeqNext { children: children.iter(), index: 0 };
+                        frame.state =
+                            FrameState::SeqNext { children: children.iter(), index: 0 };
                     }
                     Flow::Par { children, .. } => {
                         let call_id = CallFrameId(self.next_frame);
                         self.next_frame += 1;
                         let frame = self.stack.last_mut().expect("non-empty");
                         frame.frame_id = Some(call_id);
-                        frame.state = FrameState::ParNext { children: children.iter(), index: 0 };
+                        frame.state =
+                            FrameState::ParNext { children: children.iter(), index: 0 };
                         let mut ctx = ctx.clone();
                         ctx.frame = Some(call_id);
                         ctx.depth = depth_before;
@@ -454,16 +503,30 @@ impl<'a> Stepper for FlowStepper<'a> {
                     Flow::Maybe { body, .. } => {
                         frame.state = FrameState::MaybePending { body: body.as_deref() };
                     }
-                    Flow::Call { .. } => {
+                    Flow::Call { id: node_id, .. } => {
                         frame.state = FrameState::CallSuspending;
                         self.suspend_pending = true;
-                        self.events.emit(&Event::Suspend {
-                            at: ctx,
-                            reason: SuspendReason::AwaitEffect,
+
+                        let sid = SuspensionId(self.next_suspension);
+                        self.next_suspension += 1;
+                        let spec = dsl_kit::CallSpec {
+                            label: match frame.node {
+                                Flow::Call { label, .. } => label.clone(),
+                                _ => String::new(),
+                            },
+                            payload: serde_json::Value::Null,
+                        };
+                        let reason = SuspendReason::Call { spec };
+                        self.pending.push(Pending {
+                            id: sid,
+                            reason: reason.clone(),
+                            at: ctx.clone(),
                         });
+                        self.id_to_node.insert(sid, *node_id);
+                        self.events.emit(&Event::Suspend { at: ctx, reason });
                     }
                 }
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::SeqNext { children, index } => {
                 if let Some(next) = children.next() {
@@ -473,17 +536,17 @@ impl<'a> Stepper for FlowStepper<'a> {
                     let mut ctx = ctx.clone();
                     ctx.iteration = Some(iter);
                     self.events.emit(&Event::IterationTick { at: ctx });
-                    self.stack.push(Frame {
+                    self.stack.push(InternalFrame {
                         node: next,
                         path: child_path,
                         state: FrameState::Enter,
                         frame_id: None,
                     });
-                    Ok(StepOutcome::Advanced)
+                    Ok(InternalOutcome::Advanced)
                 } else {
                     self.events.emit(&Event::VisitPost { at: ctx });
                     self.stack.pop();
-                    Ok(StepOutcome::Advanced)
+                    Ok(InternalOutcome::Advanced)
                 }
             }
             FrameState::ParNext { children, index } => {
@@ -494,19 +557,19 @@ impl<'a> Stepper for FlowStepper<'a> {
                     let mut ctx = ctx.clone();
                     ctx.iteration = Some(iter);
                     self.events.emit(&Event::IterationTick { at: ctx });
-                    self.stack.push(Frame {
+                    self.stack.push(InternalFrame {
                         node: next,
                         path: child_path,
                         state: FrameState::Enter,
                         frame_id: None,
                     });
-                    Ok(StepOutcome::Advanced)
+                    Ok(InternalOutcome::Advanced)
                 } else {
                     let leave_ctx = ctx.clone();
                     self.events.emit(&Event::FrameLeave { at: leave_ctx });
                     self.events.emit(&Event::VisitPost { at: ctx });
                     self.stack.pop();
-                    Ok(StepOutcome::Advanced)
+                    Ok(InternalOutcome::Advanced)
                 }
             }
             FrameState::ScopePending { body } => {
@@ -514,72 +577,258 @@ impl<'a> Stepper for FlowStepper<'a> {
                 let child_path = path.push(body.node_id());
                 let child_state = FrameState::Enter;
                 self.stack.last_mut().expect("non-empty").state = FrameState::ScopeDone;
-                self.stack.push(Frame {
+                self.stack.push(InternalFrame {
                     node: body,
                     path: child_path,
                     state: child_state,
                     frame_id: None,
                 });
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::ScopeDone => {
                 self.events.emit(&Event::VisitPost { at: ctx });
                 self.stack.pop();
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::MaybePending { body } => {
                 let body = *body;
                 self.stack.last_mut().expect("non-empty").state = FrameState::MaybeDone;
                 if let Some(body) = body {
                     let child_path = path.push(body.node_id());
-                    self.stack.push(Frame {
+                    self.stack.push(InternalFrame {
                         node: body,
                         path: child_path,
                         state: FrameState::Enter,
                         frame_id: None,
                     });
                 }
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::MaybeDone => {
                 self.events.emit(&Event::VisitPost { at: ctx });
                 self.stack.pop();
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::CallSuspending => {
                 if self.suspend_pending {
                     self.suspend_pending = false;
-                    return Ok(StepOutcome::Suspended {
-                        reason: SuspendReason::AwaitEffect,
+                    return Ok(InternalOutcome::Suspended {
+                        reason: SuspendReason::Call {
+                            spec: dsl_kit::CallSpec {
+                                label: match frame.node {
+                                    Flow::Call { label, .. } => label.clone(),
+                                    _ => String::new(),
+                                },
+                                payload: serde_json::Value::Null,
+                            },
+                        },
                         at: ctx,
                     });
                 }
                 self.events.emit(&Event::Resume { at: ctx });
                 frame.state = FrameState::CallDone;
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
             FrameState::CallDone => {
                 self.events.emit(&Event::VisitPost { at: ctx });
                 self.stack.pop();
-                Ok(StepOutcome::Advanced)
+                Ok(InternalOutcome::Advanced)
             }
         }
     }
 }
 
-/// Async wrapper over the sync [`Stepper::step`].
-///
-/// Flow's semantics themselves do not need to await — externalising
-/// each effect through a `Suspended { reason: AwaitEffect, .. }` yield
-/// is the design's whole point. The `AsyncStepper` impl exists so that
-/// callers who are already in an async context (a tokio handler, an
-/// MCP tool, etc.) can drop the stepper into `drive_async` and its
-/// friends without a shim.
-impl<'a> AsyncStepper for FlowStepper<'a> {
-    type Value = ();
-    type Error = EngineError;
+/// Internal outcome the private step machine returns; converted to
+/// `StepOutcome<FlowValue>` by the [`Stepper`] impl.
+#[derive(Debug)]
+pub enum InternalOutcome {
+    /// Advanced one internal transition.
+    Advanced,
+    /// Suspended on a `Call` (or breakpoint).
+    Suspended {
+        /// Why suspended.
+        reason: SuspendReason,
+        /// Where suspended.
+        at: NodeContext,
+    },
+    /// Interpretation completed.
+    Done,
+}
 
-    async fn step_async(&mut self) -> Result<StepOutcome<()>, EngineError> {
-        self.step()
+// ---------- v3 Stepper impl --------------------------------------------
+
+impl<'a> Stepper for FlowStepper<'a> {
+    type Value = FlowValue;
+    type Cursor = FlowCursor;
+    type Delta = ();
+    type EffectError = FlowEffectErr;
+    type Error = FlowError;
+
+    fn step(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
+        let before_pending_len = self.pending.len();
+        let outcome = self.step_internal()?;
+        match outcome {
+            InternalOutcome::Advanced => {
+                // If a new Pending was created this step, surface it as
+                // Blocked; otherwise Ready.
+                if self.pending.len() > before_pending_len {
+                    let newly: SmallVec<[Pending; 1]> = self
+                        .pending
+                        .iter()
+                        .skip(before_pending_len)
+                        .cloned()
+                        .collect();
+                    Ok(StepOutcome::Blocked { newly_pending: newly })
+                } else {
+                    Ok(StepOutcome::Ready)
+                }
+            }
+            InternalOutcome::Suspended { .. } => {
+                let newly: SmallVec<[Pending; 1]> = self
+                    .pending
+                    .iter()
+                    .skip(before_pending_len)
+                    .cloned()
+                    .collect();
+                Ok(StepOutcome::Blocked { newly_pending: newly })
+            }
+            InternalOutcome::Done => {
+                self.done = true;
+                Ok(StepOutcome::Done(FlowValue::Unit))
+            }
+        }
+    }
+
+    fn resolve(
+        &mut self,
+        id: SuspensionId,
+        result: Result<Self::Value, Self::EffectError>,
+    ) -> Result<(), Self::Error> {
+        let node_id = self
+            .id_to_node
+            .remove(&id)
+            .ok_or(EngineError::UnknownSuspension { id })?;
+        // Drop the pending entry for this id.
+        self.pending.retain(|p| p.id != id);
+
+        match result {
+            Ok(v) => {
+                // Convert FlowValue to string for the legacy result map.
+                let text = match v {
+                    FlowValue::Text(s) => s,
+                    FlowValue::Unit => String::new(),
+                    FlowValue::List(items) => format!("{items:?}"),
+                };
+                self.results.insert(node_id, text);
+                Ok(())
+            }
+            Err(e) => Err(FlowError::Effect(e)),
+        }
+    }
+
+    fn pending(&self) -> &[Pending] {
+        &self.pending
+    }
+
+    fn take_cancellations(&mut self) -> Vec<SuspensionId> {
+        // Commit A: no Par fan-out cancellation yet; always empty.
+        Vec::new()
+    }
+
+    fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta> {
+        &self.frame_tree_stub
+    }
+
+    fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+// ---------- Sync driver helper (host convenience) ---------------------
+
+/// Runs a flow to completion in sync mode, resolving each `Call`
+/// suspension with the corresponding canned response. Used by demos.
+pub fn run_flow_sync(program: &Flow) -> Result<HashMap<NodeId, String>, FlowError> {
+    let mut stepper = FlowStepper::new(program);
+    let bp = BreakpointSet::new();
+    let mut steps = 0u32;
+    loop {
+        match stepper.run_to_yield_with_breakpoints(&bp)? {
+            InternalOutcome::Suspended { .. } => {
+                if let Some((sid, _node, label)) = stepper.suspended_call() {
+                    let response = canned_response(label);
+                    stepper.resolve(sid, Ok(FlowValue::Text(response)))?;
+                }
+            }
+            InternalOutcome::Done => break,
+            InternalOutcome::Advanced => {
+                // run_to_yield only returns non-Advanced, but keep the
+                // arm for future variants.
+            }
+        }
+        steps += 1;
+        if steps > 4096 {
+            return Err(FlowError::Engine(EngineError::Aborted {
+                at: NodeContext::at(NodeId(0), Path::root()),
+                reason: "run_flow_sync exceeded safety limit".into(),
+            }));
+        }
+    }
+    Ok(stepper.results.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn research_pipeline_runs_end_to_end() {
+        let ids = IdGen::new();
+        let program = research_pipeline(&ids);
+        let results = run_flow_sync(&program).expect("run ok");
+        // 7 Call nodes in the reference program.
+        assert_eq!(results.len(), 7);
+    }
+
+    #[test]
+    fn check_unique_ids_detects_duplicate() {
+        let dup = NodeId(101);
+        let program = Flow::Seq {
+            id: dup,
+            children: vec![Flow::Call { id: dup, label: "x".into() }],
+        };
+        let err = check_unique_ids(&program).unwrap_err();
+        assert!(matches!(err, EngineError::Malformed { .. }));
+    }
+
+    #[test]
+    fn pretty_renders_indented_tree() {
+        let ids = IdGen::new();
+        let program = research_pipeline(&ids);
+        let text = pretty(&program);
+        assert!(text.contains("Seq"));
+        assert!(text.contains("Par"));
+        assert!(text.contains("fetch_query"));
+    }
+
+    #[test]
+    fn stepper_flow_yields_and_resolves() {
+        let ids = IdGen::new();
+        let program = Flow::Call { id: ids.node(), label: "one".into() };
+        let mut stepper = FlowStepper::new(&program);
+        // First step enters and suspends.
+        let out1 = stepper.step().expect("step");
+        assert!(matches!(out1, StepOutcome::Blocked { .. }));
+        assert_eq!(stepper.pending().len(), 1);
+        let sid = stepper.pending()[0].id;
+        stepper.resolve(sid, Ok(FlowValue::Text("resp".into()))).expect("resolve");
+        // Drive to done.
+        for _ in 0..20 {
+            match stepper.step().expect("step") {
+                StepOutcome::Done(FlowValue::Unit) => return,
+                _ => continue,
+            }
+        }
+        panic!("did not reach Done");
     }
 }

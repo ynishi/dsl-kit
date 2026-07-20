@@ -1,38 +1,44 @@
-//! Engine primitives for `dsl-kit`.
+//! Engine primitives for `dsl-kit` (v3 engine shape).
 //!
-//! This crate defines the observable primitives every DSL built with the kit
-//! carries from day one: stable node identifiers, call frame identifiers with
-//! depth, iteration counters, root-to-node paths, an event stream, a stepper
-//! trait that models evaluation as a state machine, an AST traversal trait,
-//! and a structured error type that always carries the location at which the
-//! error happened.
+//! This crate defines the observable primitives every DSL built with the
+//! kit carries: stable node identifiers, call frame identifiers with
+//! depth, iteration counters, root-to-node paths, an event stream, the
+//! `Stepper` trait modelling evaluation as an externally-driven state
+//! machine, an AST traversal contract, and structured errors that always
+//! carry the location at which the error happened.
 //!
-//! ## Architecture
+//! ## v3 shape (Round 13)
 //!
-//! - `NodeId` / `CallFrameId` / `Iteration` / `Path` — the observation
-//!   primitives every event and every error carry.
-//! - `Event` / `EventSink` — the tap between the evaluator and any
-//!   observer (tracer, debugger, MCP tool, replay recorder).
-//! - `Stepper` / `AsyncStepper` — evaluators expressed as state
-//!   machines driven from the outside, with `Suspended` yields
-//!   externalising every effect.
-//! - `Walk` / `WalkMut` / `DslNode` — the traversal contract every
-//!   AST derives via the `#[derive(DslNode)]` macro in `dsl-kit-macros`.
-//! - `EngineError` / `NodeContext` — structured errors that always
-//!   know where they happened.
-//! - `BreakCondition` / `BreakpointSet` — composable boolean predicates
-//!   over `NodeContext` used to describe conditional breakpoints.
+//! - `Stepper` is a sync trait; async is a host concern. Interpretation is
+//!   observable, steppable, and supports first-class fan-out with structured
+//!   join through `Par` frames.
+//! - Suspensions are identified by `SuspensionId` and can be N-in-flight;
+//!   the host resolves each with `Ok(Value)` or `Err(EffectError)`.
+//! - Fan-out is expressed by a `Par` frame with a `JoinPolicy` (shape +
+//!   fail); reducers fold the collected slots into the parent value.
+//! - Cancellation is cooperative; the host drains cancelled ids via
+//!   `take_cancellations()` and looks them up in its own runtime-handle
+//!   map.
+//!
+//! See `workspace/tasks/dsl-kit-carry/async-join-design.md` for the full
+//! specification.
 
 #![warn(missing_docs)]
 
+use std::any::Any;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---------- Observation primitives --------------------------------------
 
 /// Stable identifier assigned to every AST node when the tree is built.
 ///
 /// A `NodeId` is orthogonal to source location: two nodes at the same
-/// source span but in different expansions carry different IDs, and the same
-/// node retains its ID across evaluation runs.
+/// source span but in different expansions carry different IDs, and the
+/// same node retains its ID across evaluation runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u64);
 
@@ -43,8 +49,6 @@ impl fmt::Display for NodeId {
 }
 
 /// Identifier for a single activation of a function-like node.
-///
-/// Recursion is uniquely identified by pairing `CallFrameId` with `depth`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallFrameId(pub u64);
 
@@ -102,9 +106,6 @@ impl fmt::Display for Path {
 }
 
 /// Monotonic ID generator for nodes and call frames.
-///
-/// Kept as a plain atomic counter so it can be shared across threads without
-/// synchronisation overhead.
 #[derive(Debug, Default)]
 pub struct IdGen {
     next: AtomicU64,
@@ -128,11 +129,6 @@ impl IdGen {
 }
 
 /// Location context attached to every emitted event and to every error.
-///
-/// A `NodeContext` is a snapshot of "where in the evaluation are we right
-/// now?" — enough for a debugger UI to jump to the node, for an error
-/// message to point at the source, and for a replay recorder to reconstruct
-/// the state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeContext {
     /// The node currently being evaluated.
@@ -167,11 +163,85 @@ impl fmt::Display for NodeContext {
     }
 }
 
-/// One observation from the evaluator.
+// ---------- Suspension identity ----------------------------------------
+
+/// Stable identifier for one in-flight suspension.
 ///
-/// Backends (tracer, debugger, MCP tool, replay recorder) attach to the same
-/// event stream. New variants may be added as the kit grows; downstream
-/// consumers should treat the enum as non-exhaustive.
+/// Allocated by the engine when a `Frame::PendingEffect` leaf is created.
+/// The host uses it as the key on [`Stepper::resolve`] and as the map key
+/// for its own `SuspensionId -> runtime handle` bookkeeping when
+/// cooperative cancellation is required. Monotonic within one `Stepper`
+/// instance; never reused, even after cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SuspensionId(pub u64);
+
+impl fmt::Display for SuspensionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "s{}", self.0)
+    }
+}
+
+/// One live suspension.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    /// Stable identifier.
+    pub id: SuspensionId,
+    /// Why the engine yielded.
+    pub reason: SuspendReason,
+    /// Where the suspension happened.
+    pub at: NodeContext,
+}
+
+// ---------- Suspend reason ---------------------------------------------
+
+/// Why the engine yielded control.
+///
+/// Cancellation runtime handles are NOT stored here — the host maintains
+/// its own `SuspensionId -> handle` map.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SuspendReason {
+    /// A first-class external effect (LLM call, tool invocation, …).
+    Call {
+        /// Host-defined effect descriptor.
+        spec: CallSpec,
+    },
+    /// A registered breakpoint fired.
+    Breakpoint,
+    /// The scheduler chose to yield cooperatively.
+    Cooperative,
+    /// Host-defined effect the DSL wants to model beyond `Call`.
+    User {
+        /// Short tag identifying the effect kind.
+        tag: Cow<'static, str>,
+    },
+}
+
+impl fmt::Display for SuspendReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SuspendReason::Call { spec } => write!(f, "call({})", spec.label),
+            SuspendReason::Breakpoint => write!(f, "breakpoint"),
+            SuspendReason::Cooperative => write!(f, "cooperative"),
+            SuspendReason::User { tag } => write!(f, "user({tag})"),
+        }
+    }
+}
+
+/// Host-defined effect descriptor. Opaque to the engine.
+#[derive(Debug, Clone)]
+pub struct CallSpec {
+    /// Short human-readable label (also fed into the DSL's canned
+    /// responses when applicable).
+    pub label: String,
+    /// Effect payload; the engine stores it verbatim and the host
+    /// interprets it per the DSL's semantics.
+    pub payload: serde_json::Value,
+}
+
+// ---------- Event stream -----------------------------------------------
+
+/// One observation from the evaluator.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Event {
@@ -212,34 +282,15 @@ pub enum Event {
         /// Where the observation happened.
         at: NodeContext,
     },
-}
-
-/// Why the stepper yielded control.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SuspendReason {
-    /// A hit breakpoint held execution.
-    Breakpoint,
-    /// The semantics awaited an external effect (LLM call, tool call, MCP).
-    AwaitEffect,
-    /// The scheduler chose to yield cooperatively.
-    Cooperative,
-}
-
-impl fmt::Display for SuspendReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SuspendReason::Breakpoint => write!(f, "breakpoint"),
-            SuspendReason::AwaitEffect => write!(f, "await-effect"),
-            SuspendReason::Cooperative => write!(f, "cooperative"),
-        }
-    }
+    /// A suspension was cancelled (tracer convenience; the authoritative
+    /// channel is [`Stepper::take_cancellations`]).
+    Cancel {
+        /// The cancelled suspension.
+        id: SuspensionId,
+    },
 }
 
 /// Sink for the event stream.
-///
-/// The trait is intentionally simple: implementors decide whether to trace,
-/// print, forward over MCP, or record for replay.
 pub trait EventSink {
     /// Consumes one event.
     fn emit(&mut self, event: &Event);
@@ -255,19 +306,15 @@ impl EventSink for NullSink {
     fn emit(&mut self, _event: &Event) {}
 }
 
-// ---------- Errors --------------------------------------------------------
+// ---------- Errors ------------------------------------------------------
 
 /// Structured error type for engine and evaluator failures.
 ///
-/// Every variant carries a [`NodeContext`] so that error messages, MCP tool
-/// responses, and log lines can always answer "at which node did this
-/// happen?". Diagnostic codes are stable, machine-readable identifiers under
-/// the `dsl_kit::` namespace and are suitable for cross-referencing with an
-/// error catalogue.
-///
-/// The kit uses [`miette`] for the diagnostic surface, so downstream callers
-/// can render pretty reports (`miette::Report::new(err)`) without further
-/// wiring.
+/// Every applicable variant carries a [`NodeContext`] or a
+/// [`SuspensionId`] / [`ReducerId`] so that error messages, MCP tool
+/// responses, and log lines can always answer "at which node / for
+/// which id did this happen?". Diagnostic codes are stable,
+/// machine-readable identifiers under the `dsl_kit::` namespace.
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 #[non_exhaustive]
 pub enum EngineError {
@@ -317,13 +364,40 @@ pub enum EngineError {
     #[error("stepper protocol violation at {at}: {detail}")]
     #[diagnostic(
         code(dsl_kit::stepper::protocol),
-        help("The stepper's suspend/resume contract was broken. Each `Suspended` outcome must be resumed exactly once before further steps.")
+        help("The stepper's suspend/resume contract was broken. Each `PendingEffect` leaf must be resolved exactly once before further steps observe its value.")
     )]
     StepperProtocol {
         /// Where the protocol violation was detected.
         at: NodeContext,
         /// Human-readable description of the misuse.
         detail: String,
+    },
+
+    /// The host called `resolve` with a `SuspensionId` the engine does
+    /// not know about (never created, already resolved, or belonging to
+    /// a cancelled leg). Hosts treat this as a benign no-op — it
+    /// happens routinely for cancelled effects whose external work
+    /// completes after abort.
+    #[error("unknown suspension {id}")]
+    #[diagnostic(
+        code(dsl_kit::stepper::unknown_suspension),
+        help("The host called resolve() with a SuspensionId the engine does not know. This is the expected outcome for a late response arriving after the effect's branch was cancelled.")
+    )]
+    UnknownSuspension {
+        /// The unknown suspension id.
+        id: SuspensionId,
+    },
+
+    /// A `ParFrame` referenced a `ReducerId` that is not registered in
+    /// the active [`ReducerRegistry`].
+    #[error("unknown reducer {id:?}")]
+    #[diagnostic(
+        code(dsl_kit::reducer::unknown),
+        help("The ParFrame's reducer_id was not found in the ReducerRegistry. Register the reducer at Stepper build time or fix the AST to reference a known id.")
+    )]
+    UnknownReducer {
+        /// The unknown reducer id.
+        id: ReducerId,
     },
 }
 
@@ -332,10 +406,6 @@ pub type EngineResult<T> = Result<T, EngineError>;
 
 /// One entry in an error catalogue: a stable machine-readable code paired
 /// with the human-readable help text explaining how to react to it.
-///
-/// Produced by [`engine_error_catalog`] for the built-in [`EngineError`]
-/// variants, and extensible by DSL hosts that want to expose their own
-/// codes through the same channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorCatalogEntry {
     /// Stable diagnostic code, e.g. `"dsl_kit::eval::aborted"`.
@@ -345,11 +415,6 @@ pub struct ErrorCatalogEntry {
 }
 
 /// Returns the built-in [`EngineError`] catalogue.
-///
-/// Each entry is produced by instantiating a sample of the variant with a
-/// dummy [`NodeContext`] and asking miette for its `code()` and `help()`
-/// strings — so the catalogue stays in lock-step with the derive attributes
-/// on `EngineError` without a second source of truth.
 pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
     use miette::Diagnostic;
 
@@ -365,6 +430,8 @@ pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
         },
         EngineError::Malformed { at: ctx(), detail: String::new() },
         EngineError::StepperProtocol { at: ctx(), detail: String::new() },
+        EngineError::UnknownSuspension { id: SuspensionId(0) },
+        EngineError::UnknownReducer { id: ReducerId(String::new()) },
     ];
 
     samples
@@ -377,146 +444,407 @@ pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
         .collect()
 }
 
-// ---------- Stepper ------------------------------------------------------
+// ---------- Step outcome & Stepper -------------------------------------
 
-/// One step of evaluation.
+/// Result of one [`Stepper::step`] call.
 ///
-/// The stepper is the central abstraction: rather than modelling evaluation
-/// as an async function that awaits internally, the kit exposes it as a
-/// state machine that yields to the outside world at every observable point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The three states name the driver's next action verbatim:
+///
+/// - `Ready` — the engine made progress and can make more without host
+///   input. Call `step()` again immediately.
+/// - `Blocked { newly_pending }` — the engine did everything it can
+///   without host input. Do NOT call `step()` again until at least one
+///   `resolve` has been fed back, or a cancellation observed via
+///   `take_cancellations()`.
+/// - `Done(v)` — the root frame produced a value; interpretation is
+///   complete.
+///
+/// Terminal failure is returned as `Err(Stepper::Error)` from `step()`;
+/// there is no `Failed` variant. Cancellations queued during the failing
+/// step are still drainable via `take_cancellations()` after the `Err`.
+#[derive(Debug, Clone)]
 pub enum StepOutcome<V> {
-    /// The stepper advanced one node and is ready to be stepped again.
-    Advanced,
-    /// The stepper yielded and is waiting to be resumed. The `at` field
-    /// pinpoints where the suspension happened so hosts can resolve
-    /// effects without asking the stepper for extra state.
-    Suspended {
-        /// Why the stepper is yielding.
-        reason: SuspendReason,
-        /// Where the suspension happened.
-        at: NodeContext,
+    /// Engine advanced; keep looping.
+    Ready,
+    /// Engine is blocked awaiting host input. `newly_pending` names
+    /// suspensions created this call (may be empty when the block is
+    /// on already-live pending).
+    Blocked {
+        /// Suspensions newly created during this `step` call.
+        newly_pending: smallvec::SmallVec<[Pending; 1]>,
     },
-    /// Evaluation completed with a value.
+    /// Interpretation completed with a value.
     Done(V),
 }
 
-/// Something that can be driven one step at a time.
+/// Something that can be driven one step at a time from the outside.
 ///
-/// Implementors are typically produced by an interpreter over a specific
-/// DSL. The trait is deliberately synchronous at its surface: async effects
-/// appear as `Suspended { reason: AwaitEffect, .. }` yields and the host
-/// drives the effect externally before resuming.
+/// v3 shape: sync trait, generic in `V` / `C` / `D` / `EffectError` /
+/// `Error`. Async is a host concern — a host wrapping the stepper in
+/// `FuturesUnordered<ResolverFuture>` is the canonical async story.
 pub trait Stepper {
     /// Value the stepper produces on completion.
     type Value;
-    /// Error type surfaced from `step` and `run_to_yield`.
-    type Error;
+    /// DSL-specific node cursor state stored inside `Frame::Node`.
+    type Cursor;
+    /// DSL-specific state delta / write log stored inside `Env` and
+    /// merged by reducers at join.
+    type Delta;
+    /// DSL-specific effect-side failure surfaced via `resolve`.
+    type EffectError: std::error::Error + Send + Sync + 'static;
+    /// DSL / engine-level error surfaced from `step` and `resolve`.
+    type Error: From<Self::EffectError> + std::error::Error + Send + Sync + 'static;
 
-    /// Runs the next node's semantics.
+    /// Advance the interpretation as far as possible without host input.
     fn step(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error>;
 
-    /// Runs steps until completion, suspension, or error.
-    fn run_to_yield(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
-        loop {
-            match self.step()? {
-                StepOutcome::Advanced => continue,
-                other => return Ok(other),
-            }
-        }
-    }
-}
-
-/// Async counterpart of [`Stepper`].
-///
-/// Implementors let the visit code await external work (network calls,
-/// tool invocations, MCP round-trips) inside the semantics rather than
-/// externalising them through suspend / resume. When the sync surface is
-/// enough — which it usually is — prefer [`Stepper`]: it composes better
-/// with debuggers and with the [`drive_async`] helper below.
-pub trait AsyncStepper {
-    /// Value the stepper produces on completion.
-    type Value;
-    /// Error type surfaced from `step_async` and `run_to_yield_async`.
-    type Error;
-
-    /// Runs the next node's semantics, awaiting any effect the semantics
-    /// wants to perform inline.
-    fn step_async(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<StepOutcome<Self::Value>, Self::Error>>;
-
-    /// Drives async steps until completion, suspension, or error.
-    fn run_to_yield_async(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<StepOutcome<Self::Value>, Self::Error>>
-    {
-        async {
-            loop {
-                match self.step_async().await? {
-                    StepOutcome::Advanced => continue,
-                    other => return Ok(other),
-                }
-            }
-        }
-    }
-}
-
-/// Host-side callback invoked whenever a stepper yields with
-/// [`SuspendReason::AwaitEffect`].
-///
-/// The resolver performs the external effect and, on success, is expected
-/// to have arranged for the stepper's state to be updated before returning
-/// (typically via a channel, a shared map, or a method on the concrete
-/// stepper type).
-pub trait EffectResolver {
-    /// Error surfaced from `resolve` when the effect cannot be produced.
-    type Error;
-
-    /// Performs the effect corresponding to `reason` at location `at`.
+    /// Feed a response back for one pending suspension.
+    ///
+    /// Order-independent; the host may resolve pending IDs in any
+    /// order. Unknown IDs return an error the host may treat as a
+    /// benign no-op (see [`EngineError::UnknownSuspension`]).
     fn resolve(
         &mut self,
-        at: &NodeContext,
-        reason: &SuspendReason,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
+        id: SuspensionId,
+        result: Result<Self::Value, Self::EffectError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Snapshot of every suspension currently blocking the tree.
+    /// Excludes ids under `Frame::Cancelled` sub-trees. Order matches
+    /// DFS pre-order over the frame tree.
+    fn pending(&self) -> &[Pending];
+
+    /// Drain the set of suspensions the engine has just cancelled.
+    /// Must be called after every `Ok(Ready)` AND every `Err(_)`
+    /// return from `step()`.
+    fn take_cancellations(&mut self) -> Vec<SuspensionId>;
+
+    /// Root of the live frame tree. Debugger read.
+    fn frame_tree(
+        &self,
+    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta>;
+
+    /// True when the root has produced a value.
+    fn is_done(&self) -> bool;
 }
 
-/// Drives an [`AsyncStepper`] to completion, handing each `AwaitEffect`
-/// suspension to a resolver.
+// ---------- Frame tree --------------------------------------------------
+
+/// Which child slot in a `ParFrame` a value corresponds to.
+pub type ChildIndex = usize;
+
+/// Why a sub-tree was cancelled.
+#[derive(Debug, Clone)]
+pub enum CancelReason {
+    /// Cancelled because the enclosing `Par` policy fired
+    /// (`Any` / `FirstK` winner selected).
+    ParPolicyFired,
+    /// Cancelled because a sibling failed (FailFast).
+    SiblingFailed,
+}
+
+/// One node in the live frame tree.
+#[derive(Debug)]
+pub enum Frame<V, C, D> {
+    /// An interior interpretation node currently executing.
+    Node {
+        /// AST node this frame is interpreting.
+        node: NodeId,
+        /// Shared environment snapshot.
+        env: EnvRef<D>,
+        /// DSL-specific cursor (opaque to the engine).
+        cursor: C,
+    },
+    /// A fan-out root. Children live on the enclosing `FrameTree.kids`.
+    Par(ParFrame<V, D>),
+    /// A labelled section wrapper (no fan-out semantics).
+    Scope {
+        /// Section label.
+        label: String,
+        /// Shared environment snapshot.
+        env: EnvRef<D>,
+    },
+    /// A leaf blocked on an external effect.
+    PendingEffect {
+        /// Stable id (also present in `Stepper::pending`).
+        id: SuspensionId,
+    },
+    /// A leaf whose value is ready and waiting to be consumed by its
+    /// parent frame's continuation.
+    Value(V),
+    /// A sub-tree the engine has cancelled. Never selected for `step()`
+    /// progress; kept so the debugger can render it.
+    Cancelled {
+        /// Why the sub-tree was cancelled.
+        reason: CancelReason,
+    },
+}
+
+/// Tree of frames. `kids[i]` under a `Par` root is the `i`-th sibling
+/// child, matched positionally with `ParFrame.slots[i]` and
+/// `ParFrame.deltas[i]`.
+#[derive(Debug)]
+pub struct FrameTree<V, C, D> {
+    /// The frame at this node.
+    pub root: Frame<V, C, D>,
+    /// Child sub-trees.
+    pub kids: Vec<FrameTree<V, C, D>>,
+}
+
+/// Fan-out metadata.
 ///
-/// Breakpoint suspensions are passed to the resolver too; a resolver that
-/// wants to distinguish them can inspect `reason` and short-circuit.
-pub async fn drive_async<S, R>(stepper: &mut S, resolver: &mut R) -> Result<S::Value, S::Error>
-where
-    S: AsyncStepper,
-    R: EffectResolver,
-    R::Error: Into<S::Error>,
-{
-    loop {
-        match stepper.step_async().await? {
-            StepOutcome::Advanced => continue,
-            StepOutcome::Suspended { reason, at } => {
-                resolver.resolve(&at, &reason).await.map_err(Into::into)?;
-            }
-            StepOutcome::Done(v) => return Ok(v),
+/// `children` are stored on the enclosing `FrameTree.kids`; `slots`,
+/// `deltas`, and `completion_order` are indexed against that same
+/// positional list.
+#[derive(Debug)]
+pub struct ParFrame<V, D> {
+    /// Policy (shape + fail).
+    pub policy: JoinPolicy,
+    /// `slots[i]` is `Some(v)` once child i completed successfully;
+    /// `None` while still running, pending, or cancelled without a
+    /// value. FailFast: reroutes failure to `Err` before reducer.
+    /// CollectAll: uses a separate erased failure vector (see impl).
+    pub slots: Vec<Option<V>>,
+    /// Per-child accumulated delta.
+    pub deltas: Vec<Option<D>>,
+    /// Order in which children completed successfully.
+    pub completion_order: Vec<ChildIndex>,
+    /// Registry key for the reducer.
+    pub reducer_id: ReducerId,
+    /// Resolved reducer handle (`Arc<dyn Reducer<V, D>>` or the
+    /// CollectAll erased variant, depending on `policy.fail`).
+    pub reducer: ReducerHandle<V, D>,
+    /// True once the shape has fired.
+    pub joined: bool,
+}
+
+// ---------- Join policy -------------------------------------------------
+
+/// Full policy for a `ParFrame`: success-side `shape` + failure-side
+/// `fail`.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinPolicy {
+    /// Success completion condition.
+    pub shape: JoinShape,
+    /// Failure handling.
+    pub fail: FailPolicy,
+}
+
+/// Success-side completion condition.
+#[derive(Debug, Clone, Copy)]
+pub enum JoinShape {
+    /// Every child must complete successfully.
+    All,
+    /// The first successful child wins; remaining children are cancelled.
+    Any,
+    /// The first `k` successful children win; remaining children are
+    /// cancelled.
+    FirstK(usize),
+}
+
+/// Failure-side policy.
+#[derive(Debug, Clone, Copy)]
+pub enum FailPolicy {
+    /// A single child failure aborts the `Par` immediately.
+    FailFast,
+    /// Failures are collected into slots; shape completion still decides
+    /// based on the count of successes.
+    CollectAll,
+}
+
+// ---------- Reducer trait + registry -----------------------------------
+
+/// Serialisable name for a registered reducer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReducerId(pub String);
+
+impl fmt::Display for ReducerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for ReducerId {
+    fn from(s: &str) -> Self {
+        ReducerId(s.to_string())
+    }
+}
+
+impl From<String> for ReducerId {
+    fn from(s: String) -> Self {
+        ReducerId(s)
+    }
+}
+
+/// FailFast reducer. Sees successful joins only.
+pub trait Reducer<V, D>: Send + Sync {
+    /// Fold slots + deltas + completion order into a joined `(V, D)`.
+    fn reduce(
+        &self,
+        slots: &[Option<V>],
+        deltas: &[Option<D>],
+        winners: &[ChildIndex],
+    ) -> Result<(V, D), EngineError>;
+}
+
+/// CollectAll reducer. Sees the full success/failure slot vector.
+pub trait ReducerCollectAll<V, D, EffectError>: Send + Sync {
+    /// Fold slots (each `Some(Ok)` / `Some(Err)` / `None`) + deltas +
+    /// completion order into a joined `(V, D)`.
+    fn reduce(
+        &self,
+        slots: &[Option<Result<V, EffectError>>],
+        deltas: &[Option<D>],
+        winners: &[ChildIndex],
+    ) -> Result<(V, D), EngineError>;
+}
+
+/// Runtime handle for the resolved reducer of a `ParFrame`.
+///
+/// The `CollectAll` variant erases `EffectError` behind an `Arc<dyn Any>`;
+/// the engine downcasts internally at invocation time when it knows
+/// `Stepper::EffectError`.
+pub enum ReducerHandle<V, D> {
+    /// FailFast-typed reducer.
+    FailFast(Arc<dyn Reducer<V, D>>),
+    /// CollectAll-typed reducer, effect-error erased.
+    CollectAll(Arc<dyn Any + Send + Sync>),
+}
+
+impl<V, D> fmt::Debug for ReducerHandle<V, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReducerHandle::FailFast(_) => f.write_str("ReducerHandle::FailFast(..)"),
+            ReducerHandle::CollectAll(_) => f.write_str("ReducerHandle::CollectAll(..)"),
         }
     }
 }
 
-/// Marker trait for AST enums recognised by the kit.
+impl<V, D> Clone for ReducerHandle<V, D> {
+    fn clone(&self) -> Self {
+        match self {
+            ReducerHandle::FailFast(a) => ReducerHandle::FailFast(a.clone()),
+            ReducerHandle::CollectAll(a) => ReducerHandle::CollectAll(a.clone()),
+        }
+    }
+}
+
+/// Runtime lookup table.
 ///
-/// The derive macro in `dsl-kit-macros` implements this trait automatically;
-/// hand-written implementations are supported for advanced use.
+/// Constructed by the host at Stepper build time; a DSL typically ships
+/// a helper `default_registry()` that registers its standard reducers
+/// under the canonical ids (`"reduce_all_ordered"` etc.).
+pub struct ReducerRegistry<V, D, EffectError> {
+    fail_fast: HashMap<ReducerId, Arc<dyn Reducer<V, D>>>,
+    collect_all: HashMap<ReducerId, Arc<dyn Any + Send + Sync>>,
+    _marker: std::marker::PhantomData<fn() -> EffectError>,
+}
+
+impl<V, D, EE> Default for ReducerRegistry<V, D, EE>
+where
+    EE: 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V, D, EE> ReducerRegistry<V, D, EE>
+where
+    EE: 'static,
+{
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self {
+            fail_fast: HashMap::new(),
+            collect_all: HashMap::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Registers a FailFast-typed reducer under `id`.
+    pub fn register_fail_fast(
+        &mut self,
+        id: impl Into<ReducerId>,
+        reducer: Arc<dyn Reducer<V, D>>,
+    ) {
+        self.fail_fast.insert(id.into(), reducer);
+    }
+
+    /// Registers a CollectAll-typed reducer under `id`.
+    pub fn register_collect_all<R>(&mut self, id: impl Into<ReducerId>, reducer: Arc<R>)
+    where
+        R: ReducerCollectAll<V, D, EE> + Send + Sync + 'static,
+        V: 'static,
+        D: 'static,
+    {
+        let erased: Arc<dyn Any + Send + Sync> = reducer;
+        self.collect_all.insert(id.into(), erased);
+    }
+
+    /// Resolves the reducer for a `ParFrame` at construction time.
+    ///
+    /// The `fail` argument disambiguates when the same id has been
+    /// registered under both traits. Returns
+    /// `EngineError::UnknownReducer` on miss.
+    pub fn resolve(
+        &self,
+        id: &ReducerId,
+        fail: FailPolicy,
+    ) -> Result<ReducerHandle<V, D>, EngineError> {
+        match fail {
+            FailPolicy::FailFast => self
+                .fail_fast
+                .get(id)
+                .cloned()
+                .map(ReducerHandle::FailFast)
+                .ok_or_else(|| EngineError::UnknownReducer { id: id.clone() }),
+            FailPolicy::CollectAll => self
+                .collect_all
+                .get(id)
+                .cloned()
+                .map(ReducerHandle::CollectAll)
+                .ok_or_else(|| EngineError::UnknownReducer { id: id.clone() }),
+        }
+    }
+}
+
+// ---------- Environment sharing ----------------------------------------
+
+/// Shared environment handle.
+///
+/// Reads are cheap `Arc` clones. Writes accumulate in a per-child `D`
+/// (state delta) inside a `Par` and are merged by the reducer at join.
+#[derive(Debug)]
+pub struct EnvRef<D>(pub Arc<Env<D>>);
+
+impl<D> Clone for EnvRef<D> {
+    fn clone(&self) -> Self {
+        EnvRef(self.0.clone())
+    }
+}
+
+/// The `Env` a `Frame::Node` or `Frame::Scope` holds. Generic over the
+/// DSL-owned `D` (state delta); the engine does not interpret `D`.
+#[derive(Debug)]
+pub struct Env<D> {
+    /// The DSL's own state delta / bindings snapshot.
+    pub delta: D,
+    /// Optional parent for lexical lookup.
+    pub parent: Option<Arc<Env<D>>>,
+}
+
+// ---------- Marker traits + traversal ----------------------------------
+
+/// Marker trait for AST enums recognised by the kit.
 pub trait DslNode {
     /// Returns the stable ID assigned to this node.
     fn node_id(&self) -> NodeId;
 }
 
-// ---------- Breakpoints --------------------------------------------------
+// ---------- Breakpoints -------------------------------------------------
 
 /// Identifier assigned by a [`BreakpointSet`] to each added condition.
-///
-/// Callers keep the id so they can later remove or disable the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BreakpointId(pub u64);
 
@@ -528,13 +856,6 @@ impl fmt::Display for BreakpointId {
 
 /// A boolean predicate over [`NodeContext`] used to describe conditional
 /// breakpoints.
-///
-/// Conditions can be combined with [`and`](Self::and), [`or`](Self::or),
-/// and [`not`](Self::not); the composed tree is evaluated against each
-/// context the stepper produces. Because the underlying data
-/// (`NodeId` / `Path` / `depth` / `iteration` / call frame) is uniform
-/// across every DSL built with the kit, an agent can synthesise a
-/// condition purely from the observable event stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BreakCondition {
     /// Matches when the node ID is exactly `id`.
@@ -549,8 +870,7 @@ pub enum BreakCondition {
     DepthAtMost(u32),
     /// Matches when the current call-frame depth equals `n` exactly.
     DepthEquals(u32),
-    /// Matches when the iteration counter equals `n`. Nodes without an
-    /// active iteration never match this variant.
+    /// Matches when the iteration counter equals `n`.
     Iteration(u64),
     /// Matches when the current call frame equals `frame`.
     CallFrame(CallFrameId),
@@ -674,12 +994,6 @@ impl BreakCondition {
 }
 
 /// A registry of breakpoint conditions and their assigned IDs.
-///
-/// Hosts typically hold one `BreakpointSet` per debug session, add
-/// conditions in response to user or agent instructions, and query
-/// [`matches`](Self::matches) against every stepper event they observe.
-/// The set is deliberately host-side data: the [`Stepper`] trait knows
-/// nothing about it, which keeps the engine's contract minimal.
 #[derive(Debug, Default)]
 pub struct BreakpointSet {
     next: u64,
@@ -708,10 +1022,6 @@ impl BreakpointSet {
     }
 
     /// Returns the ids of all entries whose condition matches `ctx`.
-    ///
-    /// The empty vector means "no breakpoint fires here"; the caller
-    /// typically checks `.is_empty()` before deciding whether to yield
-    /// with [`SuspendReason::Breakpoint`].
     pub fn matches(&self, ctx: &NodeContext) -> Vec<BreakpointId> {
         self.entries
             .iter()
@@ -736,7 +1046,7 @@ impl BreakpointSet {
     }
 }
 
-// ---------- Traversal ----------------------------------------------------
+// ---------- Traversal ---------------------------------------------------
 
 /// Which side of a node's traversal the visitor is currently on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,20 +1058,11 @@ pub enum Phase {
 }
 
 /// AST traversal contract.
-///
-/// The derive macro generates a [`Walk`] impl for any enum whose variants
-/// carry a `NodeId`-typed `id` field and zero or more directly-recursive
-/// fields (`T`, `Box<T>`, `Option<T>`, `Vec<T>` where `T` is the enum
-/// itself). Hand-written implementations are welcome for advanced shapes.
 pub trait Walk: DslNode + Sized {
     /// Direct children of this node, in traversal order.
     fn children(&self) -> Vec<&Self>;
 
     /// Depth-first pre / post traversal.
-    ///
-    /// The closure is called twice per node: once with [`Phase::Pre`]
-    /// before descending, and once with [`Phase::Post`] after all
-    /// descendants have been visited.
     fn walk<F>(&self, visitor: &mut F)
     where
         F: FnMut(&Self, Phase),
@@ -774,10 +1075,6 @@ pub trait Walk: DslNode + Sized {
     }
 
     /// Depth-first traversal with early exit.
-    ///
-    /// The closure may return `Some(value)` at any point to halt the
-    /// traversal and yield that value. Useful for search-shaped queries
-    /// such as "find the first node whose id is X".
     fn walk_until<F, T>(&self, visitor: &mut F) -> Option<T>
     where
         F: FnMut(&Self, Phase) -> Option<T>,
@@ -807,9 +1104,6 @@ pub trait Walk: DslNode + Sized {
 }
 
 /// Mutable counterpart of [`Walk`].
-///
-/// Generated by the derive macro alongside [`Walk`]. The pre / post
-/// invariant is the same; the closure receives `&mut Self` in both phases.
 pub trait WalkMut: DslNode + Sized {
     /// Direct children of this node, mutably, in traversal order.
     fn children_mut(&mut self) -> Vec<&mut Self>;
@@ -877,37 +1171,6 @@ mod tests {
     }
 
     #[test]
-    fn breakpoint_path_prefix_matches_descendants() {
-        let prefix = Path::root().push(NodeId(1)).push(NodeId(2));
-        let cond = BreakCondition::under_path(prefix.clone());
-        let inside = ctx_at(NodeId(3), prefix.push(NodeId(3)), 3);
-        let outside = ctx_at(NodeId(5), Path::root().push(NodeId(5)), 1);
-        assert!(cond.matches(&inside));
-        assert!(!cond.matches(&outside));
-    }
-
-    #[test]
-    fn breakpoint_depth_bounds() {
-        let cond = BreakCondition::at_depth_at_least(3).and(BreakCondition::at_depth_at_most(5));
-        assert!(!cond.matches(&ctx_at(NodeId(0), Path::root(), 2)));
-        assert!(cond.matches(&ctx_at(NodeId(0), Path::root(), 3)));
-        assert!(cond.matches(&ctx_at(NodeId(0), Path::root(), 5)));
-        assert!(!cond.matches(&ctx_at(NodeId(0), Path::root(), 6)));
-    }
-
-    #[test]
-    fn breakpoint_composition_flattens() {
-        let a = BreakCondition::at_node(NodeId(1));
-        let b = BreakCondition::at_node(NodeId(2));
-        let c = BreakCondition::at_node(NodeId(3));
-        let combined = a.and(b).and(c);
-        match combined {
-            BreakCondition::All(ref xs) => assert_eq!(xs.len(), 3),
-            _ => panic!("expected All variant"),
-        }
-    }
-
-    #[test]
     fn breakpoint_set_add_matches_remove() {
         let mut set = BreakpointSet::new();
         let hit = set.add(BreakCondition::at_node(NodeId(4)));
@@ -923,68 +1186,13 @@ mod tests {
     }
 
     #[test]
-    fn breakpoint_iteration_and_frame() {
-        let cond = BreakCondition::at_iteration(3).and(BreakCondition::in_call_frame(CallFrameId(9)));
-        let mut ctx = ctx_at(NodeId(0), Path::root(), 1);
-        assert!(!cond.matches(&ctx));
-        ctx.iteration = Some(Iteration(3));
-        ctx.frame = Some(CallFrameId(9));
-        assert!(cond.matches(&ctx));
-    }
-
-    // ---- Async stepper smoke test ---------------------------------------
-
-    struct CountdownStepper {
-        remaining: u32,
-        yielded_once: bool,
-    }
-
-    impl AsyncStepper for CountdownStepper {
-        type Value = u32;
-        type Error = EngineError;
-
-        async fn step_async(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
-            if self.remaining == 0 {
-                return Ok(StepOutcome::Done(0));
-            }
-            if !self.yielded_once {
-                self.yielded_once = true;
-                return Ok(StepOutcome::Suspended {
-                    reason: SuspendReason::AwaitEffect,
-                    at: NodeContext::at(NodeId(self.remaining as u64), Path::root()),
-                });
-            }
-            self.remaining -= 1;
-            self.yielded_once = false;
-            Ok(StepOutcome::Advanced)
-        }
-    }
-
-    struct NoopResolver {
-        calls: u32,
-    }
-
-    impl EffectResolver for NoopResolver {
-        type Error = EngineError;
-
-        async fn resolve(
-            &mut self,
-            _at: &NodeContext,
-            _reason: &SuspendReason,
-        ) -> Result<(), Self::Error> {
-            self.calls += 1;
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn drive_async_runs_stepper_and_calls_resolver() {
-        let mut stepper = CountdownStepper { remaining: 3, yielded_once: false };
-        let mut resolver = NoopResolver { calls: 0 };
-        let value = futures::executor::block_on(drive_async(&mut stepper, &mut resolver))
-            .expect("drive succeeded");
-        assert_eq!(value, 0);
-        assert_eq!(resolver.calls, 3);
+    fn engine_error_carries_stable_code() {
+        let err = EngineError::Aborted {
+            at: NodeContext::at(NodeId(1), Path::root().push(NodeId(1))),
+            reason: "user requested".into(),
+        };
+        use miette::Diagnostic;
+        assert_eq!(err.code().map(|c| c.to_string()).as_deref(), Some("dsl_kit::eval::aborted"));
     }
 
     #[test]
@@ -995,19 +1203,61 @@ mod tests {
         assert!(codes.contains(&"dsl_kit::eval::failed"));
         assert!(codes.contains(&"dsl_kit::ast::malformed"));
         assert!(codes.contains(&"dsl_kit::stepper::protocol"));
+        assert!(codes.contains(&"dsl_kit::stepper::unknown_suspension"));
+        assert!(codes.contains(&"dsl_kit::reducer::unknown"));
         for entry in &entries {
             assert!(!entry.help.is_empty(), "help empty for {}", entry.code);
         }
     }
 
     #[test]
-    fn engine_error_carries_stable_code() {
-        let err = EngineError::Aborted {
-            at: NodeContext::at(NodeId(1), Path::root().push(NodeId(1))),
-            reason: "user requested".into(),
-        };
-        // miette exposes the code() method via the Diagnostic trait.
-        use miette::Diagnostic;
-        assert_eq!(err.code().map(|c| c.to_string()).as_deref(), Some("dsl_kit::eval::aborted"));
+    fn reducer_id_from_str_and_string() {
+        let a: ReducerId = "foo".into();
+        let b: ReducerId = String::from("foo").into();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reducer_registry_resolves_fail_fast_and_collect_all_independently() {
+        // A trivial FailFast reducer that returns the first non-None
+        // slot verbatim.
+        struct FirstNonNone;
+        impl Reducer<i64, ()> for FirstNonNone {
+            fn reduce(
+                &self,
+                slots: &[Option<i64>],
+                _deltas: &[Option<()>],
+                _winners: &[ChildIndex],
+            ) -> Result<(i64, ()), EngineError> {
+                let v = slots.iter().find_map(|s| *s).unwrap_or(0);
+                Ok((v, ()))
+            }
+        }
+
+        // A trivial CollectAll reducer.
+        struct CountOk;
+        impl ReducerCollectAll<i64, (), std::io::Error> for CountOk {
+            fn reduce(
+                &self,
+                slots: &[Option<Result<i64, std::io::Error>>],
+                _deltas: &[Option<()>],
+                _winners: &[ChildIndex],
+            ) -> Result<(i64, ()), EngineError> {
+                let count = slots.iter().filter(|s| matches!(s, Some(Ok(_)))).count();
+                Ok((count as i64, ()))
+            }
+        }
+
+        let mut reg: ReducerRegistry<i64, (), std::io::Error> = ReducerRegistry::new();
+        reg.register_fail_fast("first", Arc::new(FirstNonNone));
+        reg.register_collect_all("count_ok", Arc::new(CountOk));
+
+        let ff = reg.resolve(&"first".into(), FailPolicy::FailFast).unwrap();
+        assert!(matches!(ff, ReducerHandle::FailFast(_)));
+        let ca = reg.resolve(&"count_ok".into(), FailPolicy::CollectAll).unwrap();
+        assert!(matches!(ca, ReducerHandle::CollectAll(_)));
+
+        let miss = reg.resolve(&"nope".into(), FailPolicy::FailFast);
+        assert!(matches!(miss, Err(EngineError::UnknownReducer { .. })));
     }
 }

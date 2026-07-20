@@ -13,7 +13,7 @@
 //! the demo can also construct a full `DslMcpHandler` around
 //! `ExprHost` and call the same tools an MCP client would.
 
-use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId, StepOutcome, Stepper};
+use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId};
 use dsl_kit_mcp::host::DslHost;
 use expr_dsl::{demo_program, evaluate_all, pretty};
 use expr_host::ExprHost;
@@ -111,10 +111,3 @@ fn find_var_node(expr: &expr_dsl::Expr, target: &str) -> Option<NodeId> {
     found
 }
 
-// Silence unused-import warnings when Stepper / StepOutcome aren't
-// referenced in main (they are re-exported through the umbrella so
-// downstream users have them on hand).
-#[allow(dead_code)]
-fn _keep_stepper_types_in_scope(_s: Option<Box<dyn Stepper<Value = (), Error = ()>>>) {
-    let _ = StepOutcome::<()>::Advanced;
-}

@@ -5,20 +5,25 @@
 //! 1. Walks the AST with the derived traversal, prints an indented
 //!    tree.
 //! 2. Runs the pipeline synchronously with a canned resolver.
-//! 3. Runs the same pipeline through `AsyncStepper` inside a tokio
-//!    runtime, using `tokio::time::sleep` to simulate real network
-//!    latency, and runs two pipelines concurrently to show that the
-//!    async surface actually overlaps work.
+//! 3. Runs two pipelines concurrently through the host-driven async
+//!    pattern, using `tokio::time::sleep` to simulate real network
+//!    latency (the pipeline-level overlap demo).
 //! 4. Exercises the breakpoint surface and renders a diagnostic error.
+//!
+//! Commit A note: this binary still exercises the Commit A shape
+//! (single in-flight suspension per pipeline). Commit C will rewrite
+//! the async section to use real inline fan-out through the new
+//! `Par` semantics.
 
 use std::time::{Duration, Instant};
 
 use dsl_kit::{
-    AsyncStepper, BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId,
-    Path, StepOutcome, Stepper, Walk,
+    BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId, Path,
+    StepOutcome, Stepper, Walk,
 };
 use flow_dsl::{
-    Flow, FlowStepper, canned_response, check_unique_ids, pretty, research_pipeline,
+    Flow, FlowStepper, FlowValue, InternalOutcome, canned_response, check_unique_ids, pretty,
+    research_pipeline,
 };
 use futures::future::join;
 
@@ -73,29 +78,32 @@ fn demonstrate_breakpoints(program: &Flow) {
     }
 }
 
-/// Drives a flow through `AsyncStepper` using a real async resolver
-/// that sleeps for `latency` before answering each `Call`.
-///
-/// Returns the elapsed wall-clock time so the caller can compare
-/// sequential vs concurrent runs.
+/// Drives a flow through the v3 [`Stepper`] trait, awaiting a real
+/// `tokio::time::sleep` between each suspension.
 async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Duration, usize) {
     let start = Instant::now();
     let mut stepper = FlowStepper::new(program);
     let mut resolved = 0usize;
+    let bp = BreakpointSet::new();
     loop {
-        // Explicit await point: every step goes through the async trait.
-        let outcome = stepper.step_async().await.expect("step");
+        // Drive to next yield via the internal breakpoint-aware loop.
+        let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
         match outcome {
-            StepOutcome::Advanced => continue,
-            StepOutcome::Suspended { .. } => {
-                if let Some((id, label)) = stepper.suspended_call() {
+            InternalOutcome::Suspended { .. } => {
+                if let Some((sid, _node, label)) = stepper.suspended_call() {
                     tokio::time::sleep(latency).await;
                     let response = format!("[{tag}] {}", canned_response(label));
-                    stepper.record_result(id, response);
+                    stepper
+                        .resolve(sid, Ok(FlowValue::Text(response)))
+                        .expect("resolve");
                     resolved += 1;
                 }
             }
-            StepOutcome::Done(()) => break,
+            InternalOutcome::Done => break,
+            InternalOutcome::Advanced => {
+                // run_to_yield only returns non-Advanced; kept for the
+                // future.
+            }
         }
     }
     (start.elapsed(), resolved)
@@ -109,21 +117,25 @@ async fn main() -> miette::Result<()> {
     println!("=== Research pipeline: AST ===");
     print!("{}", pretty(&program));
 
-    check_unique_ids(&program)?;
+    check_unique_ids(&program).map_err(miette::Report::new)?;
 
     println!("\n=== Running the pipeline ===");
     let mut stepper = FlowStepper::new(&program);
+    let bp = BreakpointSet::new();
     loop {
-        match stepper.run_to_yield()? {
-            StepOutcome::Advanced => {}
-            StepOutcome::Suspended { reason: _, at } => {
-                if let Some((id, label)) = stepper.suspended_call() {
+        let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
+        match outcome {
+            InternalOutcome::Advanced => {}
+            InternalOutcome::Suspended { at, .. } => {
+                if let Some((sid, node_id, label)) = stepper.suspended_call() {
                     let response = canned_response(label);
-                    println!("  {id:>4} {label:<15} -> {response}   ({at})");
-                    stepper.record_result(id, response);
+                    println!("  {node_id:>4} {label:<15} -> {response}   ({at})");
+                    stepper
+                        .resolve(sid, Ok(FlowValue::Text(response)))
+                        .expect("resolve");
                 }
             }
-            StepOutcome::Done(()) => break,
+            InternalOutcome::Done => break,
         }
     }
 
@@ -131,7 +143,8 @@ async fn main() -> miette::Result<()> {
     println!("  {}", stepper.event_summary());
 
     println!("\n=== Recorded results ===");
-    let mut results: Vec<(NodeId, String)> = stepper.into_results().into_iter().collect();
+    let mut results: Vec<(NodeId, String)> =
+        stepper.results().iter().map(|(id, s)| (*id, s.clone())).collect();
     results.sort_by_key(|(id, _)| id.0);
     for (id, text) in &results {
         println!("  {id}: {text}");
@@ -177,6 +190,9 @@ async fn main() -> miette::Result<()> {
     if let Err(err) = check_unique_ids(&broken) {
         println!("{:?}", miette::Report::new(err));
     }
+
+    // Silence unused warning when Stepper isn't invoked directly here.
+    let _ = std::marker::PhantomData::<StepOutcome<FlowValue>>;
 
     Ok(())
 }

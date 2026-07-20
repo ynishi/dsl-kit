@@ -205,8 +205,9 @@ dependencies = [
 name = "dsl-kit-core"
 version = "0.0.0"
 dependencies = [
- "futures",
  "miette",
+ "serde_json",
+ "smallvec",
  "thiserror",
 ]
 
@@ -306,6 +307,10 @@ version = "0.0.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-core",
+ "dsl-kit-macros",
+ "serde_json",
+ "smallvec",
+ "thiserror",
 ]
 
 [[package]]
