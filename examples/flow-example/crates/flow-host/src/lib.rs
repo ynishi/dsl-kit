@@ -15,7 +15,8 @@
 
 use dsl_kit::{BreakpointSet, DslNode, IdGen, Phase, Stepper, Walk};
 use dsl_kit_mcp::host::{
-    DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, ResolvedCall, SuspendedCall,
+    DslHost, EventCounts, HostEffectError, HostLocation, HostOutcome, HostSnapshot,
+    PendingProjection, ResolvedCall, SuspendedCall,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
 use flow_dsl::{Flow, FlowStepper, FlowValue, InternalOutcome, canned_response, pretty, research_pipeline};
@@ -94,10 +95,40 @@ impl DslHost for FlowHost {
                 label: label.to_string(),
             });
 
+        let pending: Vec<PendingProjection> = self
+            .stepper
+            .pending()
+            .iter()
+            .map(|p| {
+                let (reason, label) = match &p.reason {
+                    dsl_kit::SuspendReason::Call { spec } => {
+                        ("call".to_string(), spec.label.clone())
+                    }
+                    dsl_kit::SuspendReason::Breakpoint => ("breakpoint".into(), String::new()),
+                    dsl_kit::SuspendReason::Cooperative => ("cooperative".into(), String::new()),
+                    dsl_kit::SuspendReason::User { tag } => (format!("user:{tag}"), String::new()),
+                    _ => ("unknown".into(), String::new()),
+                };
+                PendingProjection {
+                    id: p.id.0,
+                    reason,
+                    label,
+                    at: HostLocation {
+                        node: p.at.node.0,
+                        path: p.at.path.0.iter().map(|n| n.0).collect(),
+                        depth: p.at.depth,
+                        frame: p.at.frame.map(|f| f.0),
+                        iteration: p.at.iteration.map(|i| i.0),
+                    },
+                }
+            })
+            .collect();
+
         HostSnapshot {
             depth: self.stepper.depth(),
             current_path: self.stepper.current_path().map(|p| p.0.iter().map(|n| n.0).collect()),
             suspended_call,
+            pending,
             results,
             events: EventCounts {
                 visit_pre: counts.visit_pre,
@@ -187,6 +218,62 @@ impl DslHost for FlowHost {
             .resolve(sid, Ok(FlowValue::Text(response.clone())))
             .map_err(|e| e.to_string())?;
         Ok(ResolvedCall { node: node_id.0, label, result: response })
+    }
+
+    async fn resolve_by_id(
+        &mut self,
+        id: u64,
+        result: Result<String, HostEffectError>,
+    ) -> Result<ResolvedCall, String> {
+        let sid = dsl_kit::SuspensionId(id);
+        // Look up node id + label via the current pending list before
+        // resolving (Stepper::resolve consumes the pending entry).
+        let (node_id, label) = self
+            .stepper
+            .pending()
+            .iter()
+            .find(|p| p.id == sid)
+            .map(|p| {
+                let label = match &p.reason {
+                    dsl_kit::SuspendReason::Call { spec } => spec.label.clone(),
+                    _ => String::new(),
+                };
+                (p.at.node.0, label)
+            })
+            .ok_or_else(|| format!("no pending suspension for id {id}"))?;
+
+        match result {
+            Ok(text) => {
+                self.stepper
+                    .resolve(sid, Ok(FlowValue::Text(text.clone())))
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedCall { node: node_id, label, result: text })
+            }
+            Err(err) => {
+                self.stepper
+                    .resolve(
+                        sid,
+                        Err(flow_dsl::FlowEffectErr {
+                            code: err.code.clone(),
+                            message: err.message.clone(),
+                        }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(ResolvedCall {
+                    node: node_id,
+                    label,
+                    result: format!("<err {}: {}>", err.code, err.message),
+                })
+            }
+        }
+    }
+
+    fn take_cancellations(&mut self) -> Vec<u64> {
+        self.stepper
+            .take_cancellations()
+            .into_iter()
+            .map(|s| s.0)
+            .collect()
     }
 
     fn reset(&mut self) {

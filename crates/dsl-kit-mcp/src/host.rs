@@ -51,6 +51,17 @@ pub struct ResolvedCall {
     pub result: String,
 }
 
+/// Effect-side failure surfaced by the host via
+/// [`DslHost::resolve_by_id`]. JSON-friendly mirror of the DSL's
+/// `EffectError` associated type.
+#[derive(Debug, Clone)]
+pub struct HostEffectError {
+    /// Short machine-readable code.
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+}
+
 /// A full snapshot of the host's stepper state.
 ///
 /// Everything the MCP `dsl_kit_state` tool returns comes from here;
@@ -61,12 +72,36 @@ pub struct HostSnapshot {
     pub depth: usize,
     /// Path to the currently active node, when the stepper is active.
     pub current_path: Option<Vec<u64>>,
-    /// Details of the pending call, when the stepper is suspended.
+    /// Details of the pending call, when the stepper is suspended
+    /// on a single-in-flight call. When multiple suspensions are
+    /// live (fan-out), see [`pending`](Self::pending).
     pub suspended_call: Option<SuspendedCall>,
+    /// All currently live suspensions. In the common one-in-flight
+    /// case this has zero or one entry; under a `Par` fan-out it may
+    /// carry N entries. Order matches DFS pre-order over the frame
+    /// tree.
+    pub pending: Vec<PendingProjection>,
     /// Results recorded so far, keyed by node id.
     pub results: Vec<(u64, String)>,
     /// Cumulative event counters.
     pub events: EventCounts,
+}
+
+/// One live suspension in the projection view.
+///
+/// JSON-friendly mirror of the engine's `Pending` type. Cancellation
+/// runtime handles are held on the host side (see
+/// [`DslHost::take_cancellations`]) and are not included here.
+#[derive(Debug, Clone)]
+pub struct PendingProjection {
+    /// Stable engine-assigned id.
+    pub id: u64,
+    /// Short human-readable reason.
+    pub reason: String,
+    /// Effect label for `Call`-shaped suspensions; empty otherwise.
+    pub label: String,
+    /// Location context.
+    pub at: HostLocation,
 }
 
 /// Location context of a suspension, in generic (JSON-friendly) form.
@@ -157,8 +192,36 @@ pub trait DslHost: Send + Sync {
     /// Resolve the currently suspended call.
     ///
     /// When `result` is `None`, the host provides a default (usually
-    /// its canned response for the call's label).
+    /// its canned response for the call's label). Used by the
+    /// single-in-flight legacy path — for fan-out, use
+    /// [`resolve_by_id`](Self::resolve_by_id).
     async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String>;
+
+    /// Resolve a specific pending suspension by its stable id.
+    ///
+    /// `result` carries the success payload (`Ok(text)`) or an
+    /// effect-side failure (`Err(HostEffectError)`). Hosts convert
+    /// the text into their DSL-specific `Value` type and route the
+    /// error into the engine's FailFast / CollectAll policy path.
+    ///
+    /// The default implementation returns
+    /// `Err("resolve_by_id not implemented")`. Hosts that want to
+    /// expose fan-out via MCP override it.
+    async fn resolve_by_id(
+        &mut self,
+        _id: u64,
+        _result: Result<String, HostEffectError>,
+    ) -> Result<ResolvedCall, String> {
+        Err("resolve_by_id not implemented".into())
+    }
+
+    /// Drains the ids of suspensions the engine has cancelled since
+    /// the last drain (typically the losing legs of an `Any` /
+    /// `FirstK` policy fold, or the siblings of a FailFast failure).
+    /// Default returns an empty vector.
+    fn take_cancellations(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 
     /// Reset the stepper to a fresh state.
     fn reset(&mut self);

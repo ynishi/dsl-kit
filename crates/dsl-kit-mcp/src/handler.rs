@@ -19,6 +19,11 @@
 //! - `dsl_kit_breakpoint_remove` — remove a breakpoint by id.
 //! - `dsl_kit_explain` — look up help text for a stable diagnostic code
 //!   (built-in engine codes plus any the host contributes).
+//! - `dsl_kit_pending` — list every live suspension (fan-out view).
+//! - `dsl_kit_take_cancellations` — drain ids the engine has cancelled.
+//! - `dsl_kit_resolve_by_id` — resolve a specific pending suspension by
+//!   its stable id, supporting both success (`ok`) and effect-side
+//!   failure (`err`) variants.
 //! - `dsl_kit_reset` — reset the host's stepper.
 
 use std::sync::Arc;
@@ -39,7 +44,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::host::{DslHost, HostOutcome};
+use crate::host::{DslHost, HostEffectError, HostOutcome, PendingProjection};
 use crate::resources::{ResourceEntry, kit_resources};
 
 // ---------- Parameter types ---------------------------------------------
@@ -96,6 +101,31 @@ pub struct ExplainParams {
     /// Stable diagnostic code to look up, e.g. `"dsl_kit::eval::aborted"`.
     /// When omitted, the tool lists every known code without help text.
     pub code: Option<String>,
+}
+
+/// Parameters accepted by the `dsl_kit_resolve_by_id` MCP tool.
+///
+/// Exactly one of `ok` / `err` must be present. `ok` carries a
+/// success payload as a text response; `err` carries an effect-side
+/// failure with a machine-readable `code` and human message.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveByIdParams {
+    /// Stable suspension id returned by `dsl_kit_pending` or
+    /// `dsl_kit_state`.
+    pub id: u64,
+    /// Success payload (as a text response). Omit when `err` is set.
+    pub ok: Option<String>,
+    /// Effect-side failure. Omit when `ok` is set.
+    pub err: Option<ResolveErr>,
+}
+
+/// Effect-side failure body for `dsl_kit_resolve_by_id`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ResolveErr {
+    /// Short machine-readable code (e.g. `"timeout"`, `"unauthorized"`).
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
 }
 
 // ---------- Handler state -----------------------------------------------
@@ -209,10 +239,17 @@ impl DslMcpHandler {
             .map(|(id, cond)| json!({ "id": id.0, "condition": describe_condition(cond) }))
             .collect();
 
+        let pending_json: Vec<Value> = snap
+            .pending
+            .into_iter()
+            .map(|p| pending_to_json(&p))
+            .collect();
+
         let body = json!({
             "depth": snap.depth,
             "current_path": snap.current_path,
             "suspended_call": suspended,
+            "pending": pending_json,
             "results": results_json,
             "events": {
                 "visit_pre": snap.events.visit_pre,
@@ -226,6 +263,63 @@ impl DslMcpHandler {
             "breakpoints": bps,
         });
         Ok(body.to_string())
+    }
+
+    /// List every suspension the engine currently reports through
+    /// `Stepper::pending`. In the one-in-flight case this echoes the
+    /// same info as `dsl_kit_state.suspended_call`; under `Par`
+    /// fan-out it enumerates every live child.
+    #[tool(name = "dsl_kit_pending")]
+    pub async fn dsl_kit_pending(&self) -> Result<String, String> {
+        let guard = self.state.lock().await;
+        let snap = guard.host.snapshot();
+        let pending_json: Vec<Value> =
+            snap.pending.into_iter().map(|p| pending_to_json(&p)).collect();
+        Ok(json!({ "pending": pending_json }).to_string())
+    }
+
+    /// Drain the ids of suspensions the engine has cancelled since
+    /// the last call. Hosts should invoke this after every `Ready`
+    /// / `Blocked` / `Err` return from `dsl_kit_step` and act on the
+    /// drained ids (typically abort their runtime handles).
+    #[tool(name = "dsl_kit_take_cancellations")]
+    pub async fn dsl_kit_take_cancellations(&self) -> Result<String, String> {
+        let mut guard = self.state.lock().await;
+        let ids = guard.host.take_cancellations();
+        Ok(json!({ "cancelled": ids }).to_string())
+    }
+
+    /// Resolve a specific pending suspension by its stable id.
+    /// Supports both success (`ok`) and effect-side failure (`err`)
+    /// variants.
+    #[tool(name = "dsl_kit_resolve_by_id")]
+    pub async fn dsl_kit_resolve_by_id(
+        &self,
+        Parameters(params): Parameters<ResolveByIdParams>,
+    ) -> Result<String, String> {
+        let result = match (params.ok, params.err) {
+            (Some(text), None) => Ok(text),
+            (None, Some(e)) => Err(HostEffectError {
+                code: e.code,
+                message: e.message,
+            }),
+            (Some(_), Some(_)) => {
+                return Err("exactly one of ok / err must be present, not both".into());
+            }
+            (None, None) => {
+                return Err("provide one of ok (success) or err (effect failure)".into());
+            }
+        };
+        let mut guard = self.state.lock().await;
+        let resolved = guard.host.resolve_by_id(params.id, result).await?;
+        Ok(json!({
+            "resolved": {
+                "node": resolved.node,
+                "label": resolved.label,
+                "result": resolved.result,
+            }
+        })
+        .to_string())
     }
 
     /// Advance the stepper. See [`StepParams::mode`].
@@ -419,6 +513,21 @@ impl ServerHandler for DslMcpHandler {
 }
 
 // ---------- Helpers ------------------------------------------------------
+
+fn pending_to_json(p: &PendingProjection) -> Value {
+    json!({
+        "id": p.id,
+        "reason": p.reason,
+        "label": p.label,
+        "at": {
+            "node": p.at.node,
+            "path": p.at.path,
+            "depth": p.at.depth,
+            "frame": p.at.frame,
+            "iteration": p.at.iteration,
+        },
+    })
+}
 
 fn outcome_to_json(outcome: &HostOutcome) -> Value {
     match outcome {

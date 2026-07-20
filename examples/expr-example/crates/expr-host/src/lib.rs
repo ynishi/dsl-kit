@@ -182,6 +182,7 @@ impl DslHost for ExprHost {
                 path_to(self.program, *node).map(|ids| ids.into_iter().map(|n| n.0).collect())
             }),
             suspended_call,
+            pending: Vec::new(),
             results,
             events: EventCounts {
                 visit_pre: self.step_count,
