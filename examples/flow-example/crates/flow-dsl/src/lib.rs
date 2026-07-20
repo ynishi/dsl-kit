@@ -305,33 +305,59 @@ pub struct FlowStepper<'a> {
     done: bool,
     frame_tree_stub: FrameTree<FlowValue, FlowCursor, (), FlowEffectErr>,
     // Commit B1: real Par fan-out state
-    par_contexts: Vec<ParContext>,
+    par_contexts: Vec<ParContext<'a>>,
     sid_to_par: HashMap<SuspensionId, (usize, ChildIndex)>,
+    /// Item 1b: sids that live inside a subtree slot. Resolving a
+    /// subtree sid records the result into `self.results` (like a
+    /// plain Call) and, on `Err`, routes to `record_par_failure`.
+    sid_to_subtree: HashMap<SuspensionId, (usize, ChildIndex)>,
     cancelled: Vec<SuspensionId>,
     registry: Arc<ReducerRegistry<FlowValue, (), FlowEffectErr>>,
 }
 
 /// State of one active `Par` fan-out.
 ///
-/// Populated at Par entry when all children are direct `Flow::Call`
-/// nodes. Slots align with the Par's child index; the reducer
-/// (resolved from `registry` via `reducer_id`) folds them once the
+/// Populated at Par entry. Each Par child owns exactly one slot; the
+/// slot is filled either through the Call fast path (`child_sids[i]`
+/// resolves directly to `slots[i]`) or through a subtree stack
+/// (`subtrees[i] = Some(state)`) that runs its own DFS until drained
+/// and then fills the slot with `FlowValue::Unit`. The reducer
+/// (resolved from `registry` via `reducer_id`) folds the slots once
 /// `policy.shape` fires.
-struct ParContext {
+struct ParContext<'a> {
     slots: Vec<Option<FlowValue>>,
     /// CollectAll only: per-child effect-side failure. `Some(e)` once
     /// the child resolved with `Err(e)`; always `None` for a FailFast
     /// Par (failure aborts before reaching the reducer).
     failures: Vec<Option<FlowEffectErr>>,
     completion_order: Vec<ChildIndex>,
+    /// Sid for the Call fast-path slot; `SuspensionId(0)` sentinel
+    /// for subtree slots (subtree sids live in `sid_to_subtree`).
     child_sids: Vec<SuspensionId>,
     child_node_ids: Vec<NodeId>,
+    /// `Some(subtree)` for a slot whose Par child is not a direct
+    /// `Flow::Call` — the subtree drives a private stack until it
+    /// drains, then the slot fills with `FlowValue::Unit`. `None` for
+    /// a Call fast-path slot.
+    subtrees: Vec<Option<SubtreeState<'a>>>,
     policy: JoinPolicy,
     reducer_id: ReducerId,
     joined: bool,
     result: Option<FlowValue>,
     failure: Option<FlowEffectErr>,
     par_ctx: NodeContext,
+}
+
+/// Item 1b: private DFS stack for a non-Call Par child.
+///
+/// Each subtree is stepped by swapping `self.stack` / `self.suspend_pending`
+/// with these fields, running one `step_internal`, then swapping back.
+/// This lets a `Par` of `Seq` / `Scope` / `Maybe` / nested `Par` fan
+/// out concurrently instead of degrading to the earlier sequential
+/// `ParNext` fallback.
+struct SubtreeState<'a> {
+    stack: Vec<InternalFrame<'a>>,
+    suspend_pending: bool,
 }
 
 struct InternalFrame<'a> {
@@ -344,9 +370,14 @@ struct InternalFrame<'a> {
 enum FrameState<'a> {
     Enter,
     SeqNext { children: std::slice::Iter<'a, Flow>, index: u64 },
-    ParNext { children: std::slice::Iter<'a, Flow>, index: u64 },
-    /// Commit B1: real fan-out `Par` waiting for its slots.
+    /// Real fan-out `Par` waiting for its slots to fill.
     /// `context_index` indexes into `FlowStepper.par_contexts`.
+    ///
+    /// Slots come from two sources: direct `Flow::Call` children take
+    /// the fast path (external resolve fills the slot), and non-Call
+    /// children (Seq / Scope / Maybe / nested Par) drive a private
+    /// subtree stack that fills the slot with `FlowValue::Unit` on
+    /// drain. See `SubtreeState` and `step_par_fanout` for details.
     ParFanOut { context_index: usize },
     ScopePending { body: &'a Flow },
     ScopeDone,
@@ -399,6 +430,7 @@ impl<'a> FlowStepper<'a> {
             },
             par_contexts: Vec::new(),
             sid_to_par: HashMap::new(),
+            sid_to_subtree: HashMap::new(),
             cancelled: Vec::new(),
             registry,
         }
@@ -540,96 +572,107 @@ impl<'a> FlowStepper<'a> {
                             FrameState::SeqNext { children: children.iter(), index: 0 };
                     }
                     Flow::Par { children, policy: par_policy, reducer_id: par_reducer, .. } => {
-                        // Commit B1: if every child is a direct Call,
-                        // enter real fan-out mode. Otherwise fall back
-                        // to the Commit A sequential path.
-                        let all_call: Option<Vec<(NodeId, String)>> = children
-                            .iter()
-                            .map(|c| match c {
-                                Flow::Call { id, label } => Some((*id, label.clone())),
-                                _ => None,
-                            })
-                            .collect();
+                        // Item 1b: always enter fan-out mode. Direct
+                        // `Flow::Call` children take the fast path
+                        // (suspend at Par entry, resolve directly into
+                        // the slot). Non-Call children get a private
+                        // subtree stack that runs concurrently with
+                        // its siblings and fills its slot with
+                        // `FlowValue::Unit` on drain.
                         let call_id = CallFrameId(self.next_frame);
                         self.next_frame += 1;
                         let mut par_ctx = ctx.clone();
                         par_ctx.frame = Some(call_id);
                         par_ctx.depth = depth_before;
 
-                        if let Some(call_children) = all_call {
-                            let context_index = self.par_contexts.len();
-                            let n = call_children.len();
-                            let mut child_sids = Vec::with_capacity(n);
-                            let mut child_node_ids = Vec::with_capacity(n);
+                        let context_index = self.par_contexts.len();
+                        let n = children.len();
+                        let mut child_sids: Vec<SuspensionId> = Vec::with_capacity(n);
+                        let mut child_node_ids: Vec<NodeId> = Vec::with_capacity(n);
+                        let mut subtrees: Vec<Option<SubtreeState<'a>>> =
+                            Vec::with_capacity(n);
 
-                            for (slot_idx, (node_id, label)) in
-                                call_children.iter().enumerate()
-                            {
-                                let sid = SuspensionId(self.next_suspension);
-                                self.next_suspension += 1;
-                                child_sids.push(sid);
-                                child_node_ids.push(*node_id);
+                        for (slot_idx, child) in children.iter().enumerate() {
+                            match child {
+                                Flow::Call { id: node_id, label } => {
+                                    let sid = SuspensionId(self.next_suspension);
+                                    self.next_suspension += 1;
+                                    child_sids.push(sid);
+                                    child_node_ids.push(*node_id);
+                                    subtrees.push(None);
 
-                                let child_path = path.push(*node_id);
-                                let child_ctx = NodeContext {
-                                    node: *node_id,
-                                    path: child_path,
-                                    frame: Some(call_id),
-                                    depth: depth_before + 1,
-                                    iteration: Some(Iteration(slot_idx as u64 + 1)),
-                                };
-                                let spec = dsl_kit::CallSpec {
-                                    label: label.clone(),
-                                    payload: serde_json::Value::Null,
-                                };
-                                self.pending.push(Pending {
-                                    id: sid,
-                                    reason: SuspendReason::Call { spec: spec.clone() },
-                                    at: child_ctx.clone(),
-                                });
-                                self.id_to_node.insert(sid, *node_id);
-                                self.sid_to_par.insert(sid, (context_index, slot_idx));
-                                self.events.emit(&Event::Suspend {
-                                    at: child_ctx,
-                                    reason: SuspendReason::Call { spec },
-                                });
+                                    let child_path = path.push(*node_id);
+                                    let child_ctx = NodeContext {
+                                        node: *node_id,
+                                        path: child_path,
+                                        frame: Some(call_id),
+                                        depth: depth_before + 1,
+                                        iteration: Some(Iteration(slot_idx as u64 + 1)),
+                                    };
+                                    let spec = dsl_kit::CallSpec {
+                                        label: label.clone(),
+                                        payload: serde_json::Value::Null,
+                                    };
+                                    self.pending.push(Pending {
+                                        id: sid,
+                                        reason: SuspendReason::Call { spec: spec.clone() },
+                                        at: child_ctx.clone(),
+                                    });
+                                    self.id_to_node.insert(sid, *node_id);
+                                    self.sid_to_par.insert(sid, (context_index, slot_idx));
+                                    self.events.emit(&Event::Suspend {
+                                        at: child_ctx,
+                                        reason: SuspendReason::Call { spec },
+                                    });
+                                }
+                                _ => {
+                                    // Non-Call child: spawn a subtree
+                                    // with a single Enter frame rooted
+                                    // at the child node. Slot filled
+                                    // by `FlowValue::Unit` on drain.
+                                    child_sids.push(SuspensionId(0));
+                                    child_node_ids.push(child.node_id());
+                                    let child_path = path.push(child.node_id());
+                                    subtrees.push(Some(SubtreeState {
+                                        stack: vec![InternalFrame {
+                                            node: child,
+                                            path: child_path,
+                                            state: FrameState::Enter,
+                                            frame_id: None,
+                                        }],
+                                        suspend_pending: false,
+                                    }));
+                                }
                             }
-
-                            let resolved_policy = par_policy.unwrap_or(JoinPolicy {
-                                shape: JoinShape::All,
-                                fail: FailPolicy::FailFast,
-                            });
-                            let resolved_reducer_id = par_reducer
-                                .clone()
-                                .map(ReducerId::from)
-                                .unwrap_or_else(|| {
-                                    ReducerId::from("reduce_all_ordered")
-                                });
-                            self.par_contexts.push(ParContext {
-                                slots: vec![None; n],
-                                failures: (0..n).map(|_| None).collect(),
-                                completion_order: Vec::new(),
-                                child_sids,
-                                child_node_ids,
-                                policy: resolved_policy,
-                                reducer_id: resolved_reducer_id,
-                                joined: false,
-                                result: None,
-                                failure: None,
-                                par_ctx: par_ctx.clone(),
-                            });
-
-                            let frame = self.stack.last_mut().expect("non-empty");
-                            frame.frame_id = Some(call_id);
-                            frame.state = FrameState::ParFanOut { context_index };
-                            self.events.emit(&Event::FrameEnter { at: par_ctx });
-                        } else {
-                            let frame = self.stack.last_mut().expect("non-empty");
-                            frame.frame_id = Some(call_id);
-                            frame.state =
-                                FrameState::ParNext { children: children.iter(), index: 0 };
-                            self.events.emit(&Event::FrameEnter { at: par_ctx });
                         }
+
+                        let resolved_policy = par_policy.unwrap_or(JoinPolicy {
+                            shape: JoinShape::All,
+                            fail: FailPolicy::FailFast,
+                        });
+                        let resolved_reducer_id = par_reducer
+                            .clone()
+                            .map(ReducerId::from)
+                            .unwrap_or_else(|| ReducerId::from("reduce_all_ordered"));
+                        self.par_contexts.push(ParContext {
+                            slots: vec![None; n],
+                            failures: (0..n).map(|_| None).collect(),
+                            completion_order: Vec::new(),
+                            child_sids,
+                            child_node_ids,
+                            subtrees,
+                            policy: resolved_policy,
+                            reducer_id: resolved_reducer_id,
+                            joined: false,
+                            result: None,
+                            failure: None,
+                            par_ctx: par_ctx.clone(),
+                        });
+
+                        let frame = self.stack.last_mut().expect("non-empty");
+                        frame.frame_id = Some(call_id);
+                        frame.state = FrameState::ParFanOut { context_index };
+                        self.events.emit(&Event::FrameEnter { at: par_ctx });
                     }
                     Flow::Scope { body, .. } => {
                         frame.state = FrameState::ScopePending { body: body.as_ref() };
@@ -685,51 +728,9 @@ impl<'a> FlowStepper<'a> {
             }
             FrameState::ParFanOut { context_index } => {
                 let idx = *context_index;
-                let par_ctx_clone = self.par_contexts[idx].par_ctx.clone();
-                // If a slot failure surfaced (FailFast), propagate.
-                if let Some(err) = self.par_contexts[idx].failure.clone() {
-                    return Err(FlowError::Effect(err));
-                }
-                // If the shape has fired, apply the reducer and pop.
-                let ready = self.par_contexts[idx].joined;
-                if ready {
-                    // Fold the Par (invokes the reducer to compute the
-                    // aggregate value); we drop the value here because
-                    // the current flow-dsl bubble-up path doesn't
-                    // propagate Par-level values upward, and per-Call
-                    // results are already recorded per-child in
-                    // `self.results` via `resolve`.
-                    let _ = self.fold_par(idx).map_err(FlowError::Engine)?;
-                    self.events.emit(&Event::FrameLeave { at: par_ctx_clone.clone() });
-                    self.events.emit(&Event::VisitPost { at: par_ctx_clone });
-                    self.stack.pop();
-                    return Ok(InternalOutcome::Advanced);
-                }
-                // Otherwise the Par is blocked on outstanding slots.
-                Ok(InternalOutcome::Waiting)
-            }
-            FrameState::ParNext { children, index } => {
-                if let Some(next) = children.next() {
-                    let child_path = path.push(next.node_id());
-                    *index += 1;
-                    let iter = Iteration(*index);
-                    let mut ctx = ctx.clone();
-                    ctx.iteration = Some(iter);
-                    self.events.emit(&Event::IterationTick { at: ctx });
-                    self.stack.push(InternalFrame {
-                        node: next,
-                        path: child_path,
-                        state: FrameState::Enter,
-                        frame_id: None,
-                    });
-                    Ok(InternalOutcome::Advanced)
-                } else {
-                    let leave_ctx = ctx.clone();
-                    self.events.emit(&Event::FrameLeave { at: leave_ctx });
-                    self.events.emit(&Event::VisitPost { at: ctx });
-                    self.stack.pop();
-                    Ok(InternalOutcome::Advanced)
-                }
+                // Delegate to the fan-out driver so we can borrow
+                // `self` freely (subtree stepping needs `&mut self`).
+                self.step_par_fanout(idx)
             }
             FrameState::ScopePending { body } => {
                 let body = *body;
@@ -858,30 +859,71 @@ impl<'a> FlowStepper<'a> {
     /// Records a successful resolve into a Par slot, updates
     /// completion order, and checks whether the shape has fired.
     fn record_par_slot(&mut self, context_index: usize, slot_idx: usize, value: FlowValue) {
-        let ctx = &mut self.par_contexts[context_index];
-        if ctx.joined {
-            return;
+        {
+            let ctx = &mut self.par_contexts[context_index];
+            if ctx.joined {
+                return;
+            }
+            ctx.slots[slot_idx] = Some(value);
+            ctx.completion_order.push(slot_idx);
         }
-        ctx.slots[slot_idx] = Some(value);
-        ctx.completion_order.push(slot_idx);
-        let successes = ctx.completion_order.len();
-        let n = ctx.slots.len();
-        let fires = match ctx.policy.shape {
-            JoinShape::All => successes == n,
-            JoinShape::Any => successes >= 1,
-            JoinShape::FirstK(k) => successes >= k,
+        let (fires, n) = {
+            let ctx = &self.par_contexts[context_index];
+            let successes = ctx.completion_order.len();
+            let n = ctx.slots.len();
+            let fires = match ctx.policy.shape {
+                JoinShape::All => successes == n,
+                JoinShape::Any => successes >= 1,
+                JoinShape::FirstK(k) => successes >= k,
+            };
+            (fires, n)
         };
         if fires {
-            ctx.joined = true;
-            // Queue outstanding sibling suspensions for cancellation.
-            // Skip children that already resolved with Err under
-            // CollectAll — they are neither pending nor cancellable.
-            for (i, sid) in ctx.child_sids.iter().enumerate() {
-                if ctx.slots[i].is_none() && ctx.failures[i].is_none() {
-                    self.cancelled.push(*sid);
-                    self.sid_to_par.remove(sid);
-                    self.id_to_node.remove(sid);
-                    self.pending.retain(|p| p.id != *sid);
+            self.par_contexts[context_index].joined = true;
+            self.cancel_par_children(context_index, n);
+        }
+    }
+
+    /// Cancels every still-live child of a joined ParContext:
+    /// Call fast-path slots have their sid pushed to `self.cancelled`;
+    /// subtree slots have their subtree stack dropped and every
+    /// sid mapped to that subtree cancelled.
+    fn cancel_par_children(&mut self, context_index: usize, n: usize) {
+        for slot in 0..n {
+            let slot_filled = self.par_contexts[context_index].slots[slot].is_some();
+            let slot_failed = self.par_contexts[context_index].failures[slot].is_some();
+            if slot_filled || slot_failed {
+                continue;
+            }
+            // Call fast-path slot: cancel the direct sid.
+            if self.par_contexts[context_index].subtrees[slot].is_none() {
+                let sid = self.par_contexts[context_index].child_sids[slot];
+                if sid != SuspensionId(0) {
+                    self.cancelled.push(sid);
+                    self.sid_to_par.remove(&sid);
+                    self.id_to_node.remove(&sid);
+                    self.pending.retain(|p| p.id != sid);
+                }
+            } else {
+                // Subtree slot: drop the stack, cancel every sid that
+                // was routed to this (context_index, slot).
+                self.par_contexts[context_index].subtrees[slot] = None;
+                let victims: Vec<SuspensionId> = self
+                    .sid_to_subtree
+                    .iter()
+                    .filter_map(|(sid, coord)| {
+                        if *coord == (context_index, slot) {
+                            Some(*sid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for sid in victims {
+                    self.cancelled.push(sid);
+                    self.sid_to_subtree.remove(&sid);
+                    self.id_to_node.remove(&sid);
+                    self.pending.retain(|p| p.id != sid);
                 }
             }
         }
@@ -902,50 +944,165 @@ impl<'a> FlowStepper<'a> {
         slot_idx: usize,
         err: FlowEffectErr,
     ) {
-        let ctx = &mut self.par_contexts[context_index];
-        if ctx.joined {
-            return;
-        }
-        match ctx.policy.fail {
-            FailPolicy::FailFast => {
-                ctx.joined = true;
-                ctx.failure = Some(err);
-                // Cancel remaining siblings.
-                for (i, sid) in ctx.child_sids.iter().enumerate() {
-                    if ctx.slots[i].is_none() {
-                        self.cancelled.push(*sid);
-                        self.sid_to_par.remove(sid);
-                        self.id_to_node.remove(sid);
-                        self.pending.retain(|p| p.id != *sid);
-                    }
-                }
+        let (join_now, n) = {
+            let ctx = &mut self.par_contexts[context_index];
+            if ctx.joined {
+                return;
             }
-            FailPolicy::CollectAll => {
-                ctx.failures[slot_idx] = Some(err);
-                let n = ctx.slots.len();
-                let successes = ctx.completion_order.len();
-                let failed = ctx.failures.iter().filter(|f| f.is_some()).count();
-                let live = n - successes - failed;
-                let potential_successes = successes + live;
-                let target_unattainable = match ctx.policy.shape {
-                    JoinShape::All => failed >= 1,
-                    JoinShape::Any => potential_successes == 0,
-                    JoinShape::FirstK(k) => potential_successes < k,
-                };
-                if target_unattainable {
+            match ctx.policy.fail {
+                FailPolicy::FailFast => {
                     ctx.joined = true;
-                    // Cancel any still-pending siblings so the host
-                    // can drain them via take_cancellations().
-                    for (i, sid) in ctx.child_sids.iter().enumerate() {
-                        if ctx.slots[i].is_none() && ctx.failures[i].is_none() {
-                            self.cancelled.push(*sid);
-                            self.sid_to_par.remove(sid);
-                            self.id_to_node.remove(sid);
-                            self.pending.retain(|p| p.id != *sid);
-                        }
+                    ctx.failure = Some(err);
+                    (true, ctx.slots.len())
+                }
+                FailPolicy::CollectAll => {
+                    ctx.failures[slot_idx] = Some(err);
+                    let n = ctx.slots.len();
+                    let successes = ctx.completion_order.len();
+                    let failed = ctx.failures.iter().filter(|f| f.is_some()).count();
+                    let live = n - successes - failed;
+                    let potential_successes = successes + live;
+                    let target_unattainable = match ctx.policy.shape {
+                        JoinShape::All => failed >= 1,
+                        JoinShape::Any => potential_successes == 0,
+                        JoinShape::FirstK(k) => potential_successes < k,
+                    };
+                    if target_unattainable {
+                        ctx.joined = true;
+                        (true, n)
+                    } else {
+                        (false, n)
                     }
                 }
             }
+        };
+        if join_now {
+            self.cancel_par_children(context_index, n);
+        }
+    }
+
+    /// Item 1b: fan-out driver invoked from the `ParFanOut` arm of
+    /// `step_internal`. Handles failure propagation, join+fold, and
+    /// one round-robin advance across subtree slots.
+    fn step_par_fanout(&mut self, context_index: usize) -> Result<InternalOutcome, FlowError> {
+        let par_ctx_clone = self.par_contexts[context_index].par_ctx.clone();
+        // 1. FailFast propagation.
+        if let Some(err) = self.par_contexts[context_index].failure.clone() {
+            return Err(FlowError::Effect(err));
+        }
+        // 2. Joined → fold + pop.
+        if self.par_contexts[context_index].joined {
+            let _ = self.fold_par(context_index).map_err(FlowError::Engine)?;
+            self.events.emit(&Event::FrameLeave { at: par_ctx_clone.clone() });
+            self.events.emit(&Event::VisitPost { at: par_ctx_clone });
+            self.stack.pop();
+            return Ok(InternalOutcome::Advanced);
+        }
+        // 3. Try to advance one subtree that isn't blocked on a
+        //    resolve. Round-robin: first advanceable slot wins.
+        let n = self.par_contexts[context_index].slots.len();
+        for slot_idx in 0..n {
+            if self.par_contexts[context_index].subtrees[slot_idx].is_none() {
+                continue; // Call fast-path slot (owned by external resolve).
+            }
+            // Skip subtree if any sid is currently mapped to it.
+            let blocked = self
+                .sid_to_subtree
+                .values()
+                .any(|coord| *coord == (context_index, slot_idx));
+            if blocked {
+                continue;
+            }
+            let advanced = self.step_subtree(context_index, slot_idx)?;
+            if advanced {
+                return Ok(InternalOutcome::Advanced);
+            }
+            // step_subtree returned Waiting — try the next slot.
+        }
+        Ok(InternalOutcome::Waiting)
+    }
+
+    /// Item 1b: run one internal step against the subtree at
+    /// `par_contexts[context_index].subtrees[slot_idx]` by swapping
+    /// `self.stack` / `self.suspend_pending` with the subtree fields.
+    ///
+    /// Returns `Ok(true)` if the outer scheduler should treat this as
+    /// `Advanced` (the subtree progressed, drained, or suspended);
+    /// `Ok(false)` if the subtree is currently `Waiting` (a nested
+    /// `Par` blocked on all its own subtrees) so the outer round-
+    /// robin loop should try the next slot.
+    fn step_subtree(
+        &mut self,
+        context_index: usize,
+        slot_idx: usize,
+    ) -> Result<bool, FlowError> {
+        // Take subtree state out.
+        let mut sub = self.par_contexts[context_index].subtrees[slot_idx]
+            .take()
+            .expect("caller checked subtree is Some");
+        if sub.stack.is_empty() {
+            // Drained already: fill slot with Unit and drop the state.
+            if self.par_contexts[context_index].slots[slot_idx].is_none()
+                && self.par_contexts[context_index].failures[slot_idx].is_none()
+            {
+                self.record_par_slot(context_index, slot_idx, FlowValue::Unit);
+            }
+            return Ok(true);
+        }
+        // Swap into main position.
+        std::mem::swap(&mut self.stack, &mut sub.stack);
+        std::mem::swap(&mut self.suspend_pending, &mut sub.suspend_pending);
+        let before_pending = self.pending.len();
+        let done_before = self.done;
+        let outcome = self.step_internal();
+        // Any newly-added sid this step created inside the subtree is
+        // owned by the subtree, not the outer world; reroute it.
+        let new_sids: Vec<SuspensionId> = self
+            .pending
+            .iter()
+            .skip(before_pending)
+            .map(|p| p.id)
+            .collect();
+        for sid in new_sids {
+            // Nested Par entry inside a subtree pre-registers its own
+            // sids via `sid_to_par`. Those should NOT be shadowed by a
+            // subtree mapping (they resolve into the nested Par's
+            // slots directly). Only untracked sids belong to the
+            // subtree's own Call chain.
+            let already_owned = self.sid_to_par.contains_key(&sid);
+            if !already_owned {
+                self.sid_to_subtree
+                    .insert(sid, (context_index, slot_idx));
+            }
+        }
+        // Swap back — even on Err — so state is preserved.
+        std::mem::swap(&mut self.stack, &mut sub.stack);
+        std::mem::swap(&mut self.suspend_pending, &mut sub.suspend_pending);
+        // `step_internal` sets `self.done = true` when its stack goes
+        // empty; that reflects the subtree draining, NOT the outer
+        // program. Undo the flag unless it was already set.
+        if !done_before {
+            self.done = false;
+        }
+
+        let outcome = outcome?;
+        let drained = sub.stack.is_empty();
+        if drained {
+            // Fill slot with Unit (subtree completed).
+            if self.par_contexts[context_index].slots[slot_idx].is_none()
+                && self.par_contexts[context_index].failures[slot_idx].is_none()
+            {
+                self.record_par_slot(context_index, slot_idx, FlowValue::Unit);
+            }
+            // Do not restore the subtree.
+        } else {
+            // Restore.
+            self.par_contexts[context_index].subtrees[slot_idx] = Some(sub);
+        }
+        match outcome {
+            InternalOutcome::Advanced | InternalOutcome::Suspended { .. } => Ok(true),
+            InternalOutcome::Waiting => Ok(false),
+            InternalOutcome::Done => Ok(true),
         }
     }
 }
@@ -1000,7 +1157,7 @@ impl<'a> Stepper for FlowStepper<'a> {
         id: SuspensionId,
         result: Result<Self::Value, Self::EffectError>,
     ) -> Result<(), Self::Error> {
-        // Par-slot resolve path.
+        // Par-slot fast-path resolve.
         if let Some((context_index, slot_idx)) = self.sid_to_par.remove(&id) {
             self.pending.retain(|p| p.id != id);
             let node_id = self.par_contexts[context_index].child_node_ids[slot_idx];
@@ -1016,6 +1173,32 @@ impl<'a> Stepper for FlowStepper<'a> {
                     };
                     self.results.insert(node_id, text);
                     self.record_par_slot(context_index, slot_idx, v);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.record_par_failure(context_index, slot_idx, e);
+                    Ok(())
+                }
+            }
+        } else if let Some((context_index, slot_idx)) = self.sid_to_subtree.remove(&id) {
+            // Item 1b: subtree Call resolve. Route the result to the
+            // subtree's frame (like a plain Call) so the subtree can
+            // resume; slot-fill happens later when the subtree drains.
+            // On `Err`, route to the enclosing Par (FailFast aborts
+            // siblings; CollectAll records into `failures[slot_idx]`).
+            let node_id = self
+                .id_to_node
+                .remove(&id)
+                .ok_or(EngineError::UnknownSuspension { id })?;
+            self.pending.retain(|p| p.id != id);
+            match result {
+                Ok(v) => {
+                    let text = match v {
+                        FlowValue::Text(s) => s,
+                        FlowValue::Unit => String::new(),
+                        FlowValue::List(items) => format!("{items:?}"),
+                    };
+                    self.results.insert(node_id, text);
                     Ok(())
                 }
                 Err(e) => {
@@ -1518,6 +1701,223 @@ mod tests {
             .step()
             .expect_err("reduce_any_first_or_all_failures should Err");
         assert!(matches!(err, FlowError::Engine(_)));
+    }
+
+    #[test]
+    fn par_of_seq_fans_out_and_completes() {
+        // Item 1b: Par of two Seq children, each Seq has two Calls.
+        // Fan-out is real (both Seqs advance concurrently) but each
+        // Seq is internally sequential — so pending count at any
+        // moment is at most one per Seq (i.e. up to 2, not 4).
+        let ids = IdGen::new();
+        let seq_a = Flow::Seq {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "a1".into() },
+                Flow::Call { id: ids.node(), label: "a2".into() },
+            ],
+        };
+        let seq_b = Flow::Seq {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "b1".into() },
+                Flow::Call { id: ids.node(), label: "b2".into() },
+            ],
+        };
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![seq_a, seq_b],
+            policy: None,
+            reducer_id: None,
+        };
+        let mut stepper = FlowStepper::new(&program);
+
+        // Drive to the first yield-point: both subtrees should reach
+        // their first Call and suspend, giving 2 concurrent pendings.
+        for _ in 0..64 {
+            if stepper.pending().len() >= 2 {
+                break;
+            }
+            let _ = stepper.step().expect("step to first yield");
+        }
+        assert_eq!(
+            stepper.pending().len(),
+            2,
+            "expected 2 concurrent pending (one per Seq subtree)"
+        );
+        let labels_first: Vec<String> = stepper
+            .pending()
+            .iter()
+            .map(|p| match &p.reason {
+                SuspendReason::Call { spec } => spec.label.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(labels_first.contains(&"a1".to_string()));
+        assert!(labels_first.contains(&"b1".to_string()));
+
+        // Resolve both. Each subtree should advance to its second
+        // Call; we expect two new pendings (a2 + b2).
+        let first_sids: Vec<SuspensionId> =
+            stepper.pending().iter().map(|p| p.id).collect();
+        for sid in &first_sids {
+            stepper
+                .resolve(*sid, Ok(FlowValue::Text("ok".into())))
+                .expect("resolve first-wave");
+        }
+        for _ in 0..64 {
+            if stepper.pending().len() >= 2 {
+                break;
+            }
+            let _ = stepper.step().expect("step to second yield");
+        }
+        assert_eq!(stepper.pending().len(), 2, "expected 2 concurrent second-wave pending");
+        let labels_second: Vec<String> = stepper
+            .pending()
+            .iter()
+            .map(|p| match &p.reason {
+                SuspendReason::Call { spec } => spec.label.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(labels_second.contains(&"a2".to_string()));
+        assert!(labels_second.contains(&"b2".to_string()));
+
+        // Resolve the second wave and drive to Done.
+        let second_sids: Vec<SuspensionId> =
+            stepper.pending().iter().map(|p| p.id).collect();
+        for sid in second_sids {
+            stepper
+                .resolve(sid, Ok(FlowValue::Text("ok".into())))
+                .expect("resolve second-wave");
+        }
+        for _ in 0..128 {
+            if let StepOutcome::Done(_) = stepper.step().expect("step to done") {
+                // Four Call nodes recorded a result.
+                assert_eq!(stepper.results().len(), 4);
+                return;
+            }
+        }
+        panic!("did not reach Done");
+    }
+
+    #[test]
+    fn par_of_scope_wrapping_call_fans_out() {
+        // Item 1b: Par of three Scope-wrapped Calls. Each Scope is
+        // one subtree; all three should yield concurrently (3
+        // pendings simultaneously).
+        let ids = IdGen::new();
+        let scope = |label: &str| Flow::Scope {
+            id: ids.node(),
+            label: label.into(),
+            body: Box::new(Flow::Call { id: ids.node(), label: label.into() }),
+        };
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![scope("x"), scope("y"), scope("z")],
+            policy: None,
+            reducer_id: None,
+        };
+        let mut stepper = FlowStepper::new(&program);
+
+        // Drive until all three subtrees have reached their inner
+        // Call and suspended.
+        for _ in 0..64 {
+            if stepper.pending().len() >= 3 {
+                break;
+            }
+            let _ = stepper.step().expect("step to yield");
+        }
+        assert_eq!(
+            stepper.pending().len(),
+            3,
+            "expected 3 concurrent pending across Scope subtrees"
+        );
+        let labels: Vec<String> = stepper
+            .pending()
+            .iter()
+            .map(|p| match &p.reason {
+                SuspendReason::Call { spec } => spec.label.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        for want in ["x", "y", "z"] {
+            assert!(labels.iter().any(|l| l == want), "missing label {want}");
+        }
+
+        // Resolve all three and drive to Done.
+        let sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
+        for sid in sids {
+            stepper
+                .resolve(sid, Ok(FlowValue::Text("ok".into())))
+                .expect("resolve");
+        }
+        for _ in 0..64 {
+            if let StepOutcome::Done(_) = stepper.step().expect("step to done") {
+                assert_eq!(stepper.results().len(), 3);
+                return;
+            }
+        }
+        panic!("did not reach Done");
+    }
+
+    #[test]
+    fn par_failfast_inside_subtree_cancels_siblings() {
+        // Item 1b: FailFast propagation across subtree slots.
+        // Par of two Scope-wrapped Calls; fail the first, expect the
+        // second's pending sid to be cancelled and the Par to
+        // propagate the Effect error on the next step.
+        let ids = IdGen::new();
+        let scope = |label: &str| Flow::Scope {
+            id: ids.node(),
+            label: label.into(),
+            body: Box::new(Flow::Call { id: ids.node(), label: label.into() }),
+        };
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![scope("boom"), scope("alive")],
+            policy: None,
+            reducer_id: None,
+        };
+        let mut stepper = FlowStepper::new(&program);
+        for _ in 0..32 {
+            if stepper.pending().len() >= 2 {
+                break;
+            }
+            let _ = stepper.step().expect("step to yield");
+        }
+        assert_eq!(stepper.pending().len(), 2);
+        let boom_sid = stepper
+            .pending()
+            .iter()
+            .find(|p| matches!(&p.reason, SuspendReason::Call { spec } if spec.label == "boom"))
+            .map(|p| p.id)
+            .expect("boom pending");
+        let alive_sid = stepper
+            .pending()
+            .iter()
+            .find(|p| matches!(&p.reason, SuspendReason::Call { spec } if spec.label == "alive"))
+            .map(|p| p.id)
+            .expect("alive pending");
+
+        stepper
+            .resolve(
+                boom_sid,
+                Err(FlowEffectErr {
+                    code: "detonated".into(),
+                    message: "boom".into(),
+                }),
+            )
+            .expect("resolve records failure");
+
+        // Sibling cancellation should now be queued and drainable.
+        let err = stepper.step().expect_err("failfast propagates");
+        match err {
+            FlowError::Effect(e) => assert_eq!(e.code, "detonated"),
+            FlowError::Engine(_) => panic!("expected FlowError::Effect"),
+        }
+        let cancels = stepper.take_cancellations();
+        assert!(cancels.contains(&alive_sid), "alive sid should be cancelled");
     }
 
     #[test]
