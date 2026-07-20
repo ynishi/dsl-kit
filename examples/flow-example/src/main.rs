@@ -99,11 +99,32 @@ async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Durati
                     resolved += 1;
                 }
             }
-            InternalOutcome::Done => break,
-            InternalOutcome::Advanced => {
-                // run_to_yield only returns non-Advanced; kept for the
-                // future.
+            InternalOutcome::Waiting => {
+                // Par fan-out: resolve every outstanding slot.
+                let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
+                    .pending()
+                    .iter()
+                    .filter_map(|p| match &p.reason {
+                        dsl_kit::SuspendReason::Call { spec } => {
+                            Some((p.id, spec.label.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if outstanding.is_empty() {
+                    break;
+                }
+                for (sid, label) in outstanding {
+                    tokio::time::sleep(latency).await;
+                    let response = format!("[{tag}] {}", canned_response(&label));
+                    stepper
+                        .resolve(sid, Ok(FlowValue::Text(response)))
+                        .expect("resolve");
+                    resolved += 1;
+                }
             }
+            InternalOutcome::Done => break,
+            InternalOutcome::Advanced => {}
         }
     }
     (start.elapsed(), resolved)
@@ -130,6 +151,28 @@ async fn main() -> miette::Result<()> {
                 if let Some((sid, node_id, label)) = stepper.suspended_call() {
                     let response = canned_response(label);
                     println!("  {node_id:>4} {label:<15} -> {response}   ({at})");
+                    stepper
+                        .resolve(sid, Ok(FlowValue::Text(response)))
+                        .expect("resolve");
+                }
+            }
+            InternalOutcome::Waiting => {
+                let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
+                    .pending()
+                    .iter()
+                    .filter_map(|p| match &p.reason {
+                        dsl_kit::SuspendReason::Call { spec } => {
+                            Some((p.id, spec.label.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if outstanding.is_empty() {
+                    break;
+                }
+                for (sid, label) in outstanding {
+                    let response = canned_response(&label);
+                    println!("  (par) {label:<15} -> {response}");
                     stepper
                         .resolve(sid, Ok(FlowValue::Text(response)))
                         .expect("resolve");

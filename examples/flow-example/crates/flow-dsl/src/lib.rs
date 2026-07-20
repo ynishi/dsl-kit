@@ -3,22 +3,24 @@
 //! Defines a small orchestration DSL — `Seq`, `Par`, `Call`, `Scope`,
 //! `Maybe` — with a stepper that satisfies the v3 [`Stepper`] trait.
 //!
-//! Commit A landing note: the type shape is full v3 (associated types
-//! `Value` / `Cursor` / `Delta` / `EffectError` / `Error`, N-in-flight
-//! `pending()`, `take_cancellations()`, `frame_tree()` view). `Par`
-//! semantics remain sequential internally in Commit A; real fan-out
-//! schedule + `ParFrame` bookkeeping lands in Commit B alongside the
-//! MCP fan-out surface.
+//! Commit B1 note: `Par` with all-`Call` children now schedules them as
+//! a real fan-out — N `Pending` are emitted at Par entry, host resolves
+//! them in any order, the configured reducer folds the slots into the
+//! parent value. Par with non-`Call` children (nested sub-flows) still
+//! falls back to the Commit A sequential path; full generalisation is
+//! deferred to a later commit alongside a real `FrameTree` walk.
 
 #![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use dsl_kit::{
-    BreakpointSet, CallFrameId, DslNode, EngineError, EngineResult, Event, EventSink, Frame,
-    FrameTree, IdGen, Iteration, NodeContext, NodeId, Path, Phase, Pending, StepOutcome, Stepper,
-    SuspendReason, SuspensionId, Walk,
+    BreakpointSet, CallFrameId, ChildIndex, DslNode, EngineError, EngineResult, Event, EventSink,
+    FailPolicy, Frame, FrameTree, IdGen, Iteration, JoinPolicy, JoinShape, NodeContext, NodeId,
+    Path, Phase, Pending, Reducer, ReducerCollectAll, ReducerId, ReducerRegistry, StepOutcome,
+    Stepper, SuspendReason, SuspensionId, Walk,
 };
 use smallvec::SmallVec;
 
@@ -295,6 +297,30 @@ pub struct FlowStepper<'a> {
     results: HashMap<NodeId, String>,
     done: bool,
     frame_tree_stub: FrameTree<FlowValue, FlowCursor, ()>,
+    // Commit B1: real Par fan-out state
+    par_contexts: Vec<ParContext>,
+    sid_to_par: HashMap<SuspensionId, (usize, ChildIndex)>,
+    cancelled: Vec<SuspensionId>,
+    registry: Arc<ReducerRegistry<FlowValue, (), FlowEffectErr>>,
+}
+
+/// State of one active `Par` fan-out.
+///
+/// Populated at Par entry when all children are direct `Flow::Call`
+/// nodes. Slots align with the Par's child index; the reducer
+/// (resolved from `registry` via `reducer_id`) folds them once the
+/// `policy.shape` fires.
+struct ParContext {
+    slots: Vec<Option<FlowValue>>,
+    completion_order: Vec<ChildIndex>,
+    child_sids: Vec<SuspensionId>,
+    child_node_ids: Vec<NodeId>,
+    policy: JoinPolicy,
+    reducer_id: ReducerId,
+    joined: bool,
+    result: Option<FlowValue>,
+    failure: Option<FlowEffectErr>,
+    par_ctx: NodeContext,
 }
 
 struct InternalFrame<'a> {
@@ -308,6 +334,9 @@ enum FrameState<'a> {
     Enter,
     SeqNext { children: std::slice::Iter<'a, Flow>, index: u64 },
     ParNext { children: std::slice::Iter<'a, Flow>, index: u64 },
+    /// Commit B1: real fan-out `Par` waiting for its slots.
+    /// `context_index` indexes into `FlowStepper.par_contexts`.
+    ParFanOut { context_index: usize },
     ScopePending { body: &'a Flow },
     ScopeDone,
     MaybePending { body: Option<&'a Flow> },
@@ -317,8 +346,18 @@ enum FrameState<'a> {
 }
 
 impl<'a> FlowStepper<'a> {
-    /// Creates a fresh stepper anchored at `root`.
+    /// Creates a fresh stepper anchored at `root`, using the default
+    /// reducer registry.
     pub fn new(root: &'a Flow) -> Self {
+        Self::with_registry(root, Arc::new(flow_default_registry()))
+    }
+
+    /// Creates a fresh stepper anchored at `root` with a
+    /// caller-supplied reducer registry.
+    pub fn with_registry(
+        root: &'a Flow,
+        registry: Arc<ReducerRegistry<FlowValue, (), FlowEffectErr>>,
+    ) -> Self {
         let path = Path::root().push(root.node_id());
         Self {
             stack: vec![InternalFrame {
@@ -347,6 +386,10 @@ impl<'a> FlowStepper<'a> {
                 },
                 kids: Vec::new(),
             },
+            par_contexts: Vec::new(),
+            sid_to_par: HashMap::new(),
+            cancelled: Vec::new(),
+            registry,
         }
     }
 
@@ -355,7 +398,7 @@ impl<'a> FlowStepper<'a> {
     pub fn step_with_breakpoints(
         &mut self,
         breakpoints: &BreakpointSet,
-    ) -> Result<InternalOutcome, EngineError> {
+    ) -> Result<InternalOutcome, FlowError> {
         if self.breakpoint_yielded {
             self.breakpoint_yielded = false;
             return self.step_internal();
@@ -388,7 +431,7 @@ impl<'a> FlowStepper<'a> {
     pub fn run_to_yield_with_breakpoints(
         &mut self,
         breakpoints: &BreakpointSet,
-    ) -> Result<InternalOutcome, EngineError> {
+    ) -> Result<InternalOutcome, FlowError> {
         loop {
             match self.step_with_breakpoints(breakpoints)? {
                 InternalOutcome::Advanced => continue,
@@ -462,7 +505,7 @@ impl<'a> FlowStepper<'a> {
     // ---- Internal step (returns InternalOutcome, then adapted to
     //      v3 StepOutcome by the trait impl below) ------------------
 
-    fn step_internal(&mut self) -> Result<InternalOutcome, EngineError> {
+    fn step_internal(&mut self) -> Result<InternalOutcome, FlowError> {
         if self.stack.is_empty() {
             self.done = true;
             return Ok(InternalOutcome::Done);
@@ -486,16 +529,88 @@ impl<'a> FlowStepper<'a> {
                             FrameState::SeqNext { children: children.iter(), index: 0 };
                     }
                     Flow::Par { children, .. } => {
+                        // Commit B1: if every child is a direct Call,
+                        // enter real fan-out mode. Otherwise fall back
+                        // to the Commit A sequential path.
+                        let all_call: Option<Vec<(NodeId, String)>> = children
+                            .iter()
+                            .map(|c| match c {
+                                Flow::Call { id, label } => Some((*id, label.clone())),
+                                _ => None,
+                            })
+                            .collect();
                         let call_id = CallFrameId(self.next_frame);
                         self.next_frame += 1;
-                        let frame = self.stack.last_mut().expect("non-empty");
-                        frame.frame_id = Some(call_id);
-                        frame.state =
-                            FrameState::ParNext { children: children.iter(), index: 0 };
-                        let mut ctx = ctx.clone();
-                        ctx.frame = Some(call_id);
-                        ctx.depth = depth_before;
-                        self.events.emit(&Event::FrameEnter { at: ctx });
+                        let mut par_ctx = ctx.clone();
+                        par_ctx.frame = Some(call_id);
+                        par_ctx.depth = depth_before;
+
+                        if let Some(call_children) = all_call {
+                            let context_index = self.par_contexts.len();
+                            let n = call_children.len();
+                            let mut child_sids = Vec::with_capacity(n);
+                            let mut child_node_ids = Vec::with_capacity(n);
+
+                            for (slot_idx, (node_id, label)) in
+                                call_children.iter().enumerate()
+                            {
+                                let sid = SuspensionId(self.next_suspension);
+                                self.next_suspension += 1;
+                                child_sids.push(sid);
+                                child_node_ids.push(*node_id);
+
+                                let child_path = path.push(*node_id);
+                                let child_ctx = NodeContext {
+                                    node: *node_id,
+                                    path: child_path,
+                                    frame: Some(call_id),
+                                    depth: depth_before + 1,
+                                    iteration: Some(Iteration(slot_idx as u64 + 1)),
+                                };
+                                let spec = dsl_kit::CallSpec {
+                                    label: label.clone(),
+                                    payload: serde_json::Value::Null,
+                                };
+                                self.pending.push(Pending {
+                                    id: sid,
+                                    reason: SuspendReason::Call { spec: spec.clone() },
+                                    at: child_ctx.clone(),
+                                });
+                                self.id_to_node.insert(sid, *node_id);
+                                self.sid_to_par.insert(sid, (context_index, slot_idx));
+                                self.events.emit(&Event::Suspend {
+                                    at: child_ctx,
+                                    reason: SuspendReason::Call { spec },
+                                });
+                            }
+
+                            self.par_contexts.push(ParContext {
+                                slots: vec![None; n],
+                                completion_order: Vec::new(),
+                                child_sids,
+                                child_node_ids,
+                                policy: JoinPolicy {
+                                    shape: JoinShape::All,
+                                    fail: FailPolicy::FailFast,
+                                },
+                                reducer_id: ReducerId::from("reduce_all_ordered"),
+                                joined: false,
+                                result: None,
+                                failure: None,
+                                par_ctx: par_ctx.clone(),
+                            });
+
+                            let frame = self.stack.last_mut().expect("non-empty");
+                            frame.frame_id = Some(call_id);
+                            frame.state = FrameState::ParFanOut { context_index };
+                            self.events.emit(&Event::FrameEnter { at: par_ctx });
+                        } else {
+                            let frame = self.stack.last_mut().expect("non-empty");
+                            frame.frame_id = Some(call_id);
+                            frame.state =
+                                FrameState::ParNext { children: children.iter(), index: 0 };
+                            self.events.emit(&Event::FrameEnter { at: par_ctx });
+                        }
                     }
                     Flow::Scope { body, .. } => {
                         frame.state = FrameState::ScopePending { body: body.as_ref() };
@@ -548,6 +663,31 @@ impl<'a> FlowStepper<'a> {
                     self.stack.pop();
                     Ok(InternalOutcome::Advanced)
                 }
+            }
+            FrameState::ParFanOut { context_index } => {
+                let idx = *context_index;
+                let par_ctx_clone = self.par_contexts[idx].par_ctx.clone();
+                // If a slot failure surfaced (FailFast), propagate.
+                if let Some(err) = self.par_contexts[idx].failure.clone() {
+                    return Err(FlowError::Effect(err));
+                }
+                // If the shape has fired, apply the reducer and pop.
+                let ready = self.par_contexts[idx].joined;
+                if ready {
+                    // Fold the Par (invokes the reducer to compute the
+                    // aggregate value); we drop the value here because
+                    // the current flow-dsl bubble-up path doesn't
+                    // propagate Par-level values upward, and per-Call
+                    // results are already recorded per-child in
+                    // `self.results` via `resolve`.
+                    let _ = self.fold_par(idx).map_err(FlowError::Engine)?;
+                    self.events.emit(&Event::FrameLeave { at: par_ctx_clone.clone() });
+                    self.events.emit(&Event::VisitPost { at: par_ctx_clone });
+                    self.stack.pop();
+                    return Ok(InternalOutcome::Advanced);
+                }
+                // Otherwise the Par is blocked on outstanding slots.
+                Ok(InternalOutcome::Waiting)
             }
             FrameState::ParNext { children, index } => {
                 if let Some(next) = children.next() {
@@ -651,8 +791,110 @@ pub enum InternalOutcome {
         /// Where suspended.
         at: NodeContext,
     },
+    /// Blocked waiting for external resolve (Par not yet joined) —
+    /// no new suspension emitted, no progress possible without host
+    /// input.
+    Waiting,
     /// Interpretation completed.
     Done,
+}
+
+impl<'a> FlowStepper<'a> {
+    /// Applies the Par's registered reducer to its slots, storing the
+    /// folded value in the ParContext and returning `(V, D)`.
+    fn fold_par(&mut self, context_index: usize) -> Result<(FlowValue, ()), EngineError> {
+        let (reducer_id, policy, slots, deltas, winners) = {
+            let ctx = &self.par_contexts[context_index];
+            (
+                ctx.reducer_id.clone(),
+                ctx.policy,
+                ctx.slots.clone(),
+                vec![Some(()); ctx.slots.len()],
+                ctx.completion_order.clone(),
+            )
+        };
+        let handle = self.registry.resolve(&reducer_id, policy.fail)?;
+        let (value, delta) = match handle {
+            dsl_kit::ReducerHandle::FailFast(reducer) => {
+                reducer.reduce(&slots, &deltas, &winners)?
+            }
+            dsl_kit::ReducerHandle::CollectAll(_) => {
+                // Commit B1 only wires FailFast reducers into Par
+                // integration; CollectAll trait is defined and
+                // registered but its invocation path lands with the
+                // next commit.
+                return Err(EngineError::UnknownReducer { id: reducer_id });
+            }
+        };
+        self.par_contexts[context_index].result = Some(value.clone());
+        Ok((value, delta))
+    }
+
+    /// Records a successful resolve into a Par slot, updates
+    /// completion order, and checks whether the shape has fired.
+    fn record_par_slot(&mut self, context_index: usize, slot_idx: usize, value: FlowValue) {
+        let ctx = &mut self.par_contexts[context_index];
+        if ctx.joined {
+            return;
+        }
+        ctx.slots[slot_idx] = Some(value);
+        ctx.completion_order.push(slot_idx);
+        let successes = ctx.completion_order.len();
+        let n = ctx.slots.len();
+        let fires = match ctx.policy.shape {
+            JoinShape::All => successes == n,
+            JoinShape::Any => successes >= 1,
+            JoinShape::FirstK(k) => successes >= k,
+        };
+        if fires {
+            ctx.joined = true;
+            // Queue outstanding sibling suspensions for cancellation.
+            for (i, sid) in ctx.child_sids.iter().enumerate() {
+                if ctx.slots[i].is_none() {
+                    self.cancelled.push(*sid);
+                    self.sid_to_par.remove(sid);
+                    self.id_to_node.remove(sid);
+                    self.pending.retain(|p| p.id != *sid);
+                }
+            }
+        }
+    }
+
+    /// Records a failed resolve into a Par slot. Under FailFast this
+    /// cancels the remaining siblings and marks the ParContext as
+    /// failed; the next `step()` propagates the error.
+    fn record_par_failure(
+        &mut self,
+        context_index: usize,
+        _slot_idx: usize,
+        err: FlowEffectErr,
+    ) {
+        let ctx = &mut self.par_contexts[context_index];
+        if ctx.joined {
+            return;
+        }
+        match ctx.policy.fail {
+            FailPolicy::FailFast => {
+                ctx.joined = true;
+                ctx.failure = Some(err);
+                // Cancel remaining siblings.
+                for (i, sid) in ctx.child_sids.iter().enumerate() {
+                    if ctx.slots[i].is_none() {
+                        self.cancelled.push(*sid);
+                        self.sid_to_par.remove(sid);
+                        self.id_to_node.remove(sid);
+                        self.pending.retain(|p| p.id != *sid);
+                    }
+                }
+            }
+            FailPolicy::CollectAll => {
+                // Commit B1 leaves CollectAll wiring for a follow-up
+                // commit; treat as FailFast for now.
+                ctx.joined = true;
+                ctx.failure = Some(err);
+            }
+        }
+    }
 }
 
 // ---------- v3 Stepper impl --------------------------------------------
@@ -669,8 +911,6 @@ impl<'a> Stepper for FlowStepper<'a> {
         let outcome = self.step_internal()?;
         match outcome {
             InternalOutcome::Advanced => {
-                // If a new Pending was created this step, surface it as
-                // Blocked; otherwise Ready.
                 if self.pending.len() > before_pending_len {
                     let newly: SmallVec<[Pending; 1]> = self
                         .pending
@@ -692,6 +932,9 @@ impl<'a> Stepper for FlowStepper<'a> {
                     .collect();
                 Ok(StepOutcome::Blocked { newly_pending: newly })
             }
+            InternalOutcome::Waiting => {
+                Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() })
+            }
             InternalOutcome::Done => {
                 self.done = true;
                 Ok(StepOutcome::Done(FlowValue::Unit))
@@ -704,25 +947,48 @@ impl<'a> Stepper for FlowStepper<'a> {
         id: SuspensionId,
         result: Result<Self::Value, Self::EffectError>,
     ) -> Result<(), Self::Error> {
-        let node_id = self
-            .id_to_node
-            .remove(&id)
-            .ok_or(EngineError::UnknownSuspension { id })?;
-        // Drop the pending entry for this id.
-        self.pending.retain(|p| p.id != id);
-
-        match result {
-            Ok(v) => {
-                // Convert FlowValue to string for the legacy result map.
-                let text = match v {
-                    FlowValue::Text(s) => s,
-                    FlowValue::Unit => String::new(),
-                    FlowValue::List(items) => format!("{items:?}"),
-                };
-                self.results.insert(node_id, text);
-                Ok(())
+        // Par-slot resolve path.
+        if let Some((context_index, slot_idx)) = self.sid_to_par.remove(&id) {
+            self.pending.retain(|p| p.id != id);
+            let node_id = self.par_contexts[context_index].child_node_ids[slot_idx];
+            self.id_to_node.remove(&id);
+            match result {
+                Ok(v) => {
+                    // Also record the child's individual result for
+                    // downstream introspection.
+                    let text = match &v {
+                        FlowValue::Text(s) => s.clone(),
+                        FlowValue::Unit => String::new(),
+                        FlowValue::List(items) => format!("{items:?}"),
+                    };
+                    self.results.insert(node_id, text);
+                    self.record_par_slot(context_index, slot_idx, v);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.record_par_failure(context_index, slot_idx, e);
+                    Ok(())
+                }
             }
-            Err(e) => Err(FlowError::Effect(e)),
+        } else {
+            // Single-Call (non-Par) resolve path.
+            let node_id = self
+                .id_to_node
+                .remove(&id)
+                .ok_or(EngineError::UnknownSuspension { id })?;
+            self.pending.retain(|p| p.id != id);
+            match result {
+                Ok(v) => {
+                    let text = match v {
+                        FlowValue::Text(s) => s,
+                        FlowValue::Unit => String::new(),
+                        FlowValue::List(items) => format!("{items:?}"),
+                    };
+                    self.results.insert(node_id, text);
+                    Ok(())
+                }
+                Err(e) => Err(FlowError::Effect(e)),
+            }
         }
     }
 
@@ -731,8 +997,7 @@ impl<'a> Stepper for FlowStepper<'a> {
     }
 
     fn take_cancellations(&mut self) -> Vec<SuspensionId> {
-        // Commit A: no Par fan-out cancellation yet; always empty.
-        Vec::new()
+        std::mem::take(&mut self.cancelled)
     }
 
     fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta> {
@@ -742,6 +1007,152 @@ impl<'a> Stepper for FlowStepper<'a> {
     fn is_done(&self) -> bool {
         self.done
     }
+}
+
+// ---------- Default reducers + registry --------------------------------
+
+/// FailFast + All: returns `FlowValue::List(slots-in-declaration-order)`.
+pub struct FlowReduceAllOrdered;
+
+impl Reducer<FlowValue, ()> for FlowReduceAllOrdered {
+    fn reduce(
+        &self,
+        slots: &[Option<FlowValue>],
+        _deltas: &[Option<()>],
+        _winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        let list: Vec<FlowValue> = slots.iter().filter_map(|s| s.clone()).collect();
+        Ok((FlowValue::List(list), ()))
+    }
+}
+
+/// FailFast + Any: returns the completion-order winner.
+pub struct FlowReduceAnyFirstWinner;
+
+impl Reducer<FlowValue, ()> for FlowReduceAnyFirstWinner {
+    fn reduce(
+        &self,
+        slots: &[Option<FlowValue>],
+        _deltas: &[Option<()>],
+        winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        let winner = winners.first().copied().unwrap_or(0);
+        let v = slots
+            .get(winner)
+            .and_then(|s| s.clone())
+            .unwrap_or(FlowValue::Unit);
+        Ok((v, ()))
+    }
+}
+
+/// FailFast + FirstK: returns `FlowValue::List(winners-in-completion-order)`.
+pub struct FlowReduceFirstKOrdered;
+
+impl Reducer<FlowValue, ()> for FlowReduceFirstKOrdered {
+    fn reduce(
+        &self,
+        slots: &[Option<FlowValue>],
+        _deltas: &[Option<()>],
+        winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        let list: Vec<FlowValue> = winners
+            .iter()
+            .filter_map(|&i| slots.get(i).and_then(|s| s.clone()))
+            .collect();
+        Ok((FlowValue::List(list), ()))
+    }
+}
+
+/// CollectAll + All: returns `FlowValue::List(all-Some(Ok)-values)`.
+pub struct FlowReduceCollectAllResults;
+
+impl ReducerCollectAll<FlowValue, (), FlowEffectErr> for FlowReduceCollectAllResults {
+    fn reduce(
+        &self,
+        slots: &[Option<Result<FlowValue, FlowEffectErr>>],
+        _deltas: &[Option<()>],
+        _winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        let list: Vec<FlowValue> = slots
+            .iter()
+            .filter_map(|s| match s {
+                Some(Ok(v)) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok((FlowValue::List(list), ()))
+    }
+}
+
+/// CollectAll + Any: first success wins, else fails.
+pub struct FlowReduceAnyFirstOrAllFailures;
+
+impl ReducerCollectAll<FlowValue, (), FlowEffectErr> for FlowReduceAnyFirstOrAllFailures {
+    fn reduce(
+        &self,
+        slots: &[Option<Result<FlowValue, FlowEffectErr>>],
+        _deltas: &[Option<()>],
+        winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        if let Some(&w) = winners.first() {
+            if let Some(Some(Ok(v))) = slots.get(w) {
+                return Ok((v.clone(), ()));
+            }
+        }
+        Err(EngineError::Aborted {
+            at: NodeContext::at(NodeId(0), Path::root()),
+            reason: "reduce_any_first_or_all_failures: no successful child".into(),
+        })
+    }
+}
+
+/// CollectAll + FirstK: returns the first `k` successes if attainable.
+pub struct FlowReduceFirstKBestEffort;
+
+impl ReducerCollectAll<FlowValue, (), FlowEffectErr> for FlowReduceFirstKBestEffort {
+    fn reduce(
+        &self,
+        slots: &[Option<Result<FlowValue, FlowEffectErr>>],
+        _deltas: &[Option<()>],
+        winners: &[ChildIndex],
+    ) -> Result<(FlowValue, ()), EngineError> {
+        let list: Vec<FlowValue> = winners
+            .iter()
+            .filter_map(|&i| match slots.get(i) {
+                Some(Some(Ok(v))) => Some(v.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok((FlowValue::List(list), ()))
+    }
+}
+
+/// Returns the default flow-dsl reducer registry, populated with the
+/// six canonical reducers (three FailFast + three CollectAll).
+pub fn flow_default_registry() -> ReducerRegistry<FlowValue, (), FlowEffectErr> {
+    let mut reg = ReducerRegistry::new();
+    reg.register_fail_fast("reduce_all_ordered", Arc::new(FlowReduceAllOrdered));
+    reg.register_fail_fast(
+        "reduce_any_first_winner",
+        Arc::new(FlowReduceAnyFirstWinner),
+    );
+    reg.register_fail_fast(
+        "reduce_first_k_ordered",
+        Arc::new(FlowReduceFirstKOrdered),
+    );
+    reg.register_collect_all(
+        "reduce_collect_all_results",
+        Arc::new(FlowReduceCollectAllResults),
+    );
+    reg.register_collect_all(
+        "reduce_any_first_or_all_failures",
+        Arc::new(FlowReduceAnyFirstOrAllFailures),
+    );
+    reg.register_collect_all(
+        "reduce_first_k_best_effort",
+        Arc::new(FlowReduceFirstKBestEffort),
+    );
+    reg
 }
 
 // ---------- Sync driver helper (host convenience) ---------------------
@@ -761,9 +1172,28 @@ pub fn run_flow_sync(program: &Flow) -> Result<HashMap<NodeId, String>, FlowErro
                 }
             }
             InternalOutcome::Done => break,
-            InternalOutcome::Advanced => {
-                // run_to_yield only returns non-Advanced, but keep the
-                // arm for future variants.
+            InternalOutcome::Advanced => {}
+            InternalOutcome::Waiting => {
+                // Par is blocked; resolve any outstanding Par-slot
+                // pendings with canned responses to drive the fan-out
+                // forward.
+                let outstanding: Vec<(SuspensionId, String)> = stepper
+                    .pending()
+                    .iter()
+                    .filter_map(|p| match &p.reason {
+                        SuspendReason::Call { spec } => {
+                            Some((p.id, spec.label.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if outstanding.is_empty() {
+                    break;
+                }
+                for (sid, label) in outstanding {
+                    let response = canned_response(&label);
+                    stepper.resolve(sid, Ok(FlowValue::Text(response)))?;
+                }
             }
         }
         steps += 1;
@@ -809,6 +1239,127 @@ mod tests {
         assert!(text.contains("Seq"));
         assert!(text.contains("Par"));
         assert!(text.contains("fetch_query"));
+    }
+
+    #[test]
+    fn par_fan_out_emits_n_pending_and_folds_out_of_order() {
+        // A Par of 3 Calls: expected shape = 3 pending emitted at Par
+        // entry, resolve in reverse order, reducer folds when all
+        // slots filled.
+        let ids = IdGen::new();
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "a".into() },
+                Flow::Call { id: ids.node(), label: "b".into() },
+                Flow::Call { id: ids.node(), label: "c".into() },
+            ],
+        };
+        let mut stepper = FlowStepper::new(&program);
+
+        // Enter the Par: emits 3 Pending in one shot.
+        let out1 = stepper.step().expect("enter par");
+        match out1 {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 3, "expected 3 newly pending");
+            }
+            other => panic!("expected Blocked with 3 newly pending, got {other:?}"),
+        }
+        assert_eq!(stepper.pending().len(), 3);
+        let sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
+
+        // Resolve out of declaration order: 2, 0, 1.
+        stepper
+            .resolve(sids[2], Ok(FlowValue::Text("c-resp".into())))
+            .expect("resolve c");
+        assert_eq!(stepper.pending().len(), 2);
+
+        // Next step: Par not yet joined, returns Blocked{empty}.
+        let out2 = stepper.step().expect("still waiting");
+        assert!(matches!(out2, StepOutcome::Blocked { newly_pending } if newly_pending.is_empty()));
+
+        stepper
+            .resolve(sids[0], Ok(FlowValue::Text("a-resp".into())))
+            .expect("resolve a");
+        stepper
+            .resolve(sids[1], Ok(FlowValue::Text("b-resp".into())))
+            .expect("resolve b");
+        assert_eq!(stepper.pending().len(), 0);
+
+        // Drive until Done. Par folds via reduce_all_ordered.
+        for _ in 0..20 {
+            match stepper.step().expect("step") {
+                StepOutcome::Done(_) => {
+                    // Per-child results recorded (labels resolved).
+                    assert!(!stepper.results().is_empty());
+                    return;
+                }
+                _ => continue,
+            }
+        }
+        panic!("did not reach Done");
+    }
+
+    #[test]
+    fn par_failfast_propagates_and_cancels_siblings() {
+        let ids = IdGen::new();
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "x".into() },
+                Flow::Call { id: ids.node(), label: "y".into() },
+                Flow::Call { id: ids.node(), label: "z".into() },
+            ],
+        };
+        let mut stepper = FlowStepper::new(&program);
+        let _ = stepper.step().expect("enter par");
+        let sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
+
+        // Fail the middle slot with an EffectError.
+        stepper
+            .resolve(
+                sids[1],
+                Err(FlowEffectErr {
+                    code: "timeout".into(),
+                    message: "y timed out".into(),
+                }),
+            )
+            .expect("resolve records failure");
+
+        // Next step should propagate the error.
+        let err = stepper.step().expect_err("failfast should propagate");
+        match err {
+            FlowError::Effect(e) => assert_eq!(e.code, "timeout"),
+            FlowError::Engine(_) => panic!("expected FlowError::Effect"),
+        }
+
+        // Sibling suspensions queued for cancellation.
+        let cancels = stepper.take_cancellations();
+        assert!(cancels.contains(&sids[0]));
+        assert!(cancels.contains(&sids[2]));
+    }
+
+    #[test]
+    fn default_registry_carries_six_reducers() {
+        let reg = flow_default_registry();
+        // FailFast side.
+        for id in ["reduce_all_ordered", "reduce_any_first_winner", "reduce_first_k_ordered"] {
+            let h = reg
+                .resolve(&ReducerId::from(id), FailPolicy::FailFast)
+                .unwrap_or_else(|_| panic!("missing fail-fast reducer {id}"));
+            assert!(matches!(h, dsl_kit::ReducerHandle::FailFast(_)));
+        }
+        // CollectAll side.
+        for id in [
+            "reduce_collect_all_results",
+            "reduce_any_first_or_all_failures",
+            "reduce_first_k_best_effort",
+        ] {
+            let h = reg
+                .resolve(&ReducerId::from(id), FailPolicy::CollectAll)
+                .unwrap_or_else(|_| panic!("missing collect-all reducer {id}"));
+            assert!(matches!(h, dsl_kit::ReducerHandle::CollectAll(_)));
+        }
     }
 
     #[test]

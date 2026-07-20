@@ -144,6 +144,30 @@ impl DslHost for FlowHost {
                             .map_err(|e| e.to_string())?;
                     }
                 }
+                InternalOutcome::Waiting => {
+                    // Par fan-out has outstanding pending; resolve them
+                    // with canned responses to drive the fan-out forward.
+                    let outstanding: Vec<(dsl_kit::SuspensionId, String)> = self
+                        .stepper
+                        .pending()
+                        .iter()
+                        .filter_map(|p| match &p.reason {
+                            dsl_kit::SuspendReason::Call { spec } => {
+                                Some((p.id, spec.label.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if outstanding.is_empty() {
+                        return Ok(outcome_to_host(InternalOutcome::Done));
+                    }
+                    for (sid, label) in outstanding {
+                        let response = canned_response(&label);
+                        self.stepper
+                            .resolve(sid, Ok(FlowValue::Text(response)))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
                 other => return Ok(outcome_to_host(other)),
             }
             if steps > 4096 {
@@ -198,6 +222,16 @@ fn outcome_to_host(outcome: InternalOutcome) -> HostOutcome {
                 depth: at.depth,
                 frame: at.frame.map(|f| f.0),
                 iteration: at.iteration.map(|i| i.0),
+            },
+        },
+        InternalOutcome::Waiting => HostOutcome::Suspended {
+            reason: "waiting".into(),
+            at: HostLocation {
+                node: 0,
+                path: Vec::new(),
+                depth: 0,
+                frame: None,
+                iteration: None,
             },
         },
         InternalOutcome::Done => HostOutcome::Done,
