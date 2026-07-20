@@ -31,6 +31,9 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod engine;
+pub use engine::{Ast, Engine, NodeKind};
+
 // ---------- Observation primitives --------------------------------------
 
 /// Stable identifier assigned to every AST node when the tree is built.
