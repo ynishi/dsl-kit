@@ -40,9 +40,9 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::{
-    BreakpointSet, CancelReason, ChildIndex, CountingSink, EngineError, EnvRef, Event, EventSink,
-    FailPolicy, Frame, FrameTree, JoinPolicy, JoinShape, NodeContext, NodeId, ParFrame, Path,
-    Pending, ReducerHandle, ReducerId, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
+    BreakpointSet, CallFrameId, CancelReason, ChildIndex, CountingSink, EngineError, EnvRef, Event,
+    EventSink, FailPolicy, Frame, FrameTree, JoinPolicy, JoinShape, NodeContext, NodeId, ParFrame,
+    Path, Pending, ReducerHandle, ReducerId, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
     SuspensionId,
 };
 
@@ -226,6 +226,10 @@ enum InternalFrame<A: Ast> {
         path: Path,
         sid: SuspensionId,
         label: String,
+        /// Call-frame identifier allocated by the engine when this leaf
+        /// was spawned. Reused so `FrameLeave` cites the same id as the
+        /// earlier `FrameEnter`.
+        frame: CallFrameId,
     },
     /// A completed leaf whose value is waiting to be consumed by its
     /// parent.
@@ -301,6 +305,20 @@ pub struct Engine<A: Ast> {
     /// `step_with_breakpoints` drops the marker before delegating to
     /// [`Engine::step`] so the previously-halted spawn proceeds.
     pending_bp: Option<SuspensionId>,
+
+    /// Monotonic counter for allocating [`CallFrameId`]s to `Call`
+    /// leaves as they enter (spawn) their call scope. The same id is
+    /// cited by the paired `FrameLeave` event when the leaf's `Pending`
+    /// transitions to `Value` / `Failed` / `Cancelled`.
+    next_call_frame: u64,
+
+    /// Lazy cache for [`Stepper::frame_tree`]. Populated on the first
+    /// read after a mutation, cleared whenever `step` / `resolve` is
+    /// about to mutate the internal frames. `OnceLock` gives us safe
+    /// interior-mutability for the `&self` read path while keeping
+    /// `Engine` `Send + Sync` (required by `DslHost`).
+    frame_tree_cache:
+        std::sync::OnceLock<Box<FrameTree<A::Value, A::Cursor, A::Delta, A::EffectError>>>,
 }
 
 impl<A: Ast> Engine<A> {
@@ -329,6 +347,8 @@ impl<A: Ast> Engine<A> {
             root_value: None,
             events: CountingSink::default(),
             pending_bp: None,
+            next_call_frame: 1,
+            frame_tree_cache: std::sync::OnceLock::new(),
         };
         let root_path = Path::root().push(root_id);
         let root_frame = engine.spawn_frame(root_id, root_path)?;
@@ -627,10 +647,12 @@ impl<A: Ast> Engine<A> {
             NodeKind::Call { label, payload: _ } => {
                 let sid = SuspensionId(self.next_sid);
                 self.next_sid += 1;
+                let call_frame = CallFrameId(self.next_call_frame);
+                self.next_call_frame += 1;
                 let ctx = NodeContext {
                     node: node_id,
                     path: path.clone(),
-                    frame: None,
+                    frame: Some(call_frame),
                     depth: path.depth() as u32,
                     iteration: None,
                 };
@@ -638,6 +660,7 @@ impl<A: Ast> Engine<A> {
                     label: label.clone(),
                     payload: serde_json::Value::Null,
                 };
+                self.events.emit(&Event::FrameEnter { at: ctx.clone() });
                 self.events.emit(&Event::Suspend {
                     at: ctx.clone(),
                     reason: SuspendReason::Call { spec: spec.clone() },
@@ -654,6 +677,7 @@ impl<A: Ast> Engine<A> {
                     path,
                     sid,
                     label,
+                    frame: call_frame,
                 };
                 let h = self.allocate(frame);
                 self.sid_to_frame.insert(sid, h);
@@ -1140,14 +1164,19 @@ impl<A: Ast> Engine<A> {
             InternalFrame::Cancelled { .. }
             | InternalFrame::Value { .. }
             | InternalFrame::Failed { .. } => return,
-            InternalFrame::Pending { sid, node, .. } => {
+            InternalFrame::Pending { sid, node, path, frame, .. } => {
                 let sid = *sid;
                 let node = *node;
+                let path = path.clone();
+                let call_frame = *frame;
                 self.pending.retain(|p| p.id != sid);
                 self.newly_pending.retain(|p| p.id != sid);
                 self.sid_to_frame.remove(&sid);
                 self.cancellations.push(sid);
                 self.events.emit(&Event::Cancel { id: sid });
+                let mut leave_ctx = Self::synthetic_ctx(node, path);
+                leave_ctx.frame = Some(call_frame);
+                self.events.emit(&Event::FrameLeave { at: leave_ctx });
                 *self.get_mut(h) = InternalFrame::Cancelled { node, reason };
                 return;
             }
@@ -1323,6 +1352,9 @@ impl<A: Ast> Stepper for Engine<A> {
     type Error = ExecError<A::EffectError>;
 
     fn step(&mut self) -> Result<StepOutcome<Self::Value>, Self::Error> {
+        // Any successful step may mutate the internal frames. Drop the
+        // cached projection so the next `frame_tree(&self)` rebuilds.
+        self.frame_tree_cache.take();
         if self.done {
             if let Some(v) = self.root_value.clone() {
                 return Ok(StepOutcome::Done(v));
@@ -1387,6 +1419,8 @@ impl<A: Ast> Stepper for Engine<A> {
         id: SuspensionId,
         result: Result<Self::Value, Self::EffectError>,
     ) -> Result<(), Self::Error> {
+        // Any resolve transitions the target Pending; invalidate cache.
+        self.frame_tree_cache.take();
         let h = match self.sid_to_frame.remove(&id) {
             Some(h) => h,
             None => return Err(ExecError::Engine(EngineError::UnknownSuspension { id })),
@@ -1395,13 +1429,16 @@ impl<A: Ast> Stepper for Engine<A> {
 
         match result {
             Ok(v) => {
-                let (node, path) = if let InternalFrame::Pending { node, path, .. } = self.get(h) {
-                    (*node, path.clone())
-                } else {
-                    return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
-                };
-                let ctx = Self::synthetic_ctx(node, path);
+                let (node, path, call_frame) =
+                    if let InternalFrame::Pending { node, path, frame, .. } = self.get(h) {
+                        (*node, path.clone(), *frame)
+                    } else {
+                        return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
+                    };
+                let mut ctx = Self::synthetic_ctx(node, path);
+                ctx.frame = Some(call_frame);
                 self.events.emit(&Event::Resume { at: ctx.clone() });
+                self.events.emit(&Event::FrameLeave { at: ctx.clone() });
                 // Replace leaf with Value.
                 *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
                 self.events.emit(&Event::VisitPost { at: ctx });
@@ -1419,11 +1456,15 @@ impl<A: Ast> Stepper for Engine<A> {
                 Ok(())
             }
             Err(e) => {
-                let (node, path) = if let InternalFrame::Pending { node, path, .. } = self.get(h) {
-                    (*node, path.clone())
-                } else {
-                    return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
-                };
+                let (node, path, call_frame) =
+                    if let InternalFrame::Pending { node, path, frame, .. } = self.get(h) {
+                        (*node, path.clone(), *frame)
+                    } else {
+                        return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
+                    };
+                let mut leave_ctx = Self::synthetic_ctx(node, path.clone());
+                leave_ctx.frame = Some(call_frame);
+                self.events.emit(&Event::FrameLeave { at: leave_ctx });
                 // Determine enclosing Par (if any) fail policy.
                 let mut enclosing_par_fail: Option<FailPolicy> = None;
                 let mut cur = h;
@@ -1477,18 +1518,14 @@ impl<A: Ast> Stepper for Engine<A> {
     fn frame_tree(
         &self,
     ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
-        // Projection cache: we build lazily but must return a &. Use a
-        // Box behind an UnsafeCell via a helper — for now, build on
-        // demand and leak (test-only). Proper caching is a follow-up.
-        //
-        // NOTE: this method is intentionally simple; hosts that need
-        // the tree are debuggers that call it infrequently. If it
-        // becomes hot, add a `RefCell<Option<FrameTree>>` cache
-        // invalidated on every mutation.
-        let tree = self.project_tree(self.root);
-        // Leak the projected tree so we can return a `&`.
-        // (Test-focused API; not called on hot paths.)
-        Box::leak(Box::new(tree))
+        // Lazy projection cache backed by `OnceLock`. `step` / `resolve`
+        // clear the slot whenever they mutate the internal frames (see
+        // `invalidate_frame_tree_cache`), so the first read after a
+        // mutation rebuilds the tree and every subsequent read hands
+        // back the same allocation until the next mutation.
+        self.frame_tree_cache
+            .get_or_init(|| Box::new(self.project_tree(self.root)))
+            .as_ref()
     }
 
     fn is_done(&self) -> bool {
@@ -2372,5 +2409,138 @@ mod tests {
         e.resolve(tsid, Ok(V::S("t".into()))).unwrap();
         let out = e.step().unwrap();
         assert!(matches!(&out, StepOutcome::Done(V::S(s)) if s == "t"));
+    }
+
+    // ---- FrameEnter / FrameLeave events (F1-a) ---------------------
+
+    #[test]
+    fn frame_enter_leave_paired_on_ok_resolve() {
+        // Seq wrapping a single Call: the Call is spawned lazily on the
+        // first step (Round 17 semantics), so the FrameEnter here is a
+        // walk-time emission (not one that gets zeroed by Engine::new).
+        let ast = N::Seq(vec![N::Call("solo".into())]);
+        let mut e = build(ast);
+        assert_eq!(e.events().frame_enter, 0);
+        assert_eq!(e.events().frame_leave, 0);
+        let sid = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!("expected Blocked"),
+        };
+        assert_eq!(e.events().frame_enter, 1);
+        assert_eq!(e.events().frame_leave, 0);
+        e.resolve(sid, Ok(V::S("done".into()))).unwrap();
+        assert_eq!(e.events().frame_enter, 1);
+        assert_eq!(e.events().frame_leave, 1);
+        let _ = e.step().unwrap();
+        // Seq has no further child; counters should not spuriously advance.
+        assert_eq!(e.events().frame_enter, 1);
+        assert_eq!(e.events().frame_leave, 1);
+    }
+
+    #[test]
+    fn frame_enter_leave_counts_match_across_seq_of_two_calls() {
+        // Two sequential Calls → two Enter, two Leave (paired).
+        let ast = N::Seq(vec![N::Call("a".into()), N::Call("b".into())]);
+        let mut e = build(ast);
+        let sid1 = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!(),
+        };
+        assert_eq!(e.events().frame_enter, 1);
+        assert_eq!(e.events().frame_leave, 0);
+        e.resolve(sid1, Ok(V::S("A".into()))).unwrap();
+        assert_eq!(e.events().frame_leave, 1);
+        let sid2 = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!(),
+        };
+        assert_eq!(e.events().frame_enter, 2);
+        e.resolve(sid2, Ok(V::S("B".into()))).unwrap();
+        assert_eq!(e.events().frame_leave, 2);
+        let _ = e.step().unwrap();
+        assert_eq!(e.events().frame_enter, 2);
+        assert_eq!(e.events().frame_leave, 2);
+    }
+
+    #[test]
+    fn frame_leave_fires_on_cancellation_via_par_failfast() {
+        // Par of two Calls under FailFast: fail one → sibling gets cancelled.
+        // Both Calls must contribute a FrameLeave (one from Err propagation,
+        // one from cancel_subtree Pending arm). Wrapped in Seq so Par is
+        // spawned lazily at step time (Par eager-spawns its kids, and we
+        // want their FrameEnter emissions to land in the walk-time
+        // histogram rather than being zeroed by Engine::new).
+        let ast = N::Seq(vec![N::Par {
+            children: vec![N::Call("l".into()), N::Call("r".into())],
+            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            reducer: "all_ordered",
+        }]);
+        let mut e = build(ast);
+        let sids: Vec<SuspensionId> = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 2);
+                newly_pending.iter().map(|p| p.id).collect()
+            }
+            _ => panic!(),
+        };
+        assert_eq!(e.events().frame_enter, 2);
+        assert_eq!(e.events().frame_leave, 0);
+        // Fail the first one; second one is drained via cancellation.
+        e.resolve(sids[0], Err(EE("boom".into()))).unwrap();
+        assert_eq!(e.events().frame_leave, 1);
+        // Advance so cancel_subtree fires on the sibling.
+        let _ = e.step();
+        assert_eq!(e.events().frame_leave, 2);
+        // Verify cancellation channel drained the sibling sid.
+        let cancels = e.take_cancellations();
+        assert_eq!(cancels, vec![sids[1]]);
+    }
+
+    #[test]
+    fn frame_tree_cache_is_reused_and_invalidated() {
+        // Address-stability between reads without a mutation between
+        // them is what proves the OnceLock cache is populated once and
+        // reused. Post-mutation address stability cannot be checked
+        // because the allocator may hand back the same slot; instead,
+        // we verify the tree *content* refreshes.
+        let ast = N::Seq(vec![N::Call("x".into()), N::Call("y".into())]);
+        let mut e = build(ast);
+        let sid = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!(),
+        };
+        // Cache hit reuse.
+        let p1 = e.frame_tree() as *const _;
+        let p2 = e.frame_tree() as *const _;
+        assert_eq!(p1, p2, "consecutive reads must reuse the cached box");
+        // Snapshot: root Seq has current child Pending (Call awaiting resolve).
+        let before = format!("{:?}", e.frame_tree());
+        assert!(before.contains("Pending"), "pre-resolve tree must contain Pending frame");
+        // Resolve mutates → cache must be cleared → next read projects fresh.
+        e.resolve(sid, Ok(V::S("X".into()))).unwrap();
+        let after = format!("{:?}", e.frame_tree());
+        assert!(
+            !after.contains("Pending") || after != before,
+            "post-resolve tree must not still describe the resolved Pending"
+        );
+        // Second post-mutation read reuses the fresh cached box.
+        let p3 = e.frame_tree() as *const _;
+        let p4 = e.frame_tree() as *const _;
+        assert_eq!(p3, p4, "post-mutation reads settle back into cache-reuse");
+    }
+
+    #[test]
+    fn frame_enter_zero_immediately_after_new_when_root_is_call() {
+        // Round 17 invariant: CountingSink is reset at the end of
+        // Engine::new, so root-spawn FrameEnter (as well as VisitPre
+        // and Suspend) must not leak into the observed histogram even
+        // when the root is a Call. Suspend was already covered by the
+        // Round 17 `reset_starts_from_scratch` test; the new FrameEnter
+        // emission needs the same guarantee.
+        let e = build(N::Call("root".into()));
+        assert_eq!(e.events().visit_pre, 0);
+        assert_eq!(e.events().frame_enter, 0);
+        assert_eq!(e.events().frame_leave, 0);
+        assert_eq!(e.events().suspend, 0);
     }
 }
