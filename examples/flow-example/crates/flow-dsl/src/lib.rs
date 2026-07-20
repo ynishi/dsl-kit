@@ -43,6 +43,11 @@ pub enum Flow {
         id: NodeId,
         /// Children scheduled concurrently.
         children: Vec<Flow>,
+        /// Join policy (shape + fail). `None` defaults to
+        /// `{ shape: All, fail: FailFast }`.
+        policy: Option<JoinPolicy>,
+        /// Reducer id. `None` defaults to `reduce_all_ordered`.
+        reducer_id: Option<String>,
     },
     /// Denotes an external effect; the stepper yields once and resumes
     /// once the host has provided a result.
@@ -159,6 +164,8 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
                         Flow::Call { id: ids.node(), label: "search_github".into() },
                         Flow::Call { id: ids.node(), label: "search_web".into() },
                     ],
+                    policy: None,
+                    reducer_id: None,
                 }),
             },
             Flow::Call { id: ids.node(), label: "synthesise".into() },
@@ -296,7 +303,7 @@ pub struct FlowStepper<'a> {
     id_to_node: HashMap<SuspensionId, NodeId>,
     results: HashMap<NodeId, String>,
     done: bool,
-    frame_tree_stub: FrameTree<FlowValue, FlowCursor, ()>,
+    frame_tree_stub: FrameTree<FlowValue, FlowCursor, (), FlowEffectErr>,
     // Commit B1: real Par fan-out state
     par_contexts: Vec<ParContext>,
     sid_to_par: HashMap<SuspensionId, (usize, ChildIndex)>,
@@ -312,6 +319,10 @@ pub struct FlowStepper<'a> {
 /// `policy.shape` fires.
 struct ParContext {
     slots: Vec<Option<FlowValue>>,
+    /// CollectAll only: per-child effect-side failure. `Some(e)` once
+    /// the child resolved with `Err(e)`; always `None` for a FailFast
+    /// Par (failure aborts before reaching the reducer).
+    failures: Vec<Option<FlowEffectErr>>,
     completion_order: Vec<ChildIndex>,
     child_sids: Vec<SuspensionId>,
     child_node_ids: Vec<NodeId>,
@@ -528,7 +539,7 @@ impl<'a> FlowStepper<'a> {
                         frame.state =
                             FrameState::SeqNext { children: children.iter(), index: 0 };
                     }
-                    Flow::Par { children, .. } => {
+                    Flow::Par { children, policy: par_policy, reducer_id: par_reducer, .. } => {
                         // Commit B1: if every child is a direct Call,
                         // enter real fan-out mode. Otherwise fall back
                         // to the Commit A sequential path.
@@ -584,16 +595,24 @@ impl<'a> FlowStepper<'a> {
                                 });
                             }
 
+                            let resolved_policy = par_policy.unwrap_or(JoinPolicy {
+                                shape: JoinShape::All,
+                                fail: FailPolicy::FailFast,
+                            });
+                            let resolved_reducer_id = par_reducer
+                                .clone()
+                                .map(ReducerId::from)
+                                .unwrap_or_else(|| {
+                                    ReducerId::from("reduce_all_ordered")
+                                });
                             self.par_contexts.push(ParContext {
                                 slots: vec![None; n],
+                                failures: (0..n).map(|_| None).collect(),
                                 completion_order: Vec::new(),
                                 child_sids,
                                 child_node_ids,
-                                policy: JoinPolicy {
-                                    shape: JoinShape::All,
-                                    fail: FailPolicy::FailFast,
-                                },
-                                reducer_id: ReducerId::from("reduce_all_ordered"),
+                                policy: resolved_policy,
+                                reducer_id: resolved_reducer_id,
                                 joined: false,
                                 result: None,
                                 failure: None,
@@ -803,12 +822,13 @@ impl<'a> FlowStepper<'a> {
     /// Applies the Par's registered reducer to its slots, storing the
     /// folded value in the ParContext and returning `(V, D)`.
     fn fold_par(&mut self, context_index: usize) -> Result<(FlowValue, ()), EngineError> {
-        let (reducer_id, policy, slots, deltas, winners) = {
+        let (reducer_id, policy, slots, failures, deltas, winners) = {
             let ctx = &self.par_contexts[context_index];
             (
                 ctx.reducer_id.clone(),
                 ctx.policy,
                 ctx.slots.clone(),
+                ctx.failures.clone(),
                 vec![Some(()); ctx.slots.len()],
                 ctx.completion_order.clone(),
             )
@@ -818,12 +838,17 @@ impl<'a> FlowStepper<'a> {
             dsl_kit::ReducerHandle::FailFast(reducer) => {
                 reducer.reduce(&slots, &deltas, &winners)?
             }
-            dsl_kit::ReducerHandle::CollectAll(_) => {
-                // Commit B1 only wires FailFast reducers into Par
-                // integration; CollectAll trait is defined and
-                // registered but its invocation path lands with the
-                // next commit.
-                return Err(EngineError::UnknownReducer { id: reducer_id });
+            dsl_kit::ReducerHandle::CollectAll(reducer) => {
+                let combined: Vec<Option<Result<FlowValue, FlowEffectErr>>> = slots
+                    .into_iter()
+                    .zip(failures.into_iter())
+                    .map(|(s, f)| match (s, f) {
+                        (Some(v), _) => Some(Ok(v)),
+                        (None, Some(e)) => Some(Err(e)),
+                        (None, None) => None,
+                    })
+                    .collect();
+                reducer.reduce(&combined, &deltas, &winners)?
             }
         };
         self.par_contexts[context_index].result = Some(value.clone());
@@ -849,8 +874,10 @@ impl<'a> FlowStepper<'a> {
         if fires {
             ctx.joined = true;
             // Queue outstanding sibling suspensions for cancellation.
+            // Skip children that already resolved with Err under
+            // CollectAll — they are neither pending nor cancellable.
             for (i, sid) in ctx.child_sids.iter().enumerate() {
-                if ctx.slots[i].is_none() {
+                if ctx.slots[i].is_none() && ctx.failures[i].is_none() {
                     self.cancelled.push(*sid);
                     self.sid_to_par.remove(sid);
                     self.id_to_node.remove(sid);
@@ -860,13 +887,19 @@ impl<'a> FlowStepper<'a> {
         }
     }
 
-    /// Records a failed resolve into a Par slot. Under FailFast this
-    /// cancels the remaining siblings and marks the ParContext as
-    /// failed; the next `step()` propagates the error.
+    /// Records a failed resolve into a Par slot.
+    ///
+    /// - FailFast: mark the ParContext as failed, cancel remaining
+    ///   siblings; the next `step()` propagates the error.
+    /// - CollectAll: record the failure in the per-child `failures`
+    ///   slot and continue. If the shape target is no longer
+    ///   attainable given the remaining live children, fire the join
+    ///   with the collected slot vector; the reducer decides whether
+    ///   to return a value or an aggregate `Err`.
     fn record_par_failure(
         &mut self,
         context_index: usize,
-        _slot_idx: usize,
+        slot_idx: usize,
         err: FlowEffectErr,
     ) {
         let ctx = &mut self.par_contexts[context_index];
@@ -888,10 +921,30 @@ impl<'a> FlowStepper<'a> {
                 }
             }
             FailPolicy::CollectAll => {
-                // Commit B1 leaves CollectAll wiring for a follow-up
-                // commit; treat as FailFast for now.
-                ctx.joined = true;
-                ctx.failure = Some(err);
+                ctx.failures[slot_idx] = Some(err);
+                let n = ctx.slots.len();
+                let successes = ctx.completion_order.len();
+                let failed = ctx.failures.iter().filter(|f| f.is_some()).count();
+                let live = n - successes - failed;
+                let potential_successes = successes + live;
+                let target_unattainable = match ctx.policy.shape {
+                    JoinShape::All => failed >= 1,
+                    JoinShape::Any => potential_successes == 0,
+                    JoinShape::FirstK(k) => potential_successes < k,
+                };
+                if target_unattainable {
+                    ctx.joined = true;
+                    // Cancel any still-pending siblings so the host
+                    // can drain them via take_cancellations().
+                    for (i, sid) in ctx.child_sids.iter().enumerate() {
+                        if ctx.slots[i].is_none() && ctx.failures[i].is_none() {
+                            self.cancelled.push(*sid);
+                            self.sid_to_par.remove(sid);
+                            self.id_to_node.remove(sid);
+                            self.pending.retain(|p| p.id != *sid);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1000,7 +1053,9 @@ impl<'a> Stepper for FlowStepper<'a> {
         std::mem::take(&mut self.cancelled)
     }
 
-    fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta> {
+    fn frame_tree(
+        &self,
+    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
         &self.frame_tree_stub
     }
 
@@ -1254,6 +1309,8 @@ mod tests {
                 Flow::Call { id: ids.node(), label: "b".into() },
                 Flow::Call { id: ids.node(), label: "c".into() },
             ],
+            policy: None,
+            reducer_id: None,
         };
         let mut stepper = FlowStepper::new(&program);
 
@@ -1310,6 +1367,8 @@ mod tests {
                 Flow::Call { id: ids.node(), label: "y".into() },
                 Flow::Call { id: ids.node(), label: "z".into() },
             ],
+            policy: None,
+            reducer_id: None,
         };
         let mut stepper = FlowStepper::new(&program);
         let _ = stepper.step().expect("enter par");
@@ -1360,6 +1419,105 @@ mod tests {
                 .unwrap_or_else(|_| panic!("missing collect-all reducer {id}"));
             assert!(matches!(h, dsl_kit::ReducerHandle::CollectAll(_)));
         }
+    }
+
+    #[test]
+    fn par_collect_all_first_k_reaches_target_with_one_failure() {
+        // FirstK(2) with 3 children, second child fails; the two
+        // remaining successes still satisfy the target, so the
+        // reducer sees Ok/Err/Ok slots and returns the majority.
+        let ids = IdGen::new();
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "model_a".into() },
+                Flow::Call { id: ids.node(), label: "model_b".into() },
+                Flow::Call { id: ids.node(), label: "model_c".into() },
+            ],
+            policy: Some(JoinPolicy {
+                shape: JoinShape::FirstK(2),
+                fail: FailPolicy::CollectAll,
+            }),
+            reducer_id: Some("reduce_first_k_best_effort".into()),
+        };
+        let mut stepper = FlowStepper::new(&program);
+        let _ = stepper.step().expect("enter par");
+        let sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
+
+        stepper
+            .resolve(sids[0], Ok(FlowValue::Text("answer-a".into())))
+            .expect("resolve a");
+        stepper
+            .resolve(
+                sids[1],
+                Err(FlowEffectErr { code: "timeout".into(), message: "b".into() }),
+            )
+            .expect("resolve b failure");
+        stepper
+            .resolve(sids[2], Ok(FlowValue::Text("answer-c".into())))
+            .expect("resolve c");
+
+        // Drive to done — no error should propagate under CollectAll.
+        for _ in 0..20 {
+            match stepper.step().expect("step") {
+                StepOutcome::Done(_) => {
+                    // The failure did NOT abort siblings.
+                    assert!(stepper.take_cancellations().is_empty());
+                    return;
+                }
+                _ => continue,
+            }
+        }
+        panic!("did not reach Done");
+    }
+
+    #[test]
+    fn par_collect_all_any_all_failed_surfaces_reducer_err() {
+        // Shape=Any + CollectAll: fail all children; once no live
+        // successors remain the target becomes unattainable, the
+        // reducer receives an all-Err slot vector and returns
+        // EngineError::Aborted.
+        let ids = IdGen::new();
+        let program = Flow::Par {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "x".into() },
+                Flow::Call { id: ids.node(), label: "y".into() },
+            ],
+            policy: Some(JoinPolicy {
+                shape: JoinShape::Any,
+                fail: FailPolicy::CollectAll,
+            }),
+            reducer_id: Some("reduce_any_first_or_all_failures".into()),
+        };
+        let mut stepper = FlowStepper::new(&program);
+        let _ = stepper.step().expect("enter par");
+        let sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
+
+        // Fail both slots — nothing to cancel (target only becomes
+        // unattainable on the second failure).
+        stepper
+            .resolve(
+                sids[0],
+                Err(FlowEffectErr { code: "boom-x".into(), message: "x".into() }),
+            )
+            .expect("resolve x failure");
+        stepper
+            .resolve(
+                sids[1],
+                Err(FlowEffectErr { code: "boom-y".into(), message: "y".into() }),
+            )
+            .expect("resolve y failure");
+
+        // Both children failed; no live sibling to cancel.
+        assert!(stepper.take_cancellations().is_empty());
+
+        // Next step folds via the CollectAll reducer, which returns
+        // EngineError::Aborted (no successful child).
+        let err = stepper
+            .step()
+            .expect_err("reduce_any_first_or_all_failures should Err");
+        assert!(matches!(err, FlowError::Engine(_)));
     }
 
     #[test]

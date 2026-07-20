@@ -25,7 +25,6 @@
 
 #![warn(missing_docs)]
 
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
@@ -522,7 +521,7 @@ pub trait Stepper {
     /// Root of the live frame tree. Debugger read.
     fn frame_tree(
         &self,
-    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta>;
+    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError>;
 
     /// True when the root has produced a value.
     fn is_done(&self) -> bool;
@@ -545,7 +544,7 @@ pub enum CancelReason {
 
 /// One node in the live frame tree.
 #[derive(Debug)]
-pub enum Frame<V, C, D> {
+pub enum Frame<V, C, D, EE> {
     /// An interior interpretation node currently executing.
     Node {
         /// AST node this frame is interpreting.
@@ -556,7 +555,7 @@ pub enum Frame<V, C, D> {
         cursor: C,
     },
     /// A fan-out root. Children live on the enclosing `FrameTree.kids`.
-    Par(ParFrame<V, D>),
+    Par(ParFrame<V, D, EE>),
     /// A labelled section wrapper (no fan-out semantics).
     Scope {
         /// Section label.
@@ -584,11 +583,11 @@ pub enum Frame<V, C, D> {
 /// child, matched positionally with `ParFrame.slots[i]` and
 /// `ParFrame.deltas[i]`.
 #[derive(Debug)]
-pub struct FrameTree<V, C, D> {
+pub struct FrameTree<V, C, D, EE> {
     /// The frame at this node.
-    pub root: Frame<V, C, D>,
+    pub root: Frame<V, C, D, EE>,
     /// Child sub-trees.
-    pub kids: Vec<FrameTree<V, C, D>>,
+    pub kids: Vec<FrameTree<V, C, D, EE>>,
 }
 
 /// Fan-out metadata.
@@ -597,23 +596,28 @@ pub struct FrameTree<V, C, D> {
 /// `deltas`, and `completion_order` are indexed against that same
 /// positional list.
 #[derive(Debug)]
-pub struct ParFrame<V, D> {
+pub struct ParFrame<V, D, EE> {
     /// Policy (shape + fail).
     pub policy: JoinPolicy,
     /// `slots[i]` is `Some(v)` once child i completed successfully;
     /// `None` while still running, pending, or cancelled without a
     /// value. FailFast: reroutes failure to `Err` before reducer.
-    /// CollectAll: uses a separate erased failure vector (see impl).
+    /// CollectAll: per-child failures live in `failures[i]`; combine
+    /// slot + failure at reducer-invocation time.
     pub slots: Vec<Option<V>>,
+    /// Per-child effect-side failures (CollectAll only). `Some(e)`
+    /// once the child resolved with `Err(e)`; always `None` under
+    /// FailFast (failures reroute to `Err` before the reducer runs).
+    pub failures: Vec<Option<EE>>,
     /// Per-child accumulated delta.
     pub deltas: Vec<Option<D>>,
     /// Order in which children completed successfully.
     pub completion_order: Vec<ChildIndex>,
     /// Registry key for the reducer.
     pub reducer_id: ReducerId,
-    /// Resolved reducer handle (`Arc<dyn Reducer<V, D>>` or the
-    /// CollectAll erased variant, depending on `policy.fail`).
-    pub reducer: ReducerHandle<V, D>,
+    /// Resolved reducer handle (FailFast or CollectAll, matching
+    /// `policy.fail`).
+    pub reducer: ReducerHandle<V, D, EE>,
     /// True once the shape has fired.
     pub joined: bool,
 }
@@ -701,17 +705,18 @@ pub trait ReducerCollectAll<V, D, EffectError>: Send + Sync {
 
 /// Runtime handle for the resolved reducer of a `ParFrame`.
 ///
-/// The `CollectAll` variant erases `EffectError` behind an `Arc<dyn Any>`;
-/// the engine downcasts internally at invocation time when it knows
-/// `Stepper::EffectError`.
-pub enum ReducerHandle<V, D> {
+/// Which variant is present is dictated by `JoinPolicy.fail`. The
+/// `CollectAll` variant is typed directly in the effect-error `EE`
+/// so the engine can invoke `reduce` on a `&[Option<Result<V, EE>>]`
+/// slot vector at fold time without any downcast.
+pub enum ReducerHandle<V, D, EE> {
     /// FailFast-typed reducer.
     FailFast(Arc<dyn Reducer<V, D>>),
-    /// CollectAll-typed reducer, effect-error erased.
-    CollectAll(Arc<dyn Any + Send + Sync>),
+    /// CollectAll-typed reducer, typed in the effect-error `EE`.
+    CollectAll(Arc<dyn ReducerCollectAll<V, D, EE>>),
 }
 
-impl<V, D> fmt::Debug for ReducerHandle<V, D> {
+impl<V, D, EE> fmt::Debug for ReducerHandle<V, D, EE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ReducerHandle::FailFast(_) => f.write_str("ReducerHandle::FailFast(..)"),
@@ -720,7 +725,7 @@ impl<V, D> fmt::Debug for ReducerHandle<V, D> {
     }
 }
 
-impl<V, D> Clone for ReducerHandle<V, D> {
+impl<V, D, EE> Clone for ReducerHandle<V, D, EE> {
     fn clone(&self) -> Self {
         match self {
             ReducerHandle::FailFast(a) => ReducerHandle::FailFast(a.clone()),
@@ -736,29 +741,21 @@ impl<V, D> Clone for ReducerHandle<V, D> {
 /// under the canonical ids (`"reduce_all_ordered"` etc.).
 pub struct ReducerRegistry<V, D, EffectError> {
     fail_fast: HashMap<ReducerId, Arc<dyn Reducer<V, D>>>,
-    collect_all: HashMap<ReducerId, Arc<dyn Any + Send + Sync>>,
-    _marker: std::marker::PhantomData<fn() -> EffectError>,
+    collect_all: HashMap<ReducerId, Arc<dyn ReducerCollectAll<V, D, EffectError>>>,
 }
 
-impl<V, D, EE> Default for ReducerRegistry<V, D, EE>
-where
-    EE: 'static,
-{
+impl<V, D, EE> Default for ReducerRegistry<V, D, EE> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<V, D, EE> ReducerRegistry<V, D, EE>
-where
-    EE: 'static,
-{
+impl<V, D, EE> ReducerRegistry<V, D, EE> {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self {
             fail_fast: HashMap::new(),
             collect_all: HashMap::new(),
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -772,14 +769,12 @@ where
     }
 
     /// Registers a CollectAll-typed reducer under `id`.
-    pub fn register_collect_all<R>(&mut self, id: impl Into<ReducerId>, reducer: Arc<R>)
-    where
-        R: ReducerCollectAll<V, D, EE> + Send + Sync + 'static,
-        V: 'static,
-        D: 'static,
-    {
-        let erased: Arc<dyn Any + Send + Sync> = reducer;
-        self.collect_all.insert(id.into(), erased);
+    pub fn register_collect_all(
+        &mut self,
+        id: impl Into<ReducerId>,
+        reducer: Arc<dyn ReducerCollectAll<V, D, EE>>,
+    ) {
+        self.collect_all.insert(id.into(), reducer);
     }
 
     /// Resolves the reducer for a `ParFrame` at construction time.
@@ -791,7 +786,7 @@ where
         &self,
         id: &ReducerId,
         fail: FailPolicy,
-    ) -> Result<ReducerHandle<V, D>, EngineError> {
+    ) -> Result<ReducerHandle<V, D, EE>, EngineError> {
         match fail {
             FailPolicy::FailFast => self
                 .fail_fast

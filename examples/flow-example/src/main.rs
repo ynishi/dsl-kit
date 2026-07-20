@@ -173,6 +173,8 @@ fn par_three_searches(ids: &IdGen) -> Flow {
             Flow::Call { id: ids.node(), label: "search_github".into() },
             Flow::Call { id: ids.node(), label: "search_web".into() },
         ],
+        policy: None,
+        reducer_id: None,
     }
 }
 
