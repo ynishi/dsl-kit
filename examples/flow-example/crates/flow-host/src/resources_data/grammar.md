@@ -14,13 +14,17 @@ Flow ::= Seq   { id, children: Vec<Flow> }
 ## Semantics
 
 - **`Seq`** — evaluate `children` in declaration order.
-- **`Par`** — evaluate `children` concurrently in principle; the
-  reference stepper schedules them sequentially, which is enough to
-  demonstrate the event shape.
-- **`Call`** — denotes an external effect. The stepper yields
-  `Suspended { reason: AwaitEffect, .. }`; the host resolves it via
-  `dsl_kit_resolve` and the stepper records the response against the
-  node id.
+- **`Par`** — evaluate `children` concurrently. When every child is
+  a direct `Flow::Call`, the reference stepper (v3, Commit B1) emits
+  **N `Pending` in a single step** at Par entry — a real fan-out —
+  and folds the slot values via a registered reducer once every slot
+  is filled. Fan-out with non-`Call` children still falls back to the
+  earlier sequential schedule (tracked for a later commit).
+- **`Call`** — denotes an external effect. The stepper yields a
+  `Pending { reason: Call { spec }, .. }` entry; the host resolves it
+  via `dsl_kit_resolve` (single-in-flight) or
+  `dsl_kit_resolve_by_id` (fan-out) and the stepper records the
+  response against the node id.
 - **`Scope`** — a labelled section wrapping one inner flow. No extra
   semantics beyond delineation, useful for pretty-printing and for
   path-shaped breakpoints.

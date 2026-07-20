@@ -1,31 +1,29 @@
 //! Reference demo for the flow DSL.
 //!
-//! The binary is structured in four sections:
+//! The binary is structured in five sections:
 //!
 //! 1. Walks the AST with the derived traversal, prints an indented
 //!    tree.
 //! 2. Runs the pipeline synchronously with a canned resolver.
-//! 3. Runs two pipelines concurrently through the host-driven async
-//!    pattern, using `tokio::time::sleep` to simulate real network
-//!    latency (the pipeline-level overlap demo).
-//! 4. Exercises the breakpoint surface and renders a diagnostic error.
-//!
-//! Commit A note: this binary still exercises the Commit A shape
-//! (single in-flight suspension per pipeline). Commit C will rewrite
-//! the async section to use real inline fan-out through the new
-//! `Par` semantics.
+//! 3. Runs one pipeline through the v3 async pattern with **real inline
+//!    fan-out**: at the `Par` node all three searches are dispatched
+//!    as concurrent `tokio::spawn` tasks and their responses are
+//!    plumbed back as each future completes.
+//! 4. Runs a FailFast demo: one Par slot resolves with an effect
+//!    error; the next step surfaces the error and the sibling ids
+//!    appear in `Stepper::take_cancellations`.
+//! 5. Exercises the breakpoint surface and renders a diagnostic error.
 
 use std::time::{Duration, Instant};
 
 use dsl_kit::{
     BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId, Path,
-    StepOutcome, Stepper, Walk,
+    StepOutcome, Stepper, SuspensionId, Walk,
 };
 use flow_dsl::{
-    Flow, FlowStepper, FlowValue, InternalOutcome, canned_response, check_unique_ids, pretty,
-    research_pipeline,
+    Flow, FlowEffectErr, FlowStepper, FlowValue, InternalOutcome, canned_response,
+    check_unique_ids, pretty, research_pipeline,
 };
-use futures::future::join;
 
 /// Illustrates the breakpoint condition surface by walking the AST once
 /// and reporting which nodes each condition matches.
@@ -78,21 +76,36 @@ fn demonstrate_breakpoints(program: &Flow) {
     }
 }
 
-/// Drives a flow through the v3 [`Stepper`] trait, awaiting a real
-/// `tokio::time::sleep` between each suspension.
-async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Duration, usize) {
+/// Drives a flow through the v3 [`Stepper`] trait with **real inline
+/// fan-out**. Sequential `Call` yields are awaited one at a time
+/// (`tokio::time::sleep(base_latency)`); at a `Par` node every
+/// outstanding slot is dispatched as its own `tokio::spawn` task, and
+/// the responses are resolved back into the stepper as each future
+/// completes (`JoinSet::join_next`).
+///
+/// To make the parallelism visible on stdout each fan-out slot gets a
+/// different simulated latency (`base_latency + i * stagger`), so the
+/// resolution order in the printed log is deterministic but distinct
+/// from declaration order.
+async fn run_flow_async_fanout(
+    program: &Flow,
+    base_latency: Duration,
+    stagger: Duration,
+) -> (Duration, usize) {
     let start = Instant::now();
     let mut stepper = FlowStepper::new(program);
     let mut resolved = 0usize;
     let bp = BreakpointSet::new();
     loop {
-        // Drive to next yield via the internal breakpoint-aware loop.
         let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
         match outcome {
+            InternalOutcome::Advanced => {}
+            InternalOutcome::Done => break,
             InternalOutcome::Suspended { .. } => {
                 if let Some((sid, _node, label)) = stepper.suspended_call() {
-                    tokio::time::sleep(latency).await;
-                    let response = format!("[{tag}] {}", canned_response(label));
+                    tokio::time::sleep(base_latency).await;
+                    let response = canned_response(label);
+                    println!("  seq  {label:<15} -> {response}");
                     stepper
                         .resolve(sid, Ok(FlowValue::Text(response)))
                         .expect("resolve");
@@ -100,8 +113,7 @@ async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Durati
                 }
             }
             InternalOutcome::Waiting => {
-                // Par fan-out: resolve every outstanding slot.
-                let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
+                let outstanding: Vec<(SuspensionId, String)> = stepper
                     .pending()
                     .iter()
                     .filter_map(|p| match &p.reason {
@@ -114,20 +126,113 @@ async fn run_flow_async(program: &Flow, tag: &str, latency: Duration) -> (Durati
                 if outstanding.is_empty() {
                     break;
                 }
-                for (sid, label) in outstanding {
-                    tokio::time::sleep(latency).await;
-                    let response = format!("[{tag}] {}", canned_response(&label));
+                let slot_count = outstanding.len();
+                let mut set = tokio::task::JoinSet::new();
+                for (i, (sid, label)) in outstanding.into_iter().enumerate() {
+                    let delay = base_latency + stagger * i as u32;
+                    set.spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        (sid, label, delay)
+                    });
+                }
+                let fan_start = Instant::now();
+                while let Some(joined) = set.join_next().await {
+                    let (sid, label, delay) = joined.expect("spawn");
+                    let response = canned_response(&label);
+                    println!(
+                        "  par  {label:<15} -> {response}   (after {:>3} ms)",
+                        delay.as_millis()
+                    );
                     stepper
                         .resolve(sid, Ok(FlowValue::Text(response)))
                         .expect("resolve");
                     resolved += 1;
                 }
+                let fan_elapsed = fan_start.elapsed();
+                println!(
+                    "  par  ({slot_count} slots resolved in {:>3} ms total; sequential would take ~{} ms)",
+                    fan_elapsed.as_millis(),
+                    (0..slot_count)
+                        .map(|i| (base_latency + stagger * i as u32).as_millis())
+                        .sum::<u128>()
+                );
             }
-            InternalOutcome::Done => break,
-            InternalOutcome::Advanced => {}
         }
     }
     (start.elapsed(), resolved)
+}
+
+/// Small standalone `Par`-of-three-calls program used by the FailFast
+/// demo. Kept separate from the research pipeline so a single failure
+/// isolates the fan-out cancellation behavior.
+fn par_three_searches(ids: &IdGen) -> Flow {
+    Flow::Par {
+        id: ids.node(),
+        children: vec![
+            Flow::Call { id: ids.node(), label: "search_arxiv".into() },
+            Flow::Call { id: ids.node(), label: "search_github".into() },
+            Flow::Call { id: ids.node(), label: "search_web".into() },
+        ],
+    }
+}
+
+/// Enter the Par, fail the middle slot with an effect error, then
+/// print the propagated error and the drained sibling cancellations.
+fn run_failfast_demo() {
+    let ids = IdGen::new();
+    let program = par_three_searches(&ids);
+    let mut stepper = FlowStepper::new(&program);
+
+    // Step once: enters the Par and emits 3 Pending.
+    match stepper.step().expect("enter par") {
+        StepOutcome::Blocked { newly_pending } => {
+            println!("  Par dispatched {} slots.", newly_pending.len());
+        }
+        other => {
+            println!("  unexpected first-step outcome: {other:?}");
+            return;
+        }
+    }
+
+    let pending: Vec<(SuspensionId, String)> = stepper
+        .pending()
+        .iter()
+        .filter_map(|p| match &p.reason {
+            dsl_kit::SuspendReason::Call { spec } => Some((p.id, spec.label.clone())),
+            _ => None,
+        })
+        .collect();
+    for (sid, label) in &pending {
+        println!("    slot id={:>3} label={label}", sid.0);
+    }
+
+    // Fail the middle slot.
+    let (fail_sid, fail_label) = pending[1].clone();
+    stepper
+        .resolve(
+            fail_sid,
+            Err(FlowEffectErr {
+                code: "timeout".into(),
+                message: format!("{fail_label} timed out"),
+            }),
+        )
+        .expect("record failure");
+    println!("  slot {fail_label} resolved with Err(timeout).");
+
+    // The next step propagates the error under FailFast.
+    match stepper.step() {
+        Err(err) => println!("  next step -> Err: {err}"),
+        Ok(out) => println!("  next step -> Ok({out:?}) (unexpected)"),
+    }
+
+    let cancelled = stepper.take_cancellations();
+    println!(
+        "  take_cancellations() drained {} sibling id(s): {:?}",
+        cancelled.len(),
+        cancelled.iter().map(|s| s.0).collect::<Vec<_>>()
+    );
+    let drained_again = stepper.take_cancellations();
+    println!("  take_cancellations() drained again: {drained_again:?} (empty on second call)");
 }
 
 #[tokio::main]
@@ -193,31 +298,23 @@ async fn main() -> miette::Result<()> {
         println!("  {id}: {text}");
     }
 
-    println!("\n=== Async run (single pipeline, real tokio sleeps) ===");
-    let (single_elapsed, single_calls) =
-        run_flow_async(&program, "solo", Duration::from_millis(50)).await;
-    println!(
-        "  solo pipeline: resolved {single_calls} calls in {:.0} ms (50 ms per suspend x {single_calls})",
-        single_elapsed.as_millis()
-    );
-
-    println!("\n=== Async run (two pipelines concurrently) ===");
-    let start = Instant::now();
-    let ((elapsed_a, calls_a), (elapsed_b, calls_b)) = join(
-        run_flow_async(&program, "A", Duration::from_millis(50)),
-        run_flow_async(&program, "B", Duration::from_millis(50)),
+    println!("\n=== Async run (single pipeline, real inline Par fan-out) ===");
+    let (elapsed, calls) = run_flow_async_fanout(
+        &program,
+        Duration::from_millis(50),
+        Duration::from_millis(30),
     )
     .await;
-    let joint_elapsed = start.elapsed();
     println!(
-        "  A: {calls_a} calls in {:.0} ms  B: {calls_b} calls in {:.0} ms",
-        elapsed_a.as_millis(),
-        elapsed_b.as_millis()
+        "  pipeline resolved {calls} calls in {} ms wall clock.",
+        elapsed.as_millis()
     );
     println!(
-        "  concurrent wall clock: {:.0} ms (each pipeline still {calls_a} suspends x 50 ms; overlap is real)",
-        joint_elapsed.as_millis()
+        "  The 3 Par slots ran concurrently via tokio::spawn; their combined wall clock is bounded by the slowest slot, not the sum."
     );
+
+    println!("\n=== FailFast demo (Par of 3, middle slot fails) ===");
+    run_failfast_demo();
 
     println!("\n=== Breakpoints ===");
     demonstrate_breakpoints(&program);

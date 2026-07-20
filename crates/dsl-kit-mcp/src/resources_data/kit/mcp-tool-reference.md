@@ -1,6 +1,6 @@
 # dsl-kit — MCP tool reference
 
-`DslMcpHandler` exposes ten tools. All operate on the DSL-neutral
+`DslMcpHandler` exposes thirteen tools. All operate on the DSL-neutral
 `NodeId` / `Path` / `depth` / iteration shapes, so a caller sees the
 same contract regardless of which `DslHost` is loaded.
 
@@ -10,7 +10,8 @@ same contract regardless of which `DslHost` is loaded.
   node summary, AST size.
 - **`dsl_kit_ast`** — indented text tree of the loaded program.
 - **`dsl_kit_state`** — depth, current path, pending suspended call,
-  recorded results, event counters, active breakpoints.
+  the full `pending` list (fan-out projection), recorded results,
+  event counters, active breakpoints.
 
 ## Stepping
 
@@ -20,8 +21,27 @@ same contract regardless of which `DslHost` is loaded.
   - `"to_done"`: run until completion, resolving intermediate calls
     with the host's default response.
 - **`dsl_kit_resolve`** — supply a response for the currently
-  suspended call. `result` is optional; when omitted the host provides
-  a canned default.
+  suspended call (single-in-flight path). `result` is optional; when
+  omitted the host provides a canned default. For `Par` fan-out use
+  `dsl_kit_resolve_by_id` instead.
+
+## Fan-out
+
+- **`dsl_kit_pending`** — list every live suspension. In the common
+  one-in-flight case this returns zero or one entry; under a `Par`
+  fan-out it enumerates every live child. Each entry carries a stable
+  `id`, `reason`, `label`, and `at` location.
+- **`dsl_kit_resolve_by_id`** — resolve one specific pending
+  suspension by its stable `id`. Body variants:
+  - `{ id, ok: "response text" }` — success payload.
+  - `{ id, err: { code, message } }` — effect-side failure. Under
+    `FailFast` this triggers propagation on the next `dsl_kit_step`
+    and queues sibling cancellations.
+- **`dsl_kit_take_cancellations`** — drain the ids of suspensions the
+  engine has cancelled since the last drain. Hosts should call this
+  after every `dsl_kit_step` that returns an error or completes a Par
+  fold and act on the drained ids (typically abort their runtime
+  handles). Returns `{ cancelled: [] }` on the happy path.
 
 ## Breakpoints
 
@@ -52,3 +72,21 @@ same contract regardless of which `DslHost` is loaded.
 4. `dsl_kit_state` to inspect where the stepper is.
 5. `dsl_kit_resolve` to supply a call response, then step again.
 6. `dsl_kit_reset` when starting over.
+
+## Fan-out workflow (`Par` node)
+
+When the loaded DSL supports parallel branches, a `Par` node's `step`
+emits N suspensions at once (one per child `Call`). The recommended
+tool sequence is:
+
+1. `dsl_kit_step { mode: "to_yield" }` — enters the `Par` and blocks.
+2. `dsl_kit_pending` — returns N entries, each with a stable `id`.
+3. `dsl_kit_resolve_by_id { id, ok: "..." }` × N — resolve each slot
+   in any order (does not have to match declaration order).
+4. `dsl_kit_step` — the reducer folds the slot values and the
+   pipeline advances.
+
+On the FailFast variant, step 3 for one slot uses
+`{ id, err: { code, message } }`. The next `dsl_kit_step` then
+returns an error, and `dsl_kit_take_cancellations` returns the ids
+of the siblings that were cancelled as a consequence.

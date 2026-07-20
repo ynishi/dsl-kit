@@ -59,10 +59,20 @@ Seq
 
 ## Driving it end-to-end
 
+The pipeline has one `Par` node (`web_research`) with three `Call`
+children. Real fan-out means those three children are dispatched in
+one step and resolved individually via `dsl_kit_resolve_by_id`.
+
 ```text
-1. dsl_kit_step { mode: "to_yield" }        # suspends at Call fetch_query
-2. dsl_kit_resolve { result: "..." }        # supply an answer
-3. dsl_kit_step { mode: "to_yield" }        # suspends at next Call
+1. dsl_kit_step   { mode: "to_yield" }              # suspends at Call fetch_query
+2. dsl_kit_resolve { result: "..." }                 # answer fetch_query
+3. dsl_kit_step   { mode: "to_yield" }              # enters Par → 3 pending emitted
+4. dsl_kit_pending                                   # → 3 entries with ids I1, I2, I3
+5. dsl_kit_resolve_by_id { id: I1, ok: "..." }       # resolve search_arxiv
+   dsl_kit_resolve_by_id { id: I2, ok: "..." }       # resolve search_github
+   dsl_kit_resolve_by_id { id: I3, ok: "..." }       # resolve search_web (any order)
+6. dsl_kit_step   { mode: "to_yield" }              # Par folds, advances to next Call
+7. dsl_kit_resolve { result: "..." }                 # synthesise
    ... repeat until Done ...
 ```
 
@@ -74,3 +84,18 @@ dsl_kit_step { mode: "to_done" }            # host resolves every Call with its 
 
 After `to_done` the seven `Call` results are visible under
 `dsl_kit_state.results`.
+
+### FailFast on the Par
+
+If instead of `ok` a client resolves one slot with an effect error,
+the next `dsl_kit_step` propagates it and the siblings are queued for
+cancellation:
+
+```text
+5'. dsl_kit_resolve_by_id { id: I2, err: { code: "timeout", message: "..." } }
+6'. dsl_kit_step                              # → Err (flow effect error [timeout])
+7'. dsl_kit_take_cancellations                # → { cancelled: [I1, I3, ...] }
+```
+
+Hosts should call `dsl_kit_take_cancellations` after any step that
+returns an error and abort their runtime handles for the drained ids.

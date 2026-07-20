@@ -26,6 +26,12 @@ async_trait DslHost:
 ```text
     fn catalog(&self) -> Vec<ErrorCatalogEntry>       // default: []
     fn resources(&self) -> Vec<ResourceEntry>         // default: []
+    async fn resolve_by_id(
+        &mut self,
+        id: u64,
+        result: Result<String, HostEffectError>,
+    ) -> Result<ResolvedCall, String>                 // default: error
+    fn take_cancellations(&mut self) -> Vec<u64>      // default: []
 ```
 
 - `catalog()` adds host-specific `EngineError`-shaped codes that
@@ -34,6 +40,18 @@ async_trait DslHost:
   convention) — DSL grammar references, sample programs, tool
   extensions the client might want to prime itself with. Not enforced;
   any URI namespace is legal.
+- `resolve_by_id()` powers the `dsl_kit_resolve_by_id` MCP tool.
+  Override this on hosts whose DSL emits multiple simultaneous
+  suspensions (e.g. `Par` fan-out). `result` carries either a success
+  payload (`Ok(String)`) or an effect-side failure
+  (`Err(HostEffectError { code, message })`). Hosts that stay
+  single-in-flight can leave the default implementation, which errors
+  with `"resolve_by_id not implemented"`.
+- `take_cancellations()` powers the `dsl_kit_take_cancellations` MCP
+  tool. Override to drain the engine-assigned ids of suspensions the
+  DSL has cancelled since the last drain (typically FailFast siblings
+  after an `Err` resolve, or losing legs of an `Any`/`FirstK` fold).
+  The default returns an empty vector.
 
 ## Reference implementation
 
