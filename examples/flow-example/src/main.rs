@@ -21,8 +21,8 @@ use dsl_kit::{
     StepOutcome, Stepper, SuspensionId, Walk,
 };
 use flow_dsl::{
-    Flow, FlowEffectErr, FlowStepper, FlowValue, InternalOutcome, canned_response,
-    check_unique_ids, pretty, research_pipeline,
+    Flow, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids, pretty,
+    research_pipeline,
 };
 
 /// Illustrates the breakpoint condition surface by walking the AST once
@@ -99,20 +99,14 @@ async fn run_flow_async_fanout(
     loop {
         let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
         match outcome {
-            InternalOutcome::Advanced => {}
-            InternalOutcome::Done => break,
-            InternalOutcome::Suspended { .. } => {
-                if let Some((sid, _node, label)) = stepper.suspended_call() {
-                    tokio::time::sleep(base_latency).await;
-                    let response = canned_response(label);
-                    println!("  seq  {label:<15} -> {response}");
-                    stepper
-                        .resolve(sid, Ok(FlowValue::Text(response)))
-                        .expect("resolve");
-                    resolved += 1;
-                }
-            }
-            InternalOutcome::Waiting => {
+            StepOutcome::Ready => {}
+            StepOutcome::Done(_) => break,
+            StepOutcome::Blocked { .. } => {
+                // Collect every outstanding Call. In the single-Call
+                // case (`suspended_call` returns Some), await one
+                // response sequentially. In the fan-out case, dispatch
+                // every slot as its own `tokio::spawn` task so the
+                // wall clock is bounded by the slowest, not the sum.
                 let outstanding: Vec<(SuspensionId, String)> = stepper
                     .pending()
                     .iter()
@@ -126,36 +120,47 @@ async fn run_flow_async_fanout(
                 if outstanding.is_empty() {
                     break;
                 }
-                let slot_count = outstanding.len();
-                let mut set = tokio::task::JoinSet::new();
-                for (i, (sid, label)) in outstanding.into_iter().enumerate() {
-                    let delay = base_latency + stagger * i as u32;
-                    set.spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        (sid, label, delay)
-                    });
-                }
-                let fan_start = Instant::now();
-                while let Some(joined) = set.join_next().await {
-                    let (sid, label, delay) = joined.expect("spawn");
+                if outstanding.len() == 1 {
+                    let (sid, label) = outstanding.into_iter().next().unwrap();
+                    tokio::time::sleep(base_latency).await;
                     let response = canned_response(&label);
-                    println!(
-                        "  par  {label:<15} -> {response}   (after {:>3} ms)",
-                        delay.as_millis()
-                    );
+                    println!("  seq  {label:<15} -> {response}");
                     stepper
                         .resolve(sid, Ok(FlowValue::Text(response)))
                         .expect("resolve");
                     resolved += 1;
+                } else {
+                    let slot_count = outstanding.len();
+                    let mut set = tokio::task::JoinSet::new();
+                    for (i, (sid, label)) in outstanding.into_iter().enumerate() {
+                        let delay = base_latency + stagger * i as u32;
+                        set.spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            (sid, label, delay)
+                        });
+                    }
+                    let fan_start = Instant::now();
+                    while let Some(joined) = set.join_next().await {
+                        let (sid, label, delay) = joined.expect("spawn");
+                        let response = canned_response(&label);
+                        println!(
+                            "  par  {label:<15} -> {response}   (after {:>3} ms)",
+                            delay.as_millis()
+                        );
+                        stepper
+                            .resolve(sid, Ok(FlowValue::Text(response)))
+                            .expect("resolve");
+                        resolved += 1;
+                    }
+                    let fan_elapsed = fan_start.elapsed();
+                    println!(
+                        "  par  ({slot_count} slots resolved in {:>3} ms total; sequential would take ~{} ms)",
+                        fan_elapsed.as_millis(),
+                        (0..slot_count)
+                            .map(|i| (base_latency + stagger * i as u32).as_millis())
+                            .sum::<u128>()
+                    );
                 }
-                let fan_elapsed = fan_start.elapsed();
-                println!(
-                    "  par  ({slot_count} slots resolved in {:>3} ms total; sequential would take ~{} ms)",
-                    fan_elapsed.as_millis(),
-                    (0..slot_count)
-                        .map(|i| (base_latency + stagger * i as u32).as_millis())
-                        .sum::<u128>()
-                );
             }
         }
     }
@@ -253,39 +258,42 @@ async fn main() -> miette::Result<()> {
     loop {
         let outcome = stepper.run_to_yield_with_breakpoints(&bp).expect("step");
         match outcome {
-            InternalOutcome::Advanced => {}
-            InternalOutcome::Suspended { at, .. } => {
+            StepOutcome::Ready => {}
+            StepOutcome::Done(_) => break,
+            StepOutcome::Blocked { .. } => {
+                // Single-Call yield: prefer `suspended_call` for the
+                // pretty single-line trace. Fan-out yield: resolve
+                // every outstanding Call in one batch.
                 if let Some((sid, node_id, label)) = stepper.suspended_call() {
                     let response = canned_response(label);
+                    let at = stepper.current_path().map(|p| p.to_string()).unwrap_or_default();
                     println!("  {node_id:>4} {label:<15} -> {response}   ({at})");
                     stepper
                         .resolve(sid, Ok(FlowValue::Text(response)))
                         .expect("resolve");
+                } else {
+                    let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
+                        .pending()
+                        .iter()
+                        .filter_map(|p| match &p.reason {
+                            dsl_kit::SuspendReason::Call { spec } => {
+                                Some((p.id, spec.label.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if outstanding.is_empty() {
+                        break;
+                    }
+                    for (sid, label) in outstanding {
+                        let response = canned_response(&label);
+                        println!("  (par) {label:<15} -> {response}");
+                        stepper
+                            .resolve(sid, Ok(FlowValue::Text(response)))
+                            .expect("resolve");
+                    }
                 }
             }
-            InternalOutcome::Waiting => {
-                let outstanding: Vec<(dsl_kit::SuspensionId, String)> = stepper
-                    .pending()
-                    .iter()
-                    .filter_map(|p| match &p.reason {
-                        dsl_kit::SuspendReason::Call { spec } => {
-                            Some((p.id, spec.label.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if outstanding.is_empty() {
-                    break;
-                }
-                for (sid, label) in outstanding {
-                    let response = canned_response(&label);
-                    println!("  (par) {label:<15} -> {response}");
-                    stepper
-                        .resolve(sid, Ok(FlowValue::Text(response)))
-                        .expect("resolve");
-                }
-            }
-            InternalOutcome::Done => break,
         }
     }
 

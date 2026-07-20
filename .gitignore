@@ -3,3 +3,4 @@ workspace
 .claude
 .mcp.json
 target
+.codex

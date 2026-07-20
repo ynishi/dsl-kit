@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod engine;
-pub use engine::{Ast, Engine, NodeKind};
+pub use engine::{Ast, Engine, ExecError, NodeKind};
 
 // ---------- Observation primitives --------------------------------------
 
@@ -306,6 +306,59 @@ pub struct NullSink;
 impl EventSink for NullSink {
     #[inline]
     fn emit(&mut self, _event: &Event) {}
+}
+
+/// Silent event sink that counts each event kind.
+///
+/// Used by the engine as its default observation channel so hosts
+/// can inspect basic activity without wiring a custom sink.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CountingSink {
+    /// Number of `VisitPre` events observed.
+    pub visit_pre: u32,
+    /// Number of `VisitPost` events observed.
+    pub visit_post: u32,
+    /// Number of `FrameEnter` events observed.
+    pub frame_enter: u32,
+    /// Number of `FrameLeave` events observed.
+    pub frame_leave: u32,
+    /// Number of `IterationTick` events observed.
+    pub iteration_tick: u32,
+    /// Number of `Suspend` events observed.
+    pub suspend: u32,
+    /// Number of `Resume` events observed.
+    pub resume: u32,
+}
+
+impl EventSink for CountingSink {
+    fn emit(&mut self, event: &Event) {
+        match event {
+            Event::VisitPre { .. } => self.visit_pre += 1,
+            Event::VisitPost { .. } => self.visit_post += 1,
+            Event::FrameEnter { .. } => self.frame_enter += 1,
+            Event::FrameLeave { .. } => self.frame_leave += 1,
+            Event::IterationTick { .. } => self.iteration_tick += 1,
+            Event::Suspend { .. } => self.suspend += 1,
+            Event::Resume { .. } => self.resume += 1,
+            _ => {}
+        }
+    }
+}
+
+impl CountingSink {
+    /// Returns a single-line human-readable event histogram.
+    pub fn summarise(&self) -> String {
+        format!(
+            "pre={} post={} frame_enter={} frame_leave={} iter={} suspend={} resume={}",
+            self.visit_pre,
+            self.visit_post,
+            self.frame_enter,
+            self.frame_leave,
+            self.iteration_tick,
+            self.suspend,
+            self.resume,
+        )
+    }
 }
 
 // ---------- Errors ------------------------------------------------------

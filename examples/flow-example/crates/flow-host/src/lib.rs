@@ -5,21 +5,20 @@
 //! (default payload of the reference MCP server) and useful as a
 //! worked example when writing your own `DslHost` adapter.
 //!
-//! Commit A landing note: the internal `FlowStepper` now satisfies the
-//! v3 `Stepper` trait; `FlowHost` bridges its `DslHost` (`step_one` /
-//! `resolve` / …) contract to the new stepper API. The `DslHost` trait
-//! itself is untouched in Commit A; new fan-out surface (pending list,
-//! cancellation drain) lands in Commit B.
+//! Round 17 note: [`flow_dsl::FlowStepper`] is now a thin adapter over
+//! the core [`dsl_kit::Engine`], so this bridge speaks the design-doc
+//! v3 [`dsl_kit::StepOutcome`] shape directly — the old
+//! flow-local `InternalOutcome` intermediary is gone.
 
 #![warn(missing_docs)]
 
-use dsl_kit::{BreakpointSet, DslNode, IdGen, Phase, Stepper, Walk};
+use dsl_kit::{BreakpointSet, DslNode, IdGen, Pending, Phase, StepOutcome, Stepper, Walk};
 use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostEffectError, HostLocation, HostOutcome, HostSnapshot,
     PendingProjection, ResolvedCall, SuspendedCall,
 };
 use dsl_kit_mcp::resources::ResourceEntry;
-use flow_dsl::{Flow, FlowStepper, FlowValue, InternalOutcome, canned_response, pretty, research_pipeline};
+use flow_dsl::{Flow, FlowStepper, FlowValue, canned_response, pretty, research_pipeline};
 
 const FLOW_GRAMMAR: &str = include_str!("./resources_data/grammar.md");
 const FLOW_RESEARCH_PIPELINE: &str =
@@ -147,7 +146,7 @@ impl DslHost for FlowHost {
             .stepper
             .step_with_breakpoints(breakpoints)
             .map_err(|e| e.to_string())?;
-        Ok(outcome_to_host(outcome))
+        Ok(step_outcome_to_host(outcome, self.stepper.pending()))
     }
 
     async fn step_to_yield(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
@@ -155,7 +154,7 @@ impl DslHost for FlowHost {
             .stepper
             .run_to_yield_with_breakpoints(breakpoints)
             .map_err(|e| e.to_string())?;
-        Ok(outcome_to_host(outcome))
+        Ok(step_outcome_to_host(outcome, self.stepper.pending()))
     }
 
     async fn step_to_done(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
@@ -167,17 +166,19 @@ impl DslHost for FlowHost {
                 .map_err(|e| e.to_string())?;
             steps += 1;
             match outcome {
-                InternalOutcome::Suspended { .. } => {
-                    if let Some((sid, _node, label)) = self.stepper.suspended_call() {
-                        let response = canned_response(label);
-                        self.stepper
-                            .resolve(sid, Ok(FlowValue::Text(response)))
-                            .map_err(|e| e.to_string())?;
-                    }
+                StepOutcome::Done(_) => return Ok(HostOutcome::Done),
+                StepOutcome::Ready => {
+                    // `run_to_yield_with_breakpoints` only ever returns
+                    // Ready when the loop exhausted its work quota
+                    // without a yield; treat as a soft-halt.
+                    return Ok(HostOutcome::Advanced);
                 }
-                InternalOutcome::Waiting => {
-                    // Par fan-out has outstanding pending; resolve them
-                    // with canned responses to drive the fan-out forward.
+                StepOutcome::Blocked { .. } => {
+                    // Resolve every outstanding Call with its canned
+                    // response so the pipeline can drive further. A
+                    // synthesized Breakpoint pending has no `Call`
+                    // reason and is silently skipped; the loop's next
+                    // iteration consumes the marker.
                     let outstanding: Vec<(dsl_kit::SuspensionId, String)> = self
                         .stepper
                         .pending()
@@ -190,7 +191,11 @@ impl DslHost for FlowHost {
                         })
                         .collect();
                     if outstanding.is_empty() {
-                        return Ok(outcome_to_host(InternalOutcome::Done));
+                        // Only a Breakpoint (or nothing) is pending;
+                        // loop again so the BP marker gets consumed on
+                        // the next `run_to_yield_with_breakpoints`.
+                        // If there is truly nothing to do, the next
+                        // step will return `Done` or another Blocked.
                     }
                     for (sid, label) in outstanding {
                         let response = canned_response(&label);
@@ -199,7 +204,6 @@ impl DslHost for FlowHost {
                             .map_err(|e| e.to_string())?;
                     }
                 }
-                other => return Ok(outcome_to_host(other)),
             }
             if steps > 4096 {
                 return Err("stepper exceeded to_done safety limit".into());
@@ -298,29 +302,51 @@ impl DslHost for FlowHost {
     }
 }
 
-fn outcome_to_host(outcome: InternalOutcome) -> HostOutcome {
+/// Adapt the v3 [`StepOutcome`] shape to the DSL-agnostic
+/// [`HostOutcome`] surface the MCP handler serialises.
+///
+/// - `Done(_)` → `HostOutcome::Done`.
+/// - `Ready` → `HostOutcome::Advanced` (rare from
+///   `run_to_yield_with_breakpoints`, which loops on `Ready`).
+/// - `Blocked { newly_pending }` → `HostOutcome::Suspended`. Prefer the
+///   first newly-pending as the yield reason; if `newly_pending` is
+///   empty (a "waiting" fold — new pending exhausted, pre-existing
+///   pending still live), fall back to the first entry in the current
+///   `pending()` snapshot. When both are empty (should not happen from
+///   `run_to_yield` but guarded here for completeness), report a
+///   sentinel `"waiting"` reason at an empty location.
+fn step_outcome_to_host(outcome: StepOutcome<FlowValue>, pending: &[Pending]) -> HostOutcome {
     match outcome {
-        InternalOutcome::Advanced => HostOutcome::Advanced,
-        InternalOutcome::Suspended { reason, at } => HostOutcome::Suspended {
-            reason: reason.to_string(),
-            at: HostLocation {
-                node: at.node.0,
-                path: at.path.0.iter().map(|n| n.0).collect(),
-                depth: at.depth,
-                frame: at.frame.map(|f| f.0),
-                iteration: at.iteration.map(|i| i.0),
-            },
-        },
-        InternalOutcome::Waiting => HostOutcome::Suspended {
-            reason: "waiting".into(),
-            at: HostLocation {
-                node: 0,
-                path: Vec::new(),
-                depth: 0,
-                frame: None,
-                iteration: None,
-            },
-        },
-        InternalOutcome::Done => HostOutcome::Done,
+        StepOutcome::Done(_) => HostOutcome::Done,
+        StepOutcome::Ready => HostOutcome::Advanced,
+        StepOutcome::Blocked { newly_pending } => {
+            let reference = newly_pending.first().or_else(|| pending.first());
+            match reference {
+                Some(p) => HostOutcome::Suspended {
+                    reason: p.reason.to_string(),
+                    at: pending_to_location(&p.at),
+                },
+                None => HostOutcome::Suspended {
+                    reason: "waiting".into(),
+                    at: HostLocation {
+                        node: 0,
+                        path: Vec::new(),
+                        depth: 0,
+                        frame: None,
+                        iteration: None,
+                    },
+                },
+            }
+        }
+    }
+}
+
+fn pending_to_location(ctx: &dsl_kit::NodeContext) -> HostLocation {
+    HostLocation {
+        node: ctx.node.0,
+        path: ctx.path.0.iter().map(|n| n.0).collect(),
+        depth: ctx.depth,
+        frame: ctx.frame.map(|f| f.0),
+        iteration: ctx.iteration.map(|i| i.0),
     }
 }

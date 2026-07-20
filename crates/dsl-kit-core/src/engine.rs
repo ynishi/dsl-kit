@@ -40,9 +40,10 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::{
-    CancelReason, ChildIndex, EngineError, EnvRef, FailPolicy, Frame, FrameTree, JoinPolicy,
-    JoinShape, NodeContext, NodeId, ParFrame, Path, Pending, ReducerHandle, ReducerId,
-    ReducerRegistry, StepOutcome, Stepper, SuspendReason, SuspensionId,
+    BreakpointSet, CancelReason, ChildIndex, CountingSink, EngineError, EnvRef, Event, EventSink,
+    FailPolicy, Frame, FrameTree, JoinPolicy, JoinShape, NodeContext, NodeId, ParFrame, Path,
+    Pending, ReducerHandle, ReducerId, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
+    SuspensionId,
 };
 
 /// Composite error returned by the [`Engine`] via [`Stepper::Error`].
@@ -103,6 +104,9 @@ pub trait Ast {
     type Delta: Clone + Default + Debug;
     /// Effect-side failure the host reports through `resolve`.
     type EffectError: std::error::Error + Clone + Send + Sync + 'static;
+    /// Per-frame cursor surfaced through the projected [`FrameTree`].
+    /// Use `()` when the DSL has no per-node cursor state.
+    type Cursor: Clone + Debug + Default;
 
     /// Root node the engine anchors its interpretation on.
     fn root(&self) -> NodeId;
@@ -285,6 +289,18 @@ pub struct Engine<A: Ast> {
     next_sid: u64,
     done: bool,
     root_value: Option<A::Value>,
+
+    /// Silent event counter used as the engine's default observation
+    /// channel (design doc §5.1). Exposed through [`Engine::events`] so
+    /// hosts can produce a lightweight activity summary without wiring
+    /// a custom sink.
+    events: CountingSink,
+
+    /// Synthetic pending id emitted by [`Engine::step_with_breakpoints`]
+    /// when the peek-ahead saw a breakpoint match. The next call to
+    /// `step_with_breakpoints` drops the marker before delegating to
+    /// [`Engine::step`] so the previously-halted spawn proceeds.
+    pending_bp: Option<SuspensionId>,
 }
 
 impl<A: Ast> Engine<A> {
@@ -311,11 +327,191 @@ impl<A: Ast> Engine<A> {
             next_sid: 1,
             done: false,
             root_value: None,
+            events: CountingSink::default(),
+            pending_bp: None,
         };
         let root_path = Path::root().push(root_id);
         let root_frame = engine.spawn_frame(root_id, root_path)?;
         engine.root = root_frame;
+        // `spawn_frame` emits `VisitPre` for every frame it constructs.
+        // Design doc §5.1 defines the event stream as "as it walks",
+        // i.e. as an artefact of `step()` — construction is not part of
+        // the walk. Zero the counter here so the freshly-built engine
+        // reports an empty histogram until the first `step`.
+        engine.events = CountingSink::default();
         Ok(engine)
+    }
+
+    // ---- Public projections (debugger convenience, not on Stepper) --
+
+    /// Snapshot of the engine's event counter. Exposed for hosts that
+    /// want to surface a lightweight activity histogram (see
+    /// [`CountingSink::summarise`]).
+    pub fn events(&self) -> &CountingSink {
+        &self.events
+    }
+
+    /// Convenience wrapper around [`CountingSink::summarise`].
+    pub fn event_summary(&self) -> String {
+        self.events.summarise()
+    }
+
+    /// Path of the currently-active leaf (a `Pending`, or the next node
+    /// the engine would spawn). Returns `None` when the interpretation
+    /// has completed or nothing is live.
+    pub fn current_path(&self) -> Option<Path> {
+        if let Some(p) = self.pending.first() {
+            return Some(p.at.path.clone());
+        }
+        if self.done {
+            return None;
+        }
+        self.peek_next_spawn().map(|ctx| ctx.path)
+    }
+
+    /// Depth of [`Self::current_path`] (`0` when the interpretation is
+    /// idle or complete).
+    pub fn depth(&self) -> usize {
+        self.current_path().map(|p| p.depth()).unwrap_or(0)
+    }
+
+    /// If the engine is currently blocked on a single `Call` suspension
+    /// (the common non-fan-out case), returns `(sid, node_id, label)`.
+    /// Returns `None` when there are zero or more than one pending
+    /// suspensions, or when the sole pending is a non-`Call` reason
+    /// (breakpoint / cooperative / user).
+    pub fn suspended_call(&self) -> Option<(SuspensionId, NodeId, &str)> {
+        if self.pending.len() != 1 {
+            return None;
+        }
+        let p = &self.pending[0];
+        match &p.reason {
+            SuspendReason::Call { spec } => Some((p.id, p.at.node, spec.label.as_str())),
+            _ => None,
+        }
+    }
+
+    // ---- Breakpoint-aware stepping ---------------------------------
+
+    /// Same as [`Stepper::step`] but yields a synthetic
+    /// `Pending { reason: Breakpoint }` on the call before advancing
+    /// into a node whose context matches any entry in `bps`.
+    ///
+    /// The yield is one-shot: the next call to `step_with_breakpoints`
+    /// drops the marker and proceeds. Breakpoint checking currently
+    /// covers frames that are spawned lazily on entry (`Seq` children,
+    /// `Scope` bodies, `Maybe` bodies, and the root); the eager-spawn
+    /// cascade under `Par` construction is not inspected because those
+    /// children are all committed to the frame arena in one atomic
+    /// spawn — matching a `Par` kid's ctx is a known follow-up (Round
+    /// 15 handoff note).
+    pub fn step_with_breakpoints(
+        &mut self,
+        bps: &BreakpointSet,
+    ) -> Result<StepOutcome<A::Value>, ExecError<A::EffectError>> {
+        // Resume: previous call yielded on BP — drop the synthetic
+        // pending and delegate to the normal step().
+        if let Some(sid) = self.pending_bp.take() {
+            self.pending.retain(|p| p.id != sid);
+            self.newly_pending.retain(|p| p.id != sid);
+            return self.step();
+        }
+        if !bps.is_empty() {
+            if let Some(ctx) = self.peek_next_spawn() {
+                if !bps.matches(&ctx).is_empty() {
+                    let sid = SuspensionId(self.next_sid);
+                    self.next_sid += 1;
+                    let pending = Pending {
+                        id: sid,
+                        reason: SuspendReason::Breakpoint,
+                        at: ctx.clone(),
+                    };
+                    self.pending.push(pending.clone());
+                    self.pending_bp = Some(sid);
+                    self.events.emit(&Event::Suspend {
+                        at: ctx,
+                        reason: SuspendReason::Breakpoint,
+                    });
+                    return Ok(StepOutcome::Blocked {
+                        newly_pending: SmallVec::from_iter([pending]),
+                    });
+                }
+            }
+        }
+        self.step()
+    }
+
+    /// Loop [`Self::step_with_breakpoints`] until it returns anything
+    /// other than [`StepOutcome::Ready`].
+    pub fn run_to_yield_with_breakpoints(
+        &mut self,
+        bps: &BreakpointSet,
+    ) -> Result<StepOutcome<A::Value>, ExecError<A::EffectError>> {
+        loop {
+            match self.step_with_breakpoints(bps)? {
+                StepOutcome::Ready => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// The node context that the next `step()` call would spawn a
+    /// frame at, if any. Used by [`Self::step_with_breakpoints`] to
+    /// decide whether to yield a synthetic breakpoint before advancing.
+    fn peek_next_spawn(&self) -> Option<NodeContext> {
+        self.peek_at(self.root)
+    }
+
+    fn peek_at(&self, h: FrameHandle) -> Option<NodeContext> {
+        match self.get(h) {
+            InternalFrame::Seq {
+                current,
+                children,
+                next_child,
+                path,
+                ..
+            } => {
+                if let Some(c) = current {
+                    match self.get(*c) {
+                        InternalFrame::Value { .. } => {
+                            // Seq about to advance — peek at next child.
+                            children.get(*next_child).map(|next_id| {
+                                let child_path = path.push(*next_id);
+                                Self::synthetic_ctx(*next_id, child_path)
+                            })
+                        }
+                        InternalFrame::Cancelled { .. } | InternalFrame::Failed { .. } => None,
+                        _ => self.peek_at(*c),
+                    }
+                } else {
+                    children.get(*next_child).map(|next_id| {
+                        let child_path = path.push(*next_id);
+                        Self::synthetic_ctx(*next_id, child_path)
+                    })
+                }
+            }
+            InternalFrame::Par { children, .. } => {
+                children.iter().find_map(|c| self.peek_at(*c))
+            }
+            InternalFrame::Scope { body, .. } => self.peek_at(*body),
+            InternalFrame::Maybe { body: Some(b), .. } => self.peek_at(*b),
+            InternalFrame::Pending { .. }
+            | InternalFrame::Value { .. }
+            | InternalFrame::Failed { .. }
+            | InternalFrame::Cancelled { .. }
+            | InternalFrame::Maybe { body: None, .. } => None,
+        }
+    }
+
+    fn synthetic_ctx(node: NodeId, path: Path) -> NodeContext {
+        let depth = path.depth() as u32;
+        NodeContext {
+            node,
+            path,
+            frame: None,
+            depth,
+            iteration: None,
+        }
     }
 
     // ---- Arena helpers ---------------------------------------------
@@ -346,6 +542,9 @@ impl<A: Ast> Engine<A> {
         node_id: NodeId,
         path: Path,
     ) -> Result<FrameHandle, EngineError> {
+        self.events.emit(&Event::VisitPre {
+            at: Self::synthetic_ctx(node_id, path.clone()),
+        });
         match self.ast.node_kind(node_id) {
             NodeKind::Seq { children } => {
                 let frame = InternalFrame::Seq {
@@ -439,6 +638,10 @@ impl<A: Ast> Engine<A> {
                     label: label.clone(),
                     payload: serde_json::Value::Null,
                 };
+                self.events.emit(&Event::Suspend {
+                    at: ctx.clone(),
+                    reason: SuspendReason::Call { spec: spec.clone() },
+                });
                 let pending = Pending {
                     id: sid,
                     reason: SuspendReason::Call { spec },
@@ -605,6 +808,11 @@ impl<A: Ast> Engine<A> {
         };
         if let Some(next_id) = next_id {
             let child_path = path.push(next_id);
+            // `next_child` here is the index the child about to spawn
+            // occupies (0-based); increment for IterationTick display.
+            self.events.emit(&Event::IterationTick {
+                at: Self::synthetic_ctx(node, path.clone()),
+            });
             let child = self.spawn_frame(next_id, child_path)?;
             self.set_parent(child, h);
             if let InternalFrame::Seq {
@@ -617,14 +825,18 @@ impl<A: Ast> Engine<A> {
             Ok(true)
         } else {
             // No more children — promote Seq to a Value.
-            let last = if let InternalFrame::Seq { last_value, .. } = self.get(h) {
-                last_value.clone()
+            let last = if let InternalFrame::Seq { last_value, path, .. } = self.get(h) {
+                (last_value.clone(), path.clone())
             } else {
                 unreachable!()
             };
-            let value = last.unwrap_or_else(|| self.ast.unit_value());
+            let (last_value, path) = last;
+            let value = last_value.unwrap_or_else(|| self.ast.unit_value());
             let promoted = InternalFrame::Value { node, value: value.clone() };
             *self.get_mut(h) = promoted;
+            self.events.emit(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
             self.notify_par_slot(h, value);
             let _ = (next_child, children_len);
             Ok(true)
@@ -632,8 +844,9 @@ impl<A: Ast> Engine<A> {
     }
 
     fn try_scope_promote(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
-        let (node, body) = if let InternalFrame::Scope { node, body, .. } = self.get(h) {
-            (*node, *body)
+        let (node, body, path) = if let InternalFrame::Scope { node, body, path, .. } = self.get(h)
+        {
+            (*node, *body, path.clone())
         } else {
             unreachable!()
         };
@@ -641,6 +854,9 @@ impl<A: Ast> Engine<A> {
             let value = value.clone();
             self.vacate(body);
             *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
+            self.events.emit(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
             self.notify_par_slot(h, value);
             return Ok(true);
         }
@@ -648,8 +864,9 @@ impl<A: Ast> Engine<A> {
     }
 
     fn try_maybe_promote(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
-        let (node, body) = if let InternalFrame::Maybe { node, body, .. } = self.get(h) {
-            (*node, *body)
+        let (node, body, path) = if let InternalFrame::Maybe { node, body, path, .. } = self.get(h)
+        {
+            (*node, *body, path.clone())
         } else {
             unreachable!()
         };
@@ -670,6 +887,9 @@ impl<A: Ast> Engine<A> {
                 self.vacate(body);
             }
             *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
+            self.events.emit(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
             self.notify_par_slot(h, v);
             return Ok(true);
         }
@@ -754,10 +974,11 @@ impl<A: Ast> Engine<A> {
     /// Fold a fireable Par, mark losers as cancelled, promote to Value.
     fn fire_par(&mut self, h: FrameHandle) -> Result<StepStep<A::Value>, EngineError> {
         // Extract fields.
-        let (node, policy, reducer, slots, failures, deltas, completion_order, children) = {
+        let (node, path, policy, reducer, slots, failures, deltas, completion_order, children) = {
             let f = self.get(h);
             if let InternalFrame::Par {
                 node,
+                path,
                 policy,
                 reducer,
                 slots,
@@ -770,6 +991,7 @@ impl<A: Ast> Engine<A> {
             {
                 (
                     *node,
+                    path.clone(),
                     *policy,
                     reducer.clone(),
                     slots.clone(),
@@ -833,6 +1055,9 @@ impl<A: Ast> Engine<A> {
 
         // Mark Par as joined + promote to Value.
         *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
+        self.events.emit(&Event::VisitPost {
+            at: Self::synthetic_ctx(node, path),
+        });
         // If this Par sits inside another Par slot, notify.
         self.notify_par_slot(h, value);
 
@@ -922,6 +1147,7 @@ impl<A: Ast> Engine<A> {
                 self.newly_pending.retain(|p| p.id != sid);
                 self.sid_to_frame.remove(&sid);
                 self.cancellations.push(sid);
+                self.events.emit(&Event::Cancel { id: sid });
                 *self.get_mut(h) = InternalFrame::Cancelled { node, reason };
                 return;
             }
@@ -973,7 +1199,7 @@ impl<A: Ast> Engine<A> {
     fn project_tree(
         &self,
         h: FrameHandle,
-    ) -> FrameTree<A::Value, (), A::Delta, A::EffectError> {
+    ) -> FrameTree<A::Value, A::Cursor, A::Delta, A::EffectError> {
         match self.get(h) {
             InternalFrame::Seq { children, current, node, path, .. } => {
                 // Project each spawned child (only the current one is
@@ -990,7 +1216,7 @@ impl<A: Ast> Engine<A> {
                             delta: A::Delta::default(),
                             parent: None,
                         })),
-                        cursor: (),
+                        cursor: A::Cursor::default(),
                     },
                     kids,
                 }
@@ -1091,7 +1317,7 @@ impl<A: Ast> std::fmt::Debug for Engine<A> {
 
 impl<A: Ast> Stepper for Engine<A> {
     type Value = A::Value;
-    type Cursor = ();
+    type Cursor = A::Cursor;
     type Delta = A::Delta;
     type EffectError = A::EffectError;
     type Error = ExecError<A::EffectError>;
@@ -1169,14 +1395,16 @@ impl<A: Ast> Stepper for Engine<A> {
 
         match result {
             Ok(v) => {
-                let (node, _path) = if let InternalFrame::Pending { node, path, .. } = self.get(h)
-                {
+                let (node, path) = if let InternalFrame::Pending { node, path, .. } = self.get(h) {
                     (*node, path.clone())
                 } else {
                     return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
                 };
+                let ctx = Self::synthetic_ctx(node, path);
+                self.events.emit(&Event::Resume { at: ctx.clone() });
                 // Replace leaf with Value.
                 *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
+                self.events.emit(&Event::VisitPost { at: ctx });
                 // If parent is a Par, fill the slot.
                 if let Some(&parent) = self.parent.get(&h) {
                     if let InternalFrame::Par { children, slots, completion_order, .. } =
@@ -1397,6 +1625,7 @@ mod tests {
         type Value = V;
         type Delta = ();
         type EffectError = EE;
+        type Cursor = ();
 
         fn root(&self) -> NodeId {
             self.root_id
