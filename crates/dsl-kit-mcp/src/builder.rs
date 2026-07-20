@@ -39,8 +39,9 @@ use std::sync::Arc;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, JsonObject, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResult, Content, JsonObject, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -50,6 +51,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::host::DslHost;
+use crate::resources::{ResourceEntry, kit_resources};
 
 /// Per-call context handed to every tool handler.
 ///
@@ -100,6 +102,8 @@ impl RegisteredTool {
 pub struct DslMcpBuilder {
     instructions: Option<String>,
     tools: Vec<RegisteredTool>,
+    expose_kit_resources: bool,
+    extra_resources: Vec<ResourceEntry>,
 }
 
 impl Default for DslMcpBuilder {
@@ -110,8 +114,41 @@ impl Default for DslMcpBuilder {
 
 impl DslMcpBuilder {
     /// Creates an empty builder.
+    ///
+    /// By default, the built server exposes the kit-layer resources
+    /// (`dsl-kit://kit/*`). Call [`without_kit_resources`](Self::without_kit_resources)
+    /// to suppress them; call [`resource`](Self::resource) to add DSL-
+    /// layer entries.
     pub fn new() -> Self {
-        Self { instructions: None, tools: Vec::new() }
+        Self {
+            instructions: None,
+            tools: Vec::new(),
+            expose_kit_resources: true,
+            extra_resources: Vec::new(),
+        }
+    }
+
+    /// Suppresses the built-in `dsl-kit://kit/*` resources on the
+    /// built server. Use when a custom server does not want the kit
+    /// authoring guides bleeding into its own resource surface.
+    pub fn without_kit_resources(mut self) -> Self {
+        self.expose_kit_resources = false;
+        self
+    }
+
+    /// Registers an additional MCP resource entry. The URI namespace
+    /// is at the caller's discretion; `dsl-kit://dsl/*` is the
+    /// recommended prefix for DSL-layer entries but any URI is
+    /// accepted.
+    pub fn resource(mut self, entry: ResourceEntry) -> Self {
+        self.extra_resources.push(entry);
+        self
+    }
+
+    /// Bulk variant of [`resource`](Self::resource).
+    pub fn resources(mut self, entries: impl IntoIterator<Item = ResourceEntry>) -> Self {
+        self.extra_resources.extend(entries);
+        self
     }
 
     /// Sets the server's `instructions` field (shown to MCP clients as
@@ -225,9 +262,16 @@ impl DslMcpBuilder {
 
     /// Finalizes the builder.
     pub fn build(self) -> DslMcpServer {
+        let mut resources = if self.expose_kit_resources {
+            kit_resources()
+        } else {
+            Vec::new()
+        };
+        resources.extend(self.extra_resources);
         DslMcpServer {
             instructions: self.instructions,
             tools: Arc::new(self.tools),
+            resources: Arc::new(resources),
         }
     }
 }
@@ -240,15 +284,74 @@ impl DslMcpBuilder {
 pub struct DslMcpServer {
     instructions: Option<String>,
     tools: Arc<Vec<RegisteredTool>>,
+    resources: Arc<Vec<ResourceEntry>>,
+}
+
+impl DslMcpServer {
+    /// Number of registered resources (for tests / introspection).
+    pub fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
 }
 
 impl ServerHandler for DslMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: self.instructions.clone(),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             ..Default::default()
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let resources: Vec<Resource> = self
+            .resources
+            .iter()
+            .map(|e| Resource {
+                raw: RawResource {
+                    uri: e.uri.clone(),
+                    name: e.title.clone(),
+                    title: Some(e.title.clone()),
+                    description: Some(e.description.clone()),
+                    mime_type: Some(e.mime_type.clone()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                annotations: None,
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let entry = self
+            .resources
+            .iter()
+            .find(|e| e.uri == request.uri)
+            .ok_or_else(|| {
+                McpError::resource_not_found(
+                    format!("unknown resource uri: {}", request.uri),
+                    None,
+                )
+            })?;
+        let body = entry
+            .read()
+            .map_err(|e| McpError::internal_error(format!("read resource: {e}"), None))?;
+        Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(body, entry.uri.clone())],
+        })
     }
 
     async fn list_tools(
@@ -328,6 +431,41 @@ mod tests {
         let args = serde_json::json!({ "message": "world" });
         let result = (tool.handler)(args, ToolCtx).await.expect("handler ok");
         assert_eq!(result, serde_json::json!({ "echoed": "hi, world" }));
+    }
+
+    #[tokio::test]
+    async fn builder_exposes_kit_resources_by_default() {
+        let server = DslMcpBuilder::new().build();
+        let uris: Vec<&str> = server.resources.iter().map(|e| e.uri.as_str()).collect();
+        assert!(uris.contains(&"dsl-kit://kit/intro"));
+        assert!(uris.contains(&"dsl-kit://kit/error-catalog"));
+    }
+
+    #[tokio::test]
+    async fn builder_without_kit_resources_strips_kit_layer() {
+        let server = DslMcpBuilder::new().without_kit_resources().build();
+        for entry in server.resources.iter() {
+            assert!(
+                !entry.uri.starts_with("dsl-kit://kit/"),
+                "kit uri leaked: {}",
+                entry.uri
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_resource_method_appends_entries() {
+        let server = DslMcpBuilder::new()
+            .without_kit_resources()
+            .resource(ResourceEntry::static_markdown(
+                "example://guide/hello",
+                "hello guide",
+                "toy resource",
+                "hello world",
+            ))
+            .build();
+        assert_eq!(server.resource_count(), 1);
+        assert_eq!(server.resources[0].uri, "example://guide/hello");
     }
 
     #[tokio::test]

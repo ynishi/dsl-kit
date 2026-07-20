@@ -189,6 +189,36 @@ async fn explain_rejects_unknown_code() {
 }
 
 #[tokio::test]
+async fn resources_default_includes_kit_and_dsl_layers() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
+    let entries = handler.all_resources().await;
+    let uris: Vec<&str> = entries.iter().map(|e| e.uri.as_str()).collect();
+    assert!(uris.contains(&"dsl-kit://kit/intro"), "missing kit intro");
+    assert!(uris.contains(&"dsl-kit://kit/error-catalog"), "missing kit error-catalog");
+    assert!(uris.contains(&"dsl-kit://dsl/flow/grammar"), "missing flow grammar");
+    assert!(
+        uris.contains(&"dsl-kit://dsl/flow/samples/research-pipeline"),
+        "missing flow sample"
+    );
+}
+
+#[tokio::test]
+async fn without_kit_resources_drops_kit_layer_only() {
+    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()))
+        .without_kit_resources();
+    let entries = handler.all_resources().await;
+    for entry in &entries {
+        assert!(
+            !entry.uri.starts_with("dsl-kit://kit/"),
+            "kit layer leaked through opt-out: {}",
+            entry.uri
+        );
+    }
+    // Layer B (dsl-kit://dsl/*) must still be present.
+    assert!(entries.iter().any(|e| e.uri.starts_with("dsl-kit://dsl/")));
+}
+
+#[tokio::test]
 async fn reset_starts_from_scratch() {
     let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let _ = call_step(&handler, "to_done").await;

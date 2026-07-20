@@ -169,4 +169,19 @@ pub trait DslHost: Send + Sync {
     fn catalog(&self) -> Vec<dsl_kit::ErrorCatalogEntry> {
         Vec::new()
     }
+
+    /// DSL-layer MCP resources this host contributes.
+    ///
+    /// These entries are for AI or humans **writing programs in** the
+    /// loaded DSL (grammar references, sample programs, tool
+    /// extensions). The recommended URI prefix is
+    /// [`crate::DSL_URI_PREFIX`] (`dsl-kit://dsl/`) but any URI is
+    /// accepted. The default returns an empty vector.
+    ///
+    /// Kit-layer entries (`dsl-kit://kit/*`) are supplied by
+    /// [`crate::kit_resources`] and merged separately by the handler /
+    /// builder; hosts do not need to include them here.
+    fn resources(&self) -> Vec<crate::ResourceEntry> {
+        Vec::new()
+    }
 }

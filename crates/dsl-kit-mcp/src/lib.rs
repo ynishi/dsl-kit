@@ -15,6 +15,7 @@ pub mod builder;
 pub mod flow_host;
 pub mod handler;
 pub mod host;
+pub mod resources;
 
 pub use builder::{DslMcpBuilder, DslMcpServer, ToolCtx};
 pub use flow_host::FlowHost;
@@ -22,3 +23,4 @@ pub use handler::DslMcpHandler;
 pub use host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, ResolvedCall, SuspendedCall,
 };
+pub use resources::{DSL_URI_PREFIX, KIT_URI_PREFIX, ResourceBody, ResourceEntry, kit_resources};

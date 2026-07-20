@@ -25,16 +25,22 @@ use std::sync::Arc;
 
 use dsl_kit::{BreakCondition, BreakpointId, BreakpointSet, NodeId, Path};
 use rmcp::{
-    ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    model::{
+        ListResourcesResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+    },
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::host::{DslHost, HostOutcome};
+use crate::resources::{ResourceEntry, kit_resources};
 
 // ---------- Parameter types ---------------------------------------------
 
@@ -105,15 +111,47 @@ struct HandlerState {
 pub struct DslMcpHandler {
     tool_router: ToolRouter<Self>,
     state: Arc<Mutex<HandlerState>>,
+    expose_kit_resources: bool,
 }
 
 impl DslMcpHandler {
     /// Builds a handler around any [`DslHost`] implementation.
+    ///
+    /// By default both kit-layer resources (`dsl-kit://kit/*`) and any
+    /// host-contributed DSL-layer resources
+    /// (`dsl-kit://dsl/*` by convention) are exposed via
+    /// `list_resources` / `read_resource`. Use
+    /// [`without_kit_resources`](Self::without_kit_resources) to strip
+    /// the kit layer.
     pub fn new(host: Box<dyn DslHost>) -> Self {
         Self {
             tool_router: Self::tool_router(),
             state: Arc::new(Mutex::new(HandlerState { host, breakpoints: BreakpointSet::new() })),
+            expose_kit_resources: true,
         }
+    }
+
+    /// Suppresses the built-in `dsl-kit://kit/*` resources.
+    ///
+    /// Useful for custom MCP servers that want a clean resource surface
+    /// containing only their own DSL-layer entries.
+    pub fn without_kit_resources(mut self) -> Self {
+        self.expose_kit_resources = false;
+        self
+    }
+
+    /// Returns the full resource catalogue this handler exposes, in
+    /// the order it appears in `list_resources` (kit layer first, then
+    /// host-contributed entries).
+    pub async fn all_resources(&self) -> Vec<ResourceEntry> {
+        let mut all = if self.expose_kit_resources {
+            kit_resources()
+        } else {
+            Vec::new()
+        };
+        let guard = self.state.lock().await;
+        all.extend(guard.host.resources());
+        all
     }
 }
 
@@ -329,9 +367,54 @@ impl ServerHandler for DslMcpHandler {
                  6. dsl_kit_reset to start over."
                     .into(),
             ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             ..Default::default()
         }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let entries = self.all_resources().await;
+        let resources: Vec<Resource> = entries
+            .iter()
+            .map(|e| Resource {
+                raw: RawResource {
+                    uri: e.uri.clone(),
+                    name: e.title.clone(),
+                    title: Some(e.title.clone()),
+                    description: Some(e.description.clone()),
+                    mime_type: Some(e.mime_type.clone()),
+                    size: None,
+                    icons: None,
+                    meta: None,
+                },
+                annotations: None,
+            })
+            .collect();
+        Ok(ListResourcesResult::with_all_items(resources))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let entries = self.all_resources().await;
+        let entry = entries.iter().find(|e| e.uri == request.uri).ok_or_else(|| {
+            McpError::resource_not_found(format!("unknown resource uri: {}", request.uri), None)
+        })?;
+        let body = entry
+            .read()
+            .map_err(|e| McpError::internal_error(format!("read resource: {e}"), None))?;
+        Ok(ReadResourceResult {
+            contents: vec![ResourceContents::text(body, entry.uri.clone())],
+        })
     }
 }
 

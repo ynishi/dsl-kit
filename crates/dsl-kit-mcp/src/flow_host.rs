@@ -11,6 +11,11 @@ use dsl_kit_flow::{Flow, FlowStepper, canned_response, pretty, research_pipeline
 use crate::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, ResolvedCall, SuspendedCall,
 };
+use crate::resources::ResourceEntry;
+
+const FLOW_GRAMMAR: &str = include_str!("./resources_data/flow/grammar.md");
+const FLOW_RESEARCH_PIPELINE: &str =
+    include_str!("./resources_data/flow/research-pipeline.md");
 
 /// `DslHost` that owns a leaked-static [`Flow`] program plus its
 /// stepper.
@@ -155,6 +160,23 @@ impl DslHost for FlowHost {
 
     fn reset(&mut self) {
         self.stepper = FlowStepper::new(self.program);
+    }
+
+    fn resources(&self) -> Vec<ResourceEntry> {
+        vec![
+            ResourceEntry::static_markdown(
+                "dsl-kit://dsl/flow/grammar",
+                "flow DSL — grammar",
+                "The five variants of the flow enum (Seq / Par / Call / Scope / Maybe) with their semantics and node-id contract.",
+                FLOW_GRAMMAR,
+            ),
+            ResourceEntry::static_markdown(
+                "dsl-kit://dsl/flow/samples/research-pipeline",
+                "flow DSL — research_pipeline sample",
+                "The default program FlowHost loads: a Seq wrapping a Par of three searches plus a Maybe citation check. Structure, source, and drive-to-done walkthrough.",
+                FLOW_RESEARCH_PIPELINE,
+            ),
+        ]
     }
 }
 
