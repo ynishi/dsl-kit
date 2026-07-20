@@ -1,0 +1,13 @@
+[package]
+name = "expr-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "DslHost adapter around expr-dsl. Second reference implementation showing that DslMcpHandler is DSL-agnostic."
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-mcp  = { workspace = true }
+expr-dsl     = { workspace = true }
+async-trait  = "0.1"

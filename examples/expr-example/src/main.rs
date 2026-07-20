@@ -15,7 +15,8 @@
 
 use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId, StepOutcome, Stepper};
 use dsl_kit_mcp::host::DslHost;
-use expr_example::{ExprHost, demo_program, evaluate_all, pretty};
+use expr_dsl::{demo_program, evaluate_all, pretty};
+use expr_host::ExprHost;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
@@ -94,14 +95,14 @@ fn print_outcome(label: &str, outcome: &dsl_kit_mcp::host::HostOutcome) {
     }
 }
 
-fn find_var_node(expr: &expr_example::Expr, target: &str) -> Option<NodeId> {
+fn find_var_node(expr: &expr_dsl::Expr, target: &str) -> Option<NodeId> {
     use dsl_kit::{Phase, Walk};
     let mut found: Option<NodeId> = None;
     expr.walk(&mut |node, phase| {
         if phase != Phase::Pre {
             return;
         }
-        if let expr_example::Expr::Var { id, name } = node {
+        if let expr_dsl::Expr::Var { id, name } = node {
             if name == target && found.is_none() {
                 found = Some(*id);
             }

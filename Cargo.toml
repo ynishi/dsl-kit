@@ -10,6 +10,9 @@ members = [
     "examples/flow-example/crates/flow-host",
     "examples/flow-example/crates/flow-mcp",
     "examples/expr-example",
+    "examples/expr-example/crates/expr-dsl",
+    "examples/expr-example/crates/expr-host",
+    "examples/expr-example/crates/expr-mcp",
     "examples/custom-mcp-example",
 ]
 
@@ -25,3 +28,5 @@ dsl-kit        = { path = "crates/dsl-kit",        version = "0.0.0" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.0.0" }
 flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.0.0" }
 flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.0.0" }
+expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.0.0" }
+expr-host      = { path = "examples/expr-example/crates/expr-host", version = "0.0.0" }

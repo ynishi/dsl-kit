@@ -1,0 +1,11 @@
+[package]
+name = "expr-dsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Second reference DSL for dsl-kit: a tiny arithmetic expression language with unbound-variable suspensions. Example DSL, not part of the kit surface."
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-core = { workspace = true }

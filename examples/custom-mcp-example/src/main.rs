@@ -13,17 +13,43 @@
 //!   with `tool_from_host`, and each invocation runs the flow to
 //!   completion and returns its accumulated results.
 //!
+//! Also demonstrates the two resource-surface controls added in
+//! Round 10:
+//!
+//! - `.without_kit_resources()` strips the built-in
+//!   `dsl-kit://kit/*` guides so this custom server's `list_resources`
+//!   only shows what the server itself contributes.
+//! - `.resource(...)` registers one custom entry
+//!   (`example://guides/tool-usage`) explaining the three tools above.
+//!
 //! The example is what an author defining a custom DSL for their own
 //! problem would write: define the DSL AST + host in their crate,
 //! then hand it to the builder alongside any other typed-fn tools
 //! they want to expose. No `#[tool_router]` macro, no rmcp
 //! boilerplate.
 
-use dsl_kit_mcp::{DslMcpBuilder, ToolCtx};
+use dsl_kit_mcp::{DslMcpBuilder, ResourceEntry, ToolCtx};
 use flow_host::FlowHost;
 use rmcp::{ServiceExt, transport::stdio};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+const TOOL_USAGE_GUIDE: &str = r#"# custom-mcp-example — tool usage
+
+Three tools are registered by this server:
+
+- **echo** — `{ "message": "..." }` → echoes the message and reports
+  its Unicode length.
+- **sum** — `{ "numbers": [1, 2, 3], "start": 0 }` → sums the list,
+  optionally offset by `start`.
+- **research_pipeline** — no args. Runs the built-in flow-dsl
+  research pipeline to completion and returns per-node results.
+
+This guide is served as the `example://guides/tool-usage` resource
+via the `.resource(...)` builder API. The server also calls
+`.without_kit_resources()` so `dsl-kit://kit/*` entries do not appear
+alongside it.
+"#;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EchoArgs {
@@ -69,6 +95,13 @@ async fn main() -> anyhow::Result<()> {
              Shows two flavours of tool registration: typed-fn handlers \
              (echo, sum) and dsl-kit AST bodies (research_pipeline).",
         )
+        .without_kit_resources()
+        .resource(ResourceEntry::static_markdown(
+            "example://guides/tool-usage",
+            "custom-mcp-example — tool usage",
+            "How to call the three tools this server exposes.",
+            TOOL_USAGE_GUIDE,
+        ))
         .tool(
             "echo",
             "Echoes the supplied message back and reports its length.",

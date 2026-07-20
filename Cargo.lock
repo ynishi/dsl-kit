@@ -250,15 +250,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "expr-dsl"
+version = "0.0.0"
+dependencies = [
+ "dsl-kit",
+ "dsl-kit-core",
+]
+
+[[package]]
 name = "expr-example"
 version = "0.0.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
- "dsl-kit-core",
  "dsl-kit-mcp",
+ "expr-dsl",
+ "expr-host",
  "miette",
  "tokio",
+]
+
+[[package]]
+name = "expr-host"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "dsl-kit",
+ "dsl-kit-mcp",
+ "expr-dsl",
+]
+
+[[package]]
+name = "expr-mcp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "dsl-kit-mcp",
+ "expr-host",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
