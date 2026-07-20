@@ -411,8 +411,10 @@ mod tests {
 
     #[test]
     fn lint_json_reports_empty_seq_via_no_empty_many_children() {
-        // Build a program with an empty Seq — NoEmptyManyChildren should
-        // fire, and the diagnostic must flow through lint_json unchanged.
+        // Build a program with an empty inner Seq — NoEmptyManyChildren
+        // fires on it. NoRedundantWrap (R-24 default) also fires on the
+        // outer Seq (single Seq child of same variant). Both must reach
+        // the JSON envelope intact.
         let ids = IdGen::new();
         let empty_seq_id = ids.node();
         let program: &'static Flow = Box::leak(Box::new(Flow::Seq {
@@ -424,9 +426,13 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("lint_json must be valid JSON");
         let arr = value.as_array().expect("lint_json is a JSON array");
-        assert_eq!(arr.len(), 1, "diags = {arr:?}");
-        assert_eq!(arr[0]["rule"], "no-empty-many-children");
-        assert_eq!(arr[0]["severity"], "Error");
-        assert_eq!(arr[0]["node"], empty_seq_id.0);
+        // Assert the empty-seq diagnostic is present with the expected
+        // shape; other default rules may also fire (e.g. no-redundant-wrap).
+        let empty_seq_diag = arr
+            .iter()
+            .find(|d| d["rule"] == "no-empty-many-children")
+            .expect("no-empty-many-children entry present");
+        assert_eq!(empty_seq_diag["severity"], "Error");
+        assert_eq!(empty_seq_diag["node"], empty_seq_id.0);
     }
 }

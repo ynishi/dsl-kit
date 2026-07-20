@@ -172,14 +172,21 @@ impl<A: Walk> Linter<A> {
 impl<A: Walk + DslSchema> Linter<A> {
     /// Registers the built-in rule set — [`UniqueNodeIds`],
     /// [`MaxDepth`] with the [`MaxDepth::DEFAULT_LIMIT`],
-    /// [`MaxFanOut`] with the [`MaxFanOut::DEFAULT_LIMIT`], and
-    /// [`NoEmptyManyChildren`].
+    /// [`MaxFanOut`] with the [`MaxFanOut::DEFAULT_LIMIT`],
+    /// [`NoEmptyManyChildren`], and [`NoRedundantWrap`].
+    ///
+    /// [`DeadVariants`] is intentionally *not* included — perfectly
+    /// correct programs routinely exercise only a subset of a DSL's
+    /// variants, so a default `Info` flood would drown genuine
+    /// `Error` / `Warn` findings. Register it explicitly when a
+    /// review pass wants dead-code style diagnostics.
     pub fn with_defaults() -> Self {
         Self::new()
             .with_rule(UniqueNodeIds)
             .with_rule(MaxDepth::new(MaxDepth::DEFAULT_LIMIT))
             .with_rule(MaxFanOut::new(MaxFanOut::DEFAULT_LIMIT))
             .with_rule(NoEmptyManyChildren)
+            .with_rule(NoRedundantWrap)
     }
 }
 
@@ -394,6 +401,102 @@ impl<A: Walk + DslSchema> Rule<A> for NoEmptyManyChildren {
     }
 }
 
+/// Warns when a variant wraps exactly one child of the *same*
+/// variant with no other siblings — e.g. `Seq { children: [Seq {
+/// children: [...] }] }`. The outer wrap adds no structure and can
+/// be inlined into the inner one.
+///
+/// Uses [`dsl_kit_core::DslNode::variant_name`] to compare parent
+/// and child variants; needs no schema info beyond that (the rule is
+/// purely structural), but ships in the built-in Schema-aware
+/// bucket for consistency with the other post-R-22 rules.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRedundantWrap;
+
+impl NoRedundantWrap {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "no-redundant-wrap";
+}
+
+impl<A: Walk> Rule<A> for NoRedundantWrap {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        ast.walk(&mut |node, phase| {
+            if phase != Phase::Pre {
+                return;
+            }
+            let kids = node.children();
+            if kids.len() != 1 {
+                return;
+            }
+            let parent = node.variant_name();
+            let child = kids[0].variant_name();
+            if parent == child {
+                ctx.report(
+                    Self::NAME,
+                    Severity::Warn,
+                    node.node_id(),
+                    format!(
+                        "{parent} wraps a single {child}; the outer wrap can be inlined"
+                    ),
+                );
+            }
+        });
+    }
+}
+
+/// Reports every schema variant that never appears in the AST as an
+/// `Info` diagnostic anchored to the root node.
+///
+/// Useful for review passes (dead-code style — which parts of the
+/// DSL is this program actually exercising?) and for catching stale
+/// schema entries that reference variants nothing in the codebase
+/// constructs anymore.
+///
+/// Opt-in only — not registered by [`Linter::with_defaults`], since
+/// perfectly correct programs routinely exercise only a subset of a
+/// DSL's variants and flooding every default pass with `Info`
+/// diagnostics would drown genuine `Error` / `Warn` findings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeadVariants;
+
+impl DeadVariants {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "dead-variants";
+}
+
+impl<A: Walk + DslSchema> Rule<A> for DeadVariants {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        let schema = A::schema();
+        let declared: HashSet<String> =
+            schema.variants.iter().map(|v| v.name.clone()).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        ast.walk(&mut |node, phase| {
+            if phase != Phase::Pre {
+                return;
+            }
+            seen.insert(node.variant_name().to_string());
+        });
+        let mut dead: Vec<String> = declared.difference(&seen).cloned().collect();
+        dead.sort();
+        for name in dead {
+            ctx.report(
+                Self::NAME,
+                Severity::Info,
+                ast.node_id(),
+                format!("schema variant {name} is not present in the AST"),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +689,121 @@ mod tests {
             .lint(&ast);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].node, NodeId(2));
+    }
+
+    #[test]
+    fn no_redundant_wrap_fires_on_parent_wrapping_single_same_variant_child() {
+        // node(1, [node(2, [leaf(3)])]) — outer has 1 child of same
+        // "Node" variant → fires on id=1.
+        let ast = node(1, vec![node(2, vec![leaf(3)])]);
+        let diags = Linter::<Tiny>::new()
+            .with_rule(NoRedundantWrap)
+            .lint(&ast);
+        // Tiny only has one variant so every 1-child node fires. Both
+        // id=1 (children=[node(2,..)]) and id=2 (children=[leaf(3)])
+        // wrap a single Node.
+        assert_eq!(diags.len(), 2, "diags = {diags:?}");
+        assert!(diags.iter().all(|d| d.rule == NoRedundantWrap::NAME));
+        assert!(diags.iter().all(|d| d.severity == Severity::Warn));
+    }
+
+    #[test]
+    fn no_redundant_wrap_passes_on_multi_child_parent() {
+        // 2 children → not a single-wrap → no fire on root. Kids are
+        // leaves (0 children) → no fire on kids either.
+        let ast = node(1, vec![leaf(2), leaf(3)]);
+        let diags = Linter::<Tiny>::new()
+            .with_rule(NoRedundantWrap)
+            .lint(&ast);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_variants_reports_schema_variants_not_in_ast() {
+        // Tiny's schema has only "Node" → any ast covers all variants
+        // → no dead variants → no diagnostics.
+        let ast = leaf(1);
+        let diags = Linter::<Tiny>::new().with_rule(DeadVariants).lint(&ast);
+        assert!(diags.is_empty(), "diags = {diags:?}");
+    }
+
+    // A second toy AST with two variants — one always present, one
+    // never used — so we can exercise DeadVariants' positive path.
+    #[derive(Debug)]
+    enum TwoVar {
+        Alpha { id: NodeId },
+        #[allow(dead_code)]
+        Beta { id: NodeId },
+    }
+
+    impl DslNode for TwoVar {
+        fn node_id(&self) -> NodeId {
+            match self {
+                TwoVar::Alpha { id } | TwoVar::Beta { id } => *id,
+            }
+        }
+        fn variant_name(&self) -> &'static str {
+            match self {
+                TwoVar::Alpha { .. } => "Alpha",
+                TwoVar::Beta { .. } => "Beta",
+            }
+        }
+    }
+
+    impl Walk for TwoVar {
+        fn children(&self) -> Vec<&Self> {
+            Vec::new()
+        }
+    }
+
+    impl DslSchema for TwoVar {
+        fn schema() -> dsl_kit_schema::NodeSchema {
+            dsl_kit_schema::NodeSchema {
+                name: "TwoVar".into(),
+                variants: vec![
+                    dsl_kit_schema::VariantSchema {
+                        name: "Alpha".into(),
+                        fields: vec![],
+                        children: vec![],
+                    },
+                    dsl_kit_schema::VariantSchema {
+                        name: "Beta".into(),
+                        fields: vec![],
+                        children: vec![],
+                    },
+                ],
+            }
+        }
+    }
+
+    #[test]
+    fn dead_variants_fires_info_on_unused_variant() {
+        let ast = TwoVar::Alpha { id: NodeId(1) };
+        let diags = Linter::<TwoVar>::new().with_rule(DeadVariants).lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, DeadVariants::NAME);
+        assert_eq!(diags[0].severity, Severity::Info);
+        assert_eq!(diags[0].node, NodeId(1)); // anchored to root
+        assert!(diags[0].message.contains("Beta"));
+    }
+
+    #[test]
+    fn with_defaults_includes_no_redundant_wrap_but_not_dead_variants() {
+        // Redundant wrap: node(1, [leaf(2)]) — but leaf(2) is empty
+        // Node → also fires NoEmptyManyChildren (many-only). To
+        // isolate: use populated inner.
+        let ast = node(1, vec![node(2, vec![leaf(3)])]);
+        let diags = Linter::<Tiny>::with_defaults().lint(&ast);
+        // Should include no-redundant-wrap warnings but no dead-variants
+        // (Tiny has one variant so DeadVariants would find nothing
+        // dead anyway; the absence assertion protects intent).
+        assert!(
+            diags.iter().any(|d| d.rule == NoRedundantWrap::NAME),
+            "expected no-redundant-wrap in defaults, diags = {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.rule == DeadVariants::NAME),
+            "dead-variants should be opt-in only, diags = {diags:?}"
+        );
     }
 }

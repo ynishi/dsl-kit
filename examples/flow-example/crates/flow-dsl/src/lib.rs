@@ -1521,9 +1521,99 @@ mod tests {
             children: vec![Flow::Seq { id: empty_seq_id, children: vec![] }],
         };
         let diags = Linter::<Flow>::with_defaults().lint(&program);
-        // Only NoEmptyManyChildren should fire (other defaults are clean).
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].rule, "no-empty-many-children");
-        assert_eq!(diags[0].node, empty_seq_id);
+        // NoEmptyManyChildren fires on the empty inner Seq.
+        // NoRedundantWrap (R-24) also fires on the outer Seq (single
+        // Seq child of same variant). Both are expected under defaults.
+        assert!(
+            diags.iter().any(|d| d.rule == "no-empty-many-children"
+                && d.node == empty_seq_id),
+            "expected no-empty-many-children on empty inner Seq, diags = {diags:?}",
+        );
+    }
+
+    // ---------- R-24: NoRedundantWrap + DeadVariants -----------------
+
+    #[test]
+    fn no_redundant_wrap_fires_on_seq_wrapping_single_seq() {
+        use dsl_kit_lint::{Linter, NoRedundantWrap};
+
+        let ids = IdGen::new();
+        let outer_id = ids.node();
+        let program = Flow::Seq {
+            id: outer_id,
+            children: vec![Flow::Seq {
+                id: ids.node(),
+                children: vec![
+                    Flow::Call { id: ids.node(), label: "a".into() },
+                    Flow::Call { id: ids.node(), label: "b".into() },
+                ],
+            }],
+        };
+        let diags = Linter::<Flow>::new()
+            .with_rule(NoRedundantWrap)
+            .lint(&program);
+        assert_eq!(diags.len(), 1, "diags = {diags:?}");
+        assert_eq!(diags[0].rule, "no-redundant-wrap");
+        assert_eq!(diags[0].node, outer_id);
+    }
+
+    #[test]
+    fn no_redundant_wrap_passes_on_research_pipeline() {
+        // Reference program has no same-variant single-wrap sites.
+        use dsl_kit_lint::{Linter, NoRedundantWrap};
+
+        let ids = IdGen::new();
+        let program = research_pipeline(&ids);
+        let diags = Linter::<Flow>::new()
+            .with_rule(NoRedundantWrap)
+            .lint(&program);
+        assert!(diags.is_empty(), "diags = {diags:?}");
+    }
+
+    #[test]
+    fn dead_variants_reports_unused_flow_variants() {
+        // Program uses only Seq + Call → Par, Scope, Maybe are dead.
+        use dsl_kit_lint::{Linter, DeadVariants, Severity};
+
+        let ids = IdGen::new();
+        let root_id = ids.node();
+        let program = Flow::Seq {
+            id: root_id,
+            children: vec![Flow::Call { id: ids.node(), label: "only".into() }],
+        };
+        let diags = Linter::<Flow>::new()
+            .with_rule(DeadVariants)
+            .lint(&program);
+        assert_eq!(diags.len(), 3, "diags = {diags:?}");
+        assert!(diags.iter().all(|d| d.rule == "dead-variants"));
+        assert!(diags.iter().all(|d| d.severity == Severity::Info));
+        assert!(diags.iter().all(|d| d.node == root_id));
+        let dead_names: Vec<&str> = diags
+            .iter()
+            .map(|d| {
+                if d.message.contains("Par") { "Par" }
+                else if d.message.contains("Scope") { "Scope" }
+                else if d.message.contains("Maybe") { "Maybe" }
+                else { "?" }
+            })
+            .collect();
+        assert!(dead_names.contains(&"Par"));
+        assert!(dead_names.contains(&"Scope"));
+        assert!(dead_names.contains(&"Maybe"));
+    }
+
+    #[test]
+    fn dead_variants_is_not_in_defaults() {
+        use dsl_kit_lint::Linter;
+
+        let ids = IdGen::new();
+        let program = Flow::Call { id: ids.node(), label: "only".into() };
+        let diags = Linter::<Flow>::with_defaults().lint(&program);
+        // Should not include any dead-variants entries even though 4
+        // variants are unused; DeadVariants is opt-in only.
+        assert!(
+            !diags.iter().any(|d| d.rule == "dead-variants"),
+            "dead-variants must be opt-in, diags = {diags:?}",
+        );
     }
 }
