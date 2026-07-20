@@ -1,0 +1,11 @@
+[package]
+name = "flow-dsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Reference DSL for dsl-kit — Seq / Par / Call / Scope / Maybe with a stepper and canned effect responses. Example DSL, not part of the kit surface."
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-core = { workspace = true }

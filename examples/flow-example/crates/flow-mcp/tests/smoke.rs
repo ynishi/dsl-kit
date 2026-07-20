@@ -4,7 +4,8 @@
 //! round-trip; the goal is to catch schema / logic drift, not to
 //! exercise the transport (rmcp has its own tests for that).
 
-use dsl_kit_mcp::{DslMcpHandler, FlowHost};
+use dsl_kit_mcp::DslMcpHandler;
+use flow_host::FlowHost;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::Value;
 

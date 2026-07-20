@@ -40,7 +40,7 @@ tree the `dsl_kit_ast` MCP tool returns.
 
 ```rust,ignore
 use dsl_kit::IdGen;
-use dsl_kit_flow::Flow;
+use flow_dsl::Flow;
 
 let ids = IdGen::new();
 let program = Flow::Seq {

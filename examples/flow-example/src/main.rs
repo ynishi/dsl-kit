@@ -17,7 +17,7 @@ use dsl_kit::{
     AsyncStepper, BreakCondition, BreakpointId, BreakpointSet, DslNode, IdGen, NodeContext, NodeId,
     Path, StepOutcome, Stepper, Walk,
 };
-use dsl_kit_flow::{
+use flow_dsl::{
     Flow, FlowStepper, canned_response, check_unique_ids, pretty, research_pipeline,
 };
 use futures::future::join;

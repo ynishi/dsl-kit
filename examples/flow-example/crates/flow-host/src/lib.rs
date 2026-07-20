@@ -1,21 +1,22 @@
 //! Reference `DslHost` implementation over the flow DSL.
 //!
-//! This module wires the `dsl-kit-flow` reference DSL into the
-//! MCP handler. It exists both as the default binary payload
-//! (`dsl-kit-mcp` serves this host out of the box) and as a
-//! worked example for new DSL adapters.
+//! Wires the [`flow-dsl`](flow_dsl) reference DSL into
+//! [`dsl-kit-mcp`](dsl_kit_mcp). Consumed by the `flow-mcp` binary
+//! (default payload of the reference MCP server) and useful as a
+//! worked example when writing your own `DslHost` adapter.
+
+#![warn(missing_docs)]
 
 use dsl_kit::{BreakpointSet, DslNode, IdGen, Phase, StepOutcome, Walk};
-use dsl_kit_flow::{Flow, FlowStepper, canned_response, pretty, research_pipeline};
-
-use crate::host::{
+use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, ResolvedCall, SuspendedCall,
 };
-use crate::resources::ResourceEntry;
+use dsl_kit_mcp::resources::ResourceEntry;
+use flow_dsl::{Flow, FlowStepper, canned_response, pretty, research_pipeline};
 
-const FLOW_GRAMMAR: &str = include_str!("./resources_data/flow/grammar.md");
+const FLOW_GRAMMAR: &str = include_str!("./resources_data/grammar.md");
 const FLOW_RESEARCH_PIPELINE: &str =
-    include_str!("./resources_data/flow/research-pipeline.md");
+    include_str!("./resources_data/research-pipeline.md");
 
 /// `DslHost` that owns a leaked-static [`Flow`] program plus its
 /// stepper.

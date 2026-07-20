@@ -37,8 +37,9 @@ async_trait DslHost:
 
 ## Reference implementation
 
-`flow_host::FlowHost` in this crate is the working reference and doubles
-as the payload of the shipped `dsl-kit-mcp` binary. It:
+`flow_host::FlowHost` (in the `flow-host` example crate) is the working
+reference and doubles as the payload of the `flow-mcp` binary shipped
+under `examples/flow-example/`. It:
 
 - leaks a `Flow` program (`research_pipeline`) so the stepper can hold a
   `'static` reference,

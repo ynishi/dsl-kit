@@ -1,0 +1,13 @@
+[package]
+name = "flow-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "DslHost adapter around flow-dsl. Reference implementation showing how to expose a DSL to dsl-kit-mcp."
+
+[dependencies]
+dsl-kit      = { workspace = true }
+dsl-kit-mcp  = { workspace = true }
+flow-dsl     = { workspace = true }
+async-trait  = "0.1"

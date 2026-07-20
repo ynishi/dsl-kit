@@ -2,7 +2,7 @@
 //!
 //! `Expr` is a second reference DSL for `dsl-kit`: it exercises the
 //! kit's traversal, breakpoint, and MCP host contracts against a
-//! shape that is very different from `dsl-kit-flow`. Where `Flow`
+//! shape that is very different from `flow-dsl`. Where `Flow`
 //! models an orchestration graph with `AwaitEffect` suspensions on
 //! `Call` nodes, `Expr` models a pure evaluator whose only reason
 //! to yield is an unbound variable: the host is asked to supply

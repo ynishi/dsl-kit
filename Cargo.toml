@@ -4,9 +4,11 @@ members = [
     "crates/dsl-kit-core",
     "crates/dsl-kit-macros",
     "crates/dsl-kit",
-    "crates/dsl-kit-flow",
     "crates/dsl-kit-mcp",
     "examples/flow-example",
+    "examples/flow-example/crates/flow-dsl",
+    "examples/flow-example/crates/flow-host",
+    "examples/flow-example/crates/flow-mcp",
     "examples/expr-example",
     "examples/custom-mcp-example",
 ]
@@ -20,5 +22,6 @@ license = "MIT OR Apache-2.0"
 dsl-kit-core   = { path = "crates/dsl-kit-core",   version = "0.0.0" }
 dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.0.0" }
 dsl-kit        = { path = "crates/dsl-kit",        version = "0.0.0" }
-dsl-kit-flow   = { path = "crates/dsl-kit-flow",   version = "0.0.0" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.0.0" }
+flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.0.0" }
+flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.0.0" }

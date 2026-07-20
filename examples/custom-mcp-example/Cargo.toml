@@ -13,7 +13,8 @@ path = "src/main.rs"
 [dependencies]
 dsl-kit      = { workspace = true }
 dsl-kit-mcp  = { workspace = true }
-dsl-kit-flow = { workspace = true }
+flow-dsl     = { workspace = true }
+flow-host    = { workspace = true }
 rmcp         = { version = "0.16", features = ["server", "transport-io"] }
 tokio        = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde        = { version = "1", features = ["derive"] }

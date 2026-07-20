@@ -1,0 +1,25 @@
+[package]
+name = "flow-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "MCP server binary (stdio) that serves flow-host to any MCP client. Reference dsl-kit-mcp consumer."
+
+[[bin]]
+name = "flow-mcp"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit-mcp = { workspace = true }
+flow-host   = { workspace = true }
+rmcp        = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio       = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow      = "1"
+
+[dev-dependencies]
+rmcp        = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio       = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+serde_json  = "1"

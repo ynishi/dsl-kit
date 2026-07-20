@@ -1,4 +1,11 @@
-use dsl_kit_mcp::{DslMcpHandler, FlowHost};
+//! Reference MCP server that serves `flow-host` over stdio.
+//!
+//! Consumes `dsl-kit-mcp` (the DSL-agnostic framework) with
+//! `flow-host` as the payload. Shows the shape any project can copy
+//! when wrapping their own `DslHost` in a binary.
+
+use dsl_kit_mcp::DslMcpHandler;
+use flow_host::FlowHost;
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::{self, EnvFilter};
 
@@ -11,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    tracing::info!("dsl-kit-mcp starting (flow host)");
+    tracing::info!("flow-mcp starting");
 
     let host = FlowHost::new_with_default_program();
     let handler = DslMcpHandler::new(Box::new(host));

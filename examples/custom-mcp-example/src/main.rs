@@ -19,7 +19,8 @@
 //! they want to expose. No `#[tool_router]` macro, no rmcp
 //! boilerplate.
 
-use dsl_kit_mcp::{DslMcpBuilder, FlowHost, ToolCtx};
+use dsl_kit_mcp::{DslMcpBuilder, ToolCtx};
+use flow_host::FlowHost;
 use rmcp::{ServiceExt, transport::stdio};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -86,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .tool_from_host(
             "research_pipeline",
-            "Runs the built-in dsl-kit-flow research pipeline to completion \
+            "Runs the built-in flow-dsl research pipeline to completion \
              and returns its per-node results.",
             host,
         )

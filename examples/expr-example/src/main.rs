@@ -7,7 +7,7 @@
 //!    involved).
 //! 2. The same program driven through the `DslHost` trait, proving
 //!    that the MCP handler works against DSLs whose shape is very
-//!    different from `dsl-kit-flow`.
+//!    different from `flow-dsl`.
 //!
 //! Because the example depends on `dsl-kit-mcp`, the second half of
 //! the demo can also construct a full `DslMcpHandler` around
