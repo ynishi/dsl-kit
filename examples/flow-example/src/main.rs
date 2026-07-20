@@ -1,36 +1,46 @@
 //! Reference demo for the flow DSL.
 //!
-//! The binary is structured in six sections:
+//! The binary is structured in eight sections:
 //!
 //! 1. Walks the AST with the derived traversal, prints an indented
 //!    tree.
 //! 2. Runs the pipeline synchronously through the sans-io drive layer
 //!    (`dsl_kit::drive` + an `EffectResolver` backed by canned
 //!    responses) — no hand-rolled step/resolve loop.
-//! 3. Runs one pipeline through the v3 async pattern with **real inline
+//! 3. Runs the pipeline through `drive_async` with an
+//!    `AsyncEffectResolver` that awaits a simulated latency per call —
+//!    the same engine and loop under Tokio, sequential by design.
+//! 4. Runs one pipeline through the v3 async pattern with **real inline
 //!    fan-out**: at the `Par` node all three searches are dispatched
 //!    as concurrent `tokio::spawn` tasks and their responses are
 //!    plumbed back as each future completes. This is the hand-rolled
-//!    concurrent alternative to `drive_async` (which resolves
-//!    sequentially by design) for hosts with an executor opinion.
-//! 4. Runs a FailFast demo: one Par slot resolves with an effect
+//!    concurrent alternative to `drive_async` for hosts with an
+//!    executor opinion.
+//! 5. Runs a FailFast demo: one Par slot resolves with an effect
 //!    error; the next step surfaces the error and the sibling ids
 //!    appear in `Stepper::take_cancellations`.
-//! 5. Drives the pipeline against a live breakpoint on a `Par` kid:
+//! 6. Drives the pipeline against a live breakpoint on a `Par` kid:
 //!    the drive loop returns `DriveOutcome::Break` **before the kid
 //!    spawns** (uniform spawn-stack breakpoint scope), then resumes to
 //!    completion.
-//! 6. Exercises the static breakpoint-condition surface and renders a
+//! 7. Attempts schema-driven grammar generation for `Flow` and shows
+//!    the designed fail-loud outcome: `Par`'s exotic payload types
+//!    (`Option<JoinPolicy>` / `Option<ReducerId>`) have no
+//!    canonical-syntax mapping, so generation reports them instead of
+//!    silently dropping the variant (contrast with `expr-example`,
+//!    where generation succeeds end to end).
+//! 8. Exercises the static breakpoint-condition surface and renders a
 //!    diagnostic error.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dsl_kit::{
-    BreakCondition, BreakpointId, BreakpointSet, DriveOutcome, DslNode, EffectResolver, Engine,
-    IdGen, NodeContext, NodeId, Path, Pending, Phase, StepOutcome, Stepper, SuspendReason,
-    SuspensionId, Walk, drive,
+    AsyncEffectResolver, BreakCondition, BreakpointId, BreakpointSet, DriveOutcome, DslNode,
+    EffectResolver, Engine, IdGen, NodeContext, NodeId, Path, Pending, Phase, StepOutcome,
+    Stepper, SuspendReason, SuspensionId, Walk, drive, drive_async,
 };
+use dsl_kit_schema::DslSchema;
 use flow_dsl::{
     Flow, FlowAst, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids,
     flow_default_registry, pretty, research_pipeline,
@@ -58,6 +68,30 @@ impl<'a> EffectResolver<FlowAst<'a>> for CannedResolver {
             pending.at.path
         );
         self.results.push((pending.at.node, response.clone()));
+        Ok(FlowValue::Text(response))
+    }
+}
+
+/// Async effect backend for `drive_async`: the same canned responses,
+/// but each call awaits a simulated latency first. The driver resolves
+/// sequentially by design, so the wall clock is the *sum* of latencies
+/// — the hand-rolled fan-out section shows the concurrent alternative
+/// whose wall clock is bounded by the slowest slot.
+struct SlowCannedResolver {
+    latency: Duration,
+    resolved: usize,
+}
+
+impl<'a> AsyncEffectResolver<FlowAst<'a>> for SlowCannedResolver {
+    async fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
+        let label = match &pending.reason {
+            SuspendReason::Call { spec } => spec.label.clone(),
+            other => unreachable!("drive only hands Call suspensions to the resolver: {other:?}"),
+        };
+        tokio::time::sleep(self.latency).await;
+        let response = canned_response(&label);
+        println!("  async {label:<15} -> {response}");
+        self.resolved += 1;
         Ok(FlowValue::Text(response))
     }
 }
@@ -327,6 +361,26 @@ async fn main() -> miette::Result<()> {
         println!("  {id}: {text}");
     }
 
+    println!("\n=== Async run via drive_async (sequential sans-io driver) ===");
+    let mut engine = Engine::new(FlowAst::new(&program), Arc::new(flow_default_registry()))
+        .map_err(miette::Report::new)?;
+    let mut resolver = SlowCannedResolver { latency: Duration::from_millis(20), resolved: 0 };
+    let seq_start = Instant::now();
+    match drive_async(&mut engine, &mut resolver, &BreakpointSet::new())
+        .await
+        .expect("drive_async")
+    {
+        DriveOutcome::Done(_) => println!(
+            "  {} calls resolved sequentially in {} ms — the driver awaits one \
+             call at a time; compare the fan-out section below.",
+            resolver.resolved,
+            seq_start.elapsed().as_millis()
+        ),
+        DriveOutcome::Break { at } => {
+            println!("  unexpected break with {} suspension(s)", at.len());
+        }
+    }
+
     println!("\n=== Async run (single pipeline, real inline Par fan-out) ===");
     let (elapsed, calls) = run_flow_async_fanout(
         &program,
@@ -366,6 +420,19 @@ async fn main() -> miette::Result<()> {
         DriveOutcome::Done(v) => println!("  resumed to completion: {v:?}"),
         DriveOutcome::Break { at } => {
             println!("  halted again with {} suspension(s)", at.len());
+        }
+    }
+
+    println!("\n=== Schema-driven grammar generation (designed fail-loud) ===");
+    match dsl_kit_parse::schema_gen::grammar_from_schema(&Flow::schema(), &IdGen::new()) {
+        Ok(g) => println!("  unexpectedly generated {} rules", g.rules.len()),
+        Err(e) => {
+            println!("  Flow carries payload types with no canonical text syntax;");
+            println!("  generation lists every offender instead of silently dropping variants:");
+            for d in &e.diagnostics {
+                println!("    [{}] {}", d.code, d.message);
+            }
+            println!("  (expr-example shows the succeeding path end to end.)");
         }
     }
 

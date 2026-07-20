@@ -1,11 +1,16 @@
 //! Runs the arithmetic DSL end to end.
 //!
-//! The binary shows two things:
+//! The binary shows three things:
 //!
 //! 1. A synchronous evaluation of the demo expression that supplies
 //!    every unbound variable through a plain closure (no MCP surface
 //!    involved).
-//! 2. The same program driven through the `DslHost` trait, proving
+//! 2. A text round-trip through the **schema-generated grammar**: the
+//!    parser for the canonical `Let(name: "x", ...)` syntax is derived
+//!    from `Expr::schema()` at runtime — nobody wrote a grammar. Text
+//!    parses to a `ParseTree`, conformance-checks against the schema,
+//!    builds a typed `Expr` via `#[derive(DslBuild)]`, and evaluates.
+//! 3. The same program driven through the `DslHost` trait, proving
 //!    that the MCP handler works against DSLs whose shape is very
 //!    different from `flow-dsl`.
 //!
@@ -15,8 +20,65 @@
 
 use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId};
 use dsl_kit_mcp::host::DslHost;
-use expr_dsl::{demo_program, evaluate_all, pretty};
+use dsl_kit_parse::{DslBuild, check_conformance, schema_gen};
+use dsl_kit_schema::DslSchema;
+use expr_dsl::{Expr, demo_program, evaluate_all, pretty};
 use expr_host::ExprHost;
+
+/// Parses canonical text with the schema-generated grammar, builds the
+/// typed AST, and evaluates it — the "two derives, parser for free"
+/// path landed in Round 29.
+fn run_schema_generated_grammar_demo() -> miette::Result<()> {
+    let grammar = schema_gen::checked_grammar_from_schema(&Expr::schema(), &IdGen::new())
+        .map_err(|e| miette::miette!("grammar generation failed: {:?}", e.diagnostics))?;
+    println!(
+        "generated {} rules from Expr::schema() (start rule `{}`)",
+        grammar.rules.len(),
+        grammar.start
+    );
+
+    // Same program as the hand-built demo: let x = 3 in (x + y) * z.
+    let text = r#"
+        Let(
+            name: "x",
+            value: Lit(value: 3),
+            body: Mul(
+                lhs: Add(lhs: Var(name: "x"), rhs: Var(name: "y")),
+                rhs: Var(name: "z")
+            )
+        )
+    "#;
+    let tree = grammar
+        .parse(text)
+        .map_err(|e| miette::miette!("parse failed: {:?}", e.diagnostics))?;
+    let diags = check_conformance(&tree, &Expr::schema());
+    println!(
+        "parsed `{}` tree; conformance diagnostics: {}",
+        tree.variant,
+        diags.len()
+    );
+
+    let ids = IdGen::new();
+    let expr = Expr::from_parse_tree(&tree, &ids)
+        .map_err(|e| miette::miette!("typed build failed: {:?}", e.diagnostics))?;
+    print!("{}", pretty(&expr));
+    let value = evaluate_all(&expr, |name| match name {
+        "y" => Some(5),
+        "z" => Some(2),
+        _ => None,
+    })?;
+    println!("text-parsed program with y=5, z=2 -> {value}");
+
+    // Parse failures speak the shared diagnostic dialect (farthest
+    // failure + expected set).
+    if let Err(e) = grammar.parse("Add(lhs: Lit(value: 1) rhs: Unit())") {
+        println!("deliberate error (missing comma):");
+        for d in &e.diagnostics {
+            println!("  [{}] {}", d.code, d.message);
+        }
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
@@ -34,7 +96,11 @@ async fn main() -> miette::Result<()> {
     })?;
     println!("\nsynchronous eval: (let x = 3 in (x + y) * z) with y=5, z=2 -> {value}");
 
-    // ---- 2. Driving the same program through DslHost ---------------
+    // ---- 2. Text round-trip via the schema-generated grammar -------
+    println!("\n=== Schema-generated grammar (text -> typed AST -> eval) ===");
+    run_schema_generated_grammar_demo()?;
+
+    // ---- 3. Driving the same program through DslHost ---------------
     println!("\n=== DslHost run ===");
     let mut host = ExprHost::new_with_default_program();
     let bp = BreakpointSet::new();
@@ -59,7 +125,7 @@ async fn main() -> miette::Result<()> {
         println!("  n{id}: {entry}");
     }
 
-    // ---- 3. Same host, but with a breakpoint on n1 (the Lit inside Let) --
+    // ---- 4. Same host, but with a breakpoint on n1 (the Lit inside Let) --
     println!("\n=== DslHost run with a breakpoint ===");
     host.reset();
     let mut bp = BreakpointSet::new();
