@@ -1290,4 +1290,137 @@ mod tests {
         assert_eq!(maybe["children"][0]["name"], "body");
         assert_eq!(maybe["children"][0]["multiplicity"], "optional");
     }
+
+    // ---------- dsl-kit-lint integration smoke tests --------------------
+
+    /// DSL-specific lint rule: every `Call` and `Scope` label must be
+    /// non-empty. Demonstrates the extension surface — DSL authors
+    /// implement `Rule<Flow>` and register it alongside the built-ins.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct NoEmptyLabels;
+
+    impl NoEmptyLabels {
+        const NAME: &'static str = "no-empty-labels";
+    }
+
+    impl dsl_kit_lint::Rule<Flow> for NoEmptyLabels {
+        fn name(&self) -> &'static str {
+            Self::NAME
+        }
+
+        fn check(&self, ast: &Flow, ctx: &mut dsl_kit_lint::LintContext) {
+            ast.walk(&mut |node, phase| {
+                if phase != Phase::Pre {
+                    return;
+                }
+                let empty = match node {
+                    Flow::Call { label, .. } | Flow::Scope { label, .. } => label.is_empty(),
+                    _ => false,
+                };
+                if empty {
+                    ctx.report(
+                        Self::NAME,
+                        dsl_kit_lint::Severity::Error,
+                        node.node_id(),
+                        format!("{} has an empty label", node.summary()),
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn lint_defaults_pass_on_research_pipeline() {
+        use dsl_kit_lint::Linter;
+
+        let ids = IdGen::new();
+        let program = research_pipeline(&ids);
+        let diags = Linter::<Flow>::with_defaults().lint(&program);
+        assert!(diags.is_empty(), "reference program should lint clean, got {diags:?}");
+    }
+
+    #[test]
+    fn lint_unique_node_ids_fires_on_duplicate_flow_ids() {
+        use dsl_kit_lint::{Linter, Severity, UniqueNodeIds};
+
+        let dup = NodeId(101);
+        let program = Flow::Seq {
+            id: dup,
+            children: vec![Flow::Call { id: dup, label: "x".into() }],
+        };
+        let diags = Linter::<Flow>::new().with_rule(UniqueNodeIds).lint(&program);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, "unique-node-ids");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].node, dup);
+    }
+
+    #[test]
+    fn lint_max_fan_out_fires_on_wide_seq() {
+        use dsl_kit_lint::{Linter, MaxFanOut, Severity};
+
+        let ids = IdGen::new();
+        let root_id = ids.node();
+        // 10 kids, limit 4 → 1 warn on root.
+        let children: Vec<Flow> = (0..10)
+            .map(|i| Flow::Call {
+                id: ids.node(),
+                label: format!("c{i}"),
+            })
+            .collect();
+        let program = Flow::Seq { id: root_id, children };
+
+        let diags = Linter::<Flow>::new()
+            .with_rule(MaxFanOut::new(4))
+            .lint(&program);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, "max-fan-out");
+        assert_eq!(diags[0].severity, Severity::Warn);
+        assert_eq!(diags[0].node, root_id);
+    }
+
+    #[test]
+    fn lint_dsl_specific_rule_catches_empty_label() {
+        use dsl_kit_lint::Linter;
+
+        let ids = IdGen::new();
+        let good_id = ids.node();
+        let bad_id = ids.node();
+        let program = Flow::Seq {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: good_id, label: "ok".into() },
+                Flow::Call { id: bad_id, label: String::new() },
+                Flow::Scope {
+                    id: ids.node(),
+                    label: String::new(),
+                    body: Box::new(Flow::Call { id: ids.node(), label: "inner".into() }),
+                },
+            ],
+        };
+
+        let diags = Linter::<Flow>::new().with_rule(NoEmptyLabels).lint(&program);
+        // Two empty labels: the Call and the Scope.
+        assert_eq!(diags.len(), 2, "diags = {diags:?}");
+        assert!(diags.iter().all(|d| d.rule == NoEmptyLabels::NAME));
+        assert!(diags.iter().any(|d| d.node == bad_id));
+    }
+
+    #[test]
+    fn lint_defaults_plus_custom_rule_compose() {
+        use dsl_kit_lint::Linter;
+
+        // Combine built-in defaults with a DSL-specific rule.
+        let ids = IdGen::new();
+        let program = Flow::Seq {
+            id: ids.node(),
+            children: vec![Flow::Call { id: ids.node(), label: String::new() }],
+        };
+        let diags = Linter::<Flow>::with_defaults()
+            .with_rule(NoEmptyLabels)
+            .lint(&program);
+        // Empty label fires exactly once; defaults find nothing else.
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, NoEmptyLabels::NAME);
+    }
 }

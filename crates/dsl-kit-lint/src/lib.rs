@@ -1,0 +1,462 @@
+//! Lint framework for `dsl-kit` DSLs.
+//!
+//! A [`Linter`] runs a set of [`Rule`]s over an AST that implements
+//! [`Walk`] (from `dsl-kit-core`) and produces [`Diagnostic`]s. Rules
+//! that need type-level structural information can additionally consult
+//! [`DslSchema`] (from `dsl-kit-schema`).
+//!
+//! ## Split of responsibility
+//!
+//! - `dsl-kit-core::Walk` provides the *instance* traversal every rule
+//!   needs (visit every node, count depth, count children).
+//! - `dsl-kit-schema::DslSchema` provides the *type-level* shape a
+//!   Schema-aware rule consults (which variants declare `Many` child
+//!   fields, which fields are `Optional`, …).
+//!
+//! Rules that only need traversal are generic over `A: Walk`; rules
+//! that consult the type-level shape add a `DslSchema` bound. See the
+//! built-in rules for the traversal-only flavour, and DSL-specific
+//! extension rules (in `flow-dsl`'s test module) for how DSL authors
+//! plug custom rules into the same harness.
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use dsl_kit_lint::{Linter, Severity};
+//!
+//! let diagnostics = Linter::<Flow>::with_defaults().lint(&program);
+//! for d in &diagnostics {
+//!     println!("[{:?}] {}: {}", d.severity, d.rule, d.message);
+//! }
+//! ```
+
+#![warn(missing_docs)]
+
+use std::collections::HashSet;
+
+use dsl_kit_core::{NodeId, Phase, Walk};
+use dsl_kit_schema::DslSchema;
+
+// ---------- Diagnostics -------------------------------------------------
+
+/// Severity of a [`Diagnostic`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// Rule violation the DSL author almost certainly wants to fix.
+    Error,
+    /// Suspicious shape worth flagging but not necessarily wrong.
+    Warn,
+    /// Advisory observation.
+    Info,
+}
+
+/// One lint result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    /// Name of the [`Rule`] that produced this diagnostic.
+    pub rule: &'static str,
+    /// Severity level.
+    pub severity: Severity,
+    /// Node the diagnostic is attached to.
+    pub node: NodeId,
+    /// Human-readable message.
+    pub message: String,
+}
+
+/// Accumulator handed to each rule during a lint pass.
+///
+/// Rules call [`LintContext::emit`] or [`LintContext::report`] for
+/// each diagnostic they raise; the [`Linter`] harvests them at the
+/// end of the pass.
+#[derive(Debug, Default)]
+pub struct LintContext {
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl LintContext {
+    /// Creates an empty context.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a fully-formed diagnostic.
+    pub fn emit(&mut self, diag: Diagnostic) {
+        self.diagnostics.push(diag);
+    }
+
+    /// Convenience helper: builds a `Diagnostic` and records it.
+    pub fn report(
+        &mut self,
+        rule: &'static str,
+        severity: Severity,
+        node: NodeId,
+        message: impl Into<String>,
+    ) {
+        self.emit(Diagnostic {
+            rule,
+            severity,
+            node,
+            message: message.into(),
+        });
+    }
+
+    /// Borrows the accumulated diagnostics.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Consumes the context and returns the accumulated diagnostics.
+    pub fn into_diagnostics(self) -> Vec<Diagnostic> {
+        self.diagnostics
+    }
+}
+
+// ---------- Rule trait --------------------------------------------------
+
+/// A single lint rule.
+///
+/// Rules are stateless (or carry only their own configuration) and
+/// receive the entire AST on each pass. Traversal is the rule's own
+/// responsibility — most rules use `ast.walk(&mut |node, phase| ...)`
+/// to visit every node.
+pub trait Rule<A: Walk> {
+    /// Stable rule identifier attached to every diagnostic it emits.
+    fn name(&self) -> &'static str;
+
+    /// Runs the rule against `ast`, appending diagnostics to `ctx`.
+    fn check(&self, ast: &A, ctx: &mut LintContext);
+}
+
+// ---------- Linter orchestrator -----------------------------------------
+
+/// Runs a collection of [`Rule`]s over an AST.
+pub struct Linter<A: Walk> {
+    rules: Vec<Box<dyn Rule<A>>>,
+}
+
+impl<A: Walk> Default for Linter<A> {
+    fn default() -> Self {
+        Self { rules: Vec::new() }
+    }
+}
+
+impl<A: Walk> Linter<A> {
+    /// Creates a linter with no rules registered.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers an additional rule; returns the linter for chaining.
+    #[must_use]
+    pub fn with_rule<R: Rule<A> + 'static>(mut self, rule: R) -> Self {
+        self.rules.push(Box::new(rule));
+        self
+    }
+
+    /// Runs every registered rule against `ast` and returns the
+    /// accumulated diagnostics, in the order rules were registered.
+    pub fn lint(&self, ast: &A) -> Vec<Diagnostic> {
+        let mut ctx = LintContext::new();
+        for rule in &self.rules {
+            rule.check(ast, &mut ctx);
+        }
+        ctx.into_diagnostics()
+    }
+
+    /// Number of registered rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+impl<A: Walk + DslSchema> Linter<A> {
+    /// Registers the built-in rule set — [`UniqueNodeIds`],
+    /// [`MaxDepth`] with the [`MaxDepth::DEFAULT_LIMIT`], and
+    /// [`MaxFanOut`] with the [`MaxFanOut::DEFAULT_LIMIT`].
+    ///
+    /// The `DslSchema` bound is reserved for future Schema-aware
+    /// defaults; the current set consults only [`Walk`].
+    pub fn with_defaults() -> Self {
+        Self::new()
+            .with_rule(UniqueNodeIds)
+            .with_rule(MaxDepth::new(MaxDepth::DEFAULT_LIMIT))
+            .with_rule(MaxFanOut::new(MaxFanOut::DEFAULT_LIMIT))
+    }
+}
+
+// ---------- Built-in rules ----------------------------------------------
+
+/// Errors on repeated [`NodeId`] values in the AST.
+///
+/// Every DSL author who uses `IdGen::node()` gets unique IDs for
+/// free; this rule catches hand-constructed trees that reuse an ID
+/// by mistake — a bug that also breaks Engine breakpoint targeting
+/// and root-to-node path resolution.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UniqueNodeIds;
+
+impl UniqueNodeIds {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "unique-node-ids";
+}
+
+impl<A: Walk> Rule<A> for UniqueNodeIds {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        ast.walk(&mut |node, phase| {
+            if phase != Phase::Pre {
+                return;
+            }
+            let id = node.node_id();
+            if !seen.insert(id) {
+                ctx.report(
+                    Self::NAME,
+                    Severity::Error,
+                    id,
+                    format!("node id {id} appears more than once"),
+                );
+            }
+        });
+    }
+}
+
+/// Errors on any node whose depth exceeds a configured limit.
+///
+/// Depth is the number of ancestors between the node and the root; the
+/// root itself is depth 0. Useful for catching pathological or
+/// generator-produced ASTs before they hit the engine walker.
+#[derive(Debug, Clone, Copy)]
+pub struct MaxDepth {
+    /// Maximum allowed depth (inclusive).
+    pub limit: usize,
+}
+
+impl MaxDepth {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "max-depth";
+
+    /// Default depth limit used by [`Linter::with_defaults`].
+    pub const DEFAULT_LIMIT: usize = 64;
+
+    /// Creates a rule with the given limit.
+    pub fn new(limit: usize) -> Self {
+        Self { limit }
+    }
+}
+
+impl<A: Walk> Rule<A> for MaxDepth {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        let limit = self.limit;
+        let mut depth: usize = 0;
+        ast.walk(&mut |node, phase| match phase {
+            Phase::Pre => {
+                if depth > limit {
+                    ctx.report(
+                        Self::NAME,
+                        Severity::Error,
+                        node.node_id(),
+                        format!("node depth {depth} exceeds limit {limit}"),
+                    );
+                }
+                depth += 1;
+            }
+            Phase::Post => {
+                depth = depth.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// Warns on any node whose direct child count exceeds a configured
+/// limit.
+///
+/// Fan-out complexity guard. Distinct from [`MaxDepth`], which
+/// bounds nesting; this bounds width. A single flat `Seq` with 200
+/// children clears any depth limit but is a maintenance smell.
+#[derive(Debug, Clone, Copy)]
+pub struct MaxFanOut {
+    /// Maximum allowed direct-child count (inclusive).
+    pub limit: usize,
+}
+
+impl MaxFanOut {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "max-fan-out";
+
+    /// Default fan-out limit used by [`Linter::with_defaults`].
+    pub const DEFAULT_LIMIT: usize = 32;
+
+    /// Creates a rule with the given limit.
+    pub fn new(limit: usize) -> Self {
+        Self { limit }
+    }
+}
+
+impl<A: Walk> Rule<A> for MaxFanOut {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        let limit = self.limit;
+        ast.walk(&mut |node, phase| {
+            if phase != Phase::Pre {
+                return;
+            }
+            let count = node.children().len();
+            if count > limit {
+                ctx.report(
+                    Self::NAME,
+                    Severity::Warn,
+                    node.node_id(),
+                    format!("node has {count} direct children, above limit {limit}"),
+                );
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsl_kit_core::{DslNode, NodeId};
+
+    // Minimal test AST — a linear chain with configurable fan-out —
+    // to exercise Walk + rules without pulling in flow-dsl. This
+    // mirrors what #[derive(DslNode)] would produce for a tiny enum.
+    #[derive(Debug)]
+    enum Tiny {
+        Node { id: NodeId, kids: Vec<Tiny> },
+    }
+
+    impl DslNode for Tiny {
+        fn node_id(&self) -> NodeId {
+            match self {
+                Tiny::Node { id, .. } => *id,
+            }
+        }
+    }
+
+    impl Walk for Tiny {
+        fn children(&self) -> Vec<&Self> {
+            match self {
+                Tiny::Node { kids, .. } => kids.iter().collect(),
+            }
+        }
+    }
+
+    fn leaf(n: u64) -> Tiny {
+        Tiny::Node { id: NodeId(n), kids: vec![] }
+    }
+
+    fn node(n: u64, kids: Vec<Tiny>) -> Tiny {
+        Tiny::Node { id: NodeId(n), kids }
+    }
+
+    #[test]
+    fn unique_node_ids_passes_on_distinct_ids() {
+        let ast = node(1, vec![leaf(2), leaf(3)]);
+        let diags = Linter::<Tiny>::new().with_rule(UniqueNodeIds).lint(&ast);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn unique_node_ids_fires_on_duplicate() {
+        let dup = NodeId(42);
+        let ast = Tiny::Node {
+            id: dup,
+            kids: vec![Tiny::Node { id: dup, kids: vec![] }],
+        };
+        let diags = Linter::<Tiny>::new().with_rule(UniqueNodeIds).lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, UniqueNodeIds::NAME);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].node, dup);
+        assert!(diags[0].message.contains("appears more than once"));
+    }
+
+    #[test]
+    fn max_depth_passes_within_limit() {
+        // depth 0 root → depth 1 leaf. Limit 4 is well within.
+        let ast = node(1, vec![leaf(2)]);
+        let diags = Linter::<Tiny>::new().with_rule(MaxDepth::new(4)).lint(&ast);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn max_depth_fires_when_exceeded() {
+        // Build a chain of nested nodes: depth 0, 1, 2, 3, 4.
+        // Limit 2 → depths 3 and 4 fire.
+        let ast = node(
+            1,
+            vec![node(2, vec![node(3, vec![node(4, vec![leaf(5)])])])],
+        );
+        let diags = Linter::<Tiny>::new().with_rule(MaxDepth::new(2)).lint(&ast);
+        assert_eq!(diags.len(), 2, "diags = {diags:?}");
+        assert!(diags.iter().all(|d| d.rule == MaxDepth::NAME));
+        assert!(diags.iter().all(|d| d.severity == Severity::Error));
+        assert_eq!(diags[0].node, NodeId(4));
+        assert_eq!(diags[1].node, NodeId(5));
+    }
+
+    #[test]
+    fn max_fan_out_passes_within_limit() {
+        let ast = node(1, (2..6).map(leaf).collect());
+        let diags = Linter::<Tiny>::new()
+            .with_rule(MaxFanOut::new(8))
+            .lint(&ast);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn max_fan_out_fires_at_warn_severity_when_exceeded() {
+        // 5 kids under root; limit 3 → 1 diagnostic on root.
+        let ast = node(1, (2..7).map(leaf).collect());
+        let diags = Linter::<Tiny>::new()
+            .with_rule(MaxFanOut::new(3))
+            .lint(&ast);
+        assert_eq!(diags.len(), 1, "diags = {diags:?}");
+        assert_eq!(diags[0].rule, MaxFanOut::NAME);
+        assert_eq!(diags[0].severity, Severity::Warn);
+        assert_eq!(diags[0].node, NodeId(1));
+        assert!(diags[0].message.contains("5 direct children"));
+    }
+
+    #[test]
+    fn linter_runs_multiple_rules_in_registration_order() {
+        let dup = NodeId(9);
+        let ast = Tiny::Node {
+            id: dup,
+            kids: vec![Tiny::Node {
+                id: NodeId(10),
+                kids: vec![Tiny::Node { id: dup, kids: vec![] }],
+            }],
+        };
+        let diags = Linter::<Tiny>::new()
+            .with_rule(UniqueNodeIds)
+            .with_rule(MaxDepth::new(0))
+            .lint(&ast);
+        assert!(diags.iter().any(|d| d.rule == UniqueNodeIds::NAME));
+        assert!(diags.iter().any(|d| d.rule == MaxDepth::NAME));
+        // UniqueNodeIds registered first: its diagnostics come first.
+        let first_unique = diags.iter().position(|d| d.rule == UniqueNodeIds::NAME);
+        let first_depth = diags.iter().position(|d| d.rule == MaxDepth::NAME);
+        assert!(first_unique < first_depth);
+    }
+
+    #[test]
+    fn rule_count_reflects_registrations() {
+        let l: Linter<Tiny> = Linter::new()
+            .with_rule(UniqueNodeIds)
+            .with_rule(MaxDepth::new(8));
+        assert_eq!(l.rule_count(), 2);
+    }
+}

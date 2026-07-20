@@ -1,0 +1,12 @@
+[package]
+name = "dsl-kit-lint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Extensible lint framework for dsl-kit DSLs. Walk-driven, Schema-aware, DSL-author-extensible."
+
+[dependencies]
+dsl-kit-core   = { workspace = true }
+dsl-kit-schema = { workspace = true }
+
+[dev-dependencies]

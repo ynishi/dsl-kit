@@ -212,6 +212,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl-kit-lint"
+version = "0.0.0"
+dependencies = [
+ "dsl-kit-core",
+ "dsl-kit-schema",
+]
+
+[[package]]
 name = "dsl-kit-macros"
 version = "0.0.0"
 dependencies = [
@@ -314,6 +322,7 @@ version = "0.0.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-core",
+ "dsl-kit-lint",
  "dsl-kit-macros",
  "dsl-kit-schema",
  "serde_json",
