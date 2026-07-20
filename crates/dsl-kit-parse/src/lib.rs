@@ -33,6 +33,7 @@ use dsl_kit_schema::{ChildSchema, Multiplicity, NodeSchema, VariantSchema};
 use serde_json::{Value, json};
 use std::fmt;
 
+pub mod grammar_check;
 pub mod peg;
 pub mod serde_bridge;
 
@@ -377,11 +378,6 @@ pub mod codes {
     /// A payload field's value could not be converted to the target
     /// Rust type (serde deserialization failure or `FromStr` failure).
     pub const FIELD_TYPE: &str = "dsl_kit::parse::field_type";
-    /// A payload field is present as [`crate::RawValue::Text`] but the
-    /// derive-generated builder currently only accepts
-    /// [`crate::RawValue::Json`] (until the PEG front-end lands in
-    /// G-2).
-    pub const FIELD_TEXT_UNSUPPORTED: &str = "dsl_kit::parse::field_text_unsupported";
 }
 
 /// Validates `tree` against `schema` shallowly (this level only).
@@ -672,11 +668,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// `T` must therefore satisfy both bounds; every primitive the kit
 /// currently uses (`String`, `i64`, `u32`, `bool`, `f64`) does.
 ///
-/// The [`codes::FIELD_TEXT_UNSUPPORTED`] diagnostic exists as a
-/// backwards-compat slug — it is no longer emitted by this helper but
-/// is kept in [`codes`] until a downstream reference-check pass
-/// (post-G-3) confirms nothing outside the crate references it.
-///
 /// This helper is intended for use by `#[derive(DslBuild)]`-generated
 /// code but is usable directly by hand-written [`DslBuild`] impls.
 pub fn build_field<T>(tree: &ParseTree, name: &str) -> Result<T, BuildError>
@@ -711,17 +702,6 @@ where
             .with_span(tree.span),
         )),
     }
-}
-
-/// Deprecated alias for [`build_field`]. Retained until R-25's derive
-/// generation is updated across the tree (target: G-3).
-#[doc(hidden)]
-pub fn build_field_json<T>(tree: &ParseTree, name: &str) -> Result<T, BuildError>
-where
-    T: serde::de::DeserializeOwned + std::str::FromStr,
-    <T as std::str::FromStr>::Err: std::fmt::Display,
-{
-    build_field(tree, name)
 }
 
 /// Builds the single child of a [`Multiplicity::One`] slot.

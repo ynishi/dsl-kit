@@ -401,9 +401,10 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 /// 2. Dispatches on the [`ParseTree`]'s `variant` name against the
 ///    enum's variants.
 /// 3. For each named field, calls [`build_field`] — the field's
-///    Rust type must implement `serde::de::DeserializeOwned`. The
-///    `RawValue::Text` arm is rejected with `FIELD_TEXT_UNSUPPORTED`
-///    until the PEG front-end (G-2) lands.
+///    Rust type must implement both `serde::de::DeserializeOwned` and
+///    `FromStr`. `RawValue::Json` payloads dispatch through serde;
+///    `RawValue::Text` payloads (the PEG front-end's natural output)
+///    dispatch through `FromStr`.
 /// 4. For each recursive child field, calls the appropriate helper
 ///    ([`build_child_one`] / `_optional` / `_many`) and re-wraps the
 ///    result in `Box` where the source field is boxed.
