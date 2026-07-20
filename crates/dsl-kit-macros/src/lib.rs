@@ -15,6 +15,14 @@
 //! variants, non-recursive payload fields, and child-field
 //! multiplicity. See `dsl-kit-schema` for the target types.
 //!
+//! `#[derive(DslBuild)]` (G-1) accepts the same shape and emits an
+//! `impl DslBuild` that converts a validated `ParseTree` into a typed
+//! AST value, minting fresh `NodeId`s from the caller's `IdGen`. It
+//! delegates payload deserialization to `dsl_kit_parse::build_field`
+//! and child-slot recursion to `build_child_one` / `build_child_optional`
+//! / `build_child_many`. Types deriving `DslBuild` must also derive
+//! `DslSchema` (used for the level-scoped conformance check).
+//!
 //! Variants may carry additional fields of unrelated types (payload); those
 //! fields are ignored by the traversal.
 //!
@@ -375,6 +383,162 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                 ::dsl_kit_schema::NodeSchema {
                     name: #name_str.to_string(),
                     variants: ::std::vec![#(#variant_ctors),*],
+                }
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Derives `dsl_kit_parse::DslBuild` for the same enum shape accepted
+/// by [`DslNode`] and [`DslSchema`]. The generated `from_parse_tree`
+/// method:
+///
+/// 1. Runs a level-scoped [`check_conformance`] against
+///    `Self::schema()` and returns any diagnostics before proceeding.
+///    Types deriving `DslBuild` must therefore also derive `DslSchema`.
+/// 2. Dispatches on the [`ParseTree`]'s `variant` name against the
+///    enum's variants.
+/// 3. For each named field, calls [`build_field`] — the field's
+///    Rust type must implement `serde::de::DeserializeOwned`. The
+///    `RawValue::Text` arm is rejected with `FIELD_TEXT_UNSUPPORTED`
+///    until the PEG front-end (G-2) lands.
+/// 4. For each recursive child field, calls the appropriate helper
+///    ([`build_child_one`] / `_optional` / `_many`) and re-wraps the
+///    result in `Box` where the source field is boxed.
+/// 5. Constructs the variant with a fresh [`NodeId`] from the
+///    caller-supplied `IdGen`.
+///
+/// [`check_conformance`]: dsl_kit_parse::check_conformance
+/// [`build_field`]: dsl_kit_parse::build_field
+/// [`build_child_one`]: dsl_kit_parse::build_child_one
+/// [`DslNode`]: dsl_kit_core::DslNode
+/// [`DslSchema`]: dsl_kit_schema::DslSchema
+/// [`ParseTree`]: dsl_kit_parse::ParseTree
+/// [`NodeId`]: dsl_kit_core::NodeId
+#[proc_macro_derive(DslBuild)]
+pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(
+            &input,
+            "#[derive(DslBuild)] currently supports enums only",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let mut variant_arms = Vec::new();
+
+    for variant in &data.variants {
+        let variant_ident = &variant.ident;
+        let variant_name_str = variant_ident.to_string();
+
+        let Fields::Named(fields) = &variant.fields else {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslBuild)] requires every variant to use named fields",
+            )
+            .to_compile_error()
+            .into();
+        };
+
+        let has_id = fields.named.iter().any(|f| {
+            f.ident.as_ref().is_some_and(|ident| ident == "id")
+        });
+        if !has_id {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslBuild)] requires each variant to have an `id: NodeId` field",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        let mut let_bindings = Vec::new();
+        let mut ctor_fields = Vec::new();
+
+        for f in &fields.named {
+            let Some(ident) = &f.ident else { continue };
+            if ident == "id" {
+                continue;
+            }
+            let ident_str = ident.to_string();
+
+            if let Some(kind) = detect_recursion(&f.ty, &name) {
+                let helper_call = match kind {
+                    Recursion::Direct => quote! {
+                        ::dsl_kit_parse::build_child_one::<#name>(tree, #ident_str, ids)?
+                    },
+                    Recursion::Boxed => quote! {
+                        ::std::boxed::Box::new(
+                            ::dsl_kit_parse::build_child_one::<#name>(tree, #ident_str, ids)?
+                        )
+                    },
+                    Recursion::Optional => quote! {
+                        ::dsl_kit_parse::build_child_optional::<#name>(tree, #ident_str, ids)?
+                    },
+                    Recursion::OptionalBoxed => quote! {
+                        ::dsl_kit_parse::build_child_optional::<#name>(tree, #ident_str, ids)?
+                            .map(::std::boxed::Box::new)
+                    },
+                    Recursion::Many => quote! {
+                        ::dsl_kit_parse::build_child_many::<#name>(tree, #ident_str, ids)?
+                    },
+                    Recursion::ManyBoxed => quote! {
+                        ::dsl_kit_parse::build_child_many::<#name>(tree, #ident_str, ids)?
+                            .into_iter()
+                            .map(::std::boxed::Box::new)
+                            .collect::<::std::vec::Vec<_>>()
+                    },
+                };
+                let_bindings.push(quote! { let #ident = #helper_call; });
+                ctor_fields.push(quote! { #ident });
+            } else {
+                let ty = &f.ty;
+                let_bindings.push(quote! {
+                    let #ident: #ty = ::dsl_kit_parse::build_field(tree, #ident_str)?;
+                });
+                ctor_fields.push(quote! { #ident });
+            }
+        }
+
+        variant_arms.push(quote! {
+            #variant_name_str => {
+                #(#let_bindings)*
+                ::std::result::Result::Ok(Self::#variant_ident {
+                    id: ids.node(),
+                    #(#ctor_fields,)*
+                })
+            }
+        });
+    }
+
+    let expanded: TokenStream2 = quote! {
+        impl #impl_generics ::dsl_kit_parse::DslBuild for #name #ty_generics #where_clause {
+            fn from_parse_tree(
+                tree: &::dsl_kit_parse::ParseTree,
+                ids: &::dsl_kit_core::IdGen,
+            ) -> ::std::result::Result<Self, ::dsl_kit_parse::BuildError> {
+                let __level_diags = ::dsl_kit_parse::check_conformance(
+                    tree,
+                    &<Self as ::dsl_kit_schema::DslSchema>::schema(),
+                );
+                if !__level_diags.is_empty() {
+                    return ::std::result::Result::Err(
+                        ::dsl_kit_parse::BuildError::new(__level_diags),
+                    );
+                }
+                match tree.variant.as_str() {
+                    #(#variant_arms)*
+                    other => ::std::unreachable!(
+                        "check_conformance accepted unknown variant `{}` — this is a bug",
+                        other,
+                    ),
                 }
             }
         }

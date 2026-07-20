@@ -243,6 +243,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl-kit-parse"
+version = "0.0.0"
+dependencies = [
+ "dsl-kit-core",
+ "dsl-kit-macros",
+ "dsl-kit-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsl-kit-schema"
 version = "0.0.0"
 dependencies = [
@@ -272,7 +283,9 @@ dependencies = [
  "dsl-kit",
  "dsl-kit-core",
  "dsl-kit-macros",
+ "dsl-kit-parse",
  "dsl-kit-schema",
+ "serde_json",
 ]
 
 [[package]]
@@ -296,9 +309,12 @@ dependencies = [
  "dsl-kit",
  "dsl-kit-lint",
  "dsl-kit-mcp",
+ "dsl-kit-parse",
  "dsl-kit-schema",
  "expr-dsl",
+ "rmcp",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

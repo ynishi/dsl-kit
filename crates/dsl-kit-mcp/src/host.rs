@@ -270,4 +270,32 @@ pub trait DslHost: Send + Sync {
     fn lint_json(&self) -> Option<String> {
         None
     }
+
+    /// Parse `input` (JSON serialized `ParseTree` — see the serde
+    /// bridge in `dsl-kit-parse`), build a typed AST, swap it in, and
+    /// reset the stepper.
+    ///
+    /// The default returns `Err("load_json not supported by this host")`
+    /// so that DSL hosts that have not opted into the parse trunk still
+    /// implement the trait unchanged. Hosts that link `dsl-kit-parse`
+    /// override this with:
+    ///
+    /// 1. Feed `input` through
+    ///    `dsl_kit_parse::serde_bridge::from_json_str`.
+    /// 2. Call `<Ast as dsl_kit_parse::DslBuild>::from_parse_tree`
+    ///    using a fresh `IdGen`.
+    /// 3. Replace the currently-owned AST and reset the internal
+    ///    stepper. `NodeId`s start over at 0.
+    ///
+    /// On failure, the returned string is a serialized JSON array of
+    /// [`Diagnostic`](https://docs.rs/dsl-kit-parse) envelopes so the
+    /// caller gets machine-readable feedback in the same dialect used
+    /// by conformance and lint. The
+    /// [`dsl_kit_load`](crate::DslMcpHandler::dsl_kit_load) tool passes
+    /// this through unchanged and additionally clears the handler's
+    /// breakpoint set on success (old `NodeId`s are meaningless
+    /// against the new AST).
+    async fn load_json(&mut self, _input: &str) -> Result<(), String> {
+        Err("load_json not supported by this host".into())
+    }
 }

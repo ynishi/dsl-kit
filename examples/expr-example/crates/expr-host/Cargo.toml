@@ -11,6 +11,11 @@ dsl-kit         = { workspace = true }
 dsl-kit-mcp     = { workspace = true }
 dsl-kit-schema  = { workspace = true }
 dsl-kit-lint    = { workspace = true }
+dsl-kit-parse   = { workspace = true }
 expr-dsl        = { workspace = true }
 async-trait     = "0.1"
 serde_json      = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+rmcp  = { version = "0.16", features = ["server", "transport-io", "macros"] }

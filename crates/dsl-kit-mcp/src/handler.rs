@@ -128,6 +128,16 @@ pub struct ResolveErr {
     pub message: String,
 }
 
+/// Parameters accepted by the `dsl_kit_load` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoadParams {
+    /// JSON document for the DSL to parse, build, and swap in.
+    /// The internally-tagged `"type"` convention selects the variant
+    /// at every level; other keys map to declared fields / child slots
+    /// per the DSL's schema (see `dsl-kit-parse::serde_bridge`).
+    pub input: String,
+}
+
 // ---------- Handler state -----------------------------------------------
 
 struct HandlerState {
@@ -457,6 +467,50 @@ impl DslMcpHandler {
                 Ok(json!({ "wired": true, "schema": value }).to_string())
             }
             None => Ok(json!({ "wired": false, "schema": null }).to_string()),
+        }
+    }
+
+    /// Parse a JSON document, build a typed AST, swap it into the host,
+    /// and reset the stepper. Clears the handler's breakpoint set on
+    /// success (old `NodeId`s are meaningless against the new AST).
+    ///
+    /// Envelope on success:
+    /// `{ "ok": true, "dsl": <name>, "root": <root_id>, "ast_size": N }`.
+    ///
+    /// Envelope on failure:
+    /// `{ "ok": false, "diagnostics": [<Diagnostic>, ...] }` when the
+    /// host's `load_json` returned a JSON diagnostic array; otherwise
+    /// `{ "ok": false, "error": <message> }` for hosts that returned a
+    /// plain-text error (including the default "not supported" path).
+    #[tool(name = "dsl_kit_load")]
+    pub async fn dsl_kit_load(
+        &self,
+        Parameters(params): Parameters<LoadParams>,
+    ) -> Result<String, String> {
+        let mut guard = self.state.lock().await;
+        match guard.host.load_json(&params.input).await {
+            Ok(()) => {
+                guard.breakpoints = BreakpointSet::new();
+                let host = &*guard.host;
+                let body = json!({
+                    "ok": true,
+                    "dsl": host.dsl_name(),
+                    "root": host.root_node_id(),
+                    "ast_size": host.ast_size(),
+                });
+                Ok(body.to_string())
+            }
+            Err(msg) => {
+                // Prefer parsing the message as JSON diagnostics; fall
+                // back to a plain-text `error` field for the default
+                // (unsupported) and other prose-only paths.
+                if let Ok(value) = serde_json::from_str::<Value>(&msg) {
+                    if value.is_array() {
+                        return Ok(json!({ "ok": false, "diagnostics": value }).to_string());
+                    }
+                }
+                Ok(json!({ "ok": false, "error": msg }).to_string())
+            }
         }
     }
 

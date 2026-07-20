@@ -292,6 +292,26 @@ impl DslHost for ExprHost {
             .collect();
         Some(serde_json::Value::Array(value).to_string())
     }
+
+    async fn load_json(&mut self, input: &str) -> Result<(), String> {
+        use dsl_kit_parse::{DslBuild, serde_bridge::from_json_str};
+        use dsl_kit_schema::DslSchema;
+        // Bridge → conformance-checked build. Diagnostics are serialized
+        // as the shared envelope so the handler can pass them through to
+        // the client unchanged (see `dsl_kit_load`).
+        let tree =
+            from_json_str(input, &Expr::schema()).map_err(|e| e.to_json().to_string())?;
+        let ids = IdGen::new();
+        let program = Expr::from_parse_tree(&tree, &ids).map_err(|e| e.to_json().to_string())?;
+        // Same lifetime shape as the default program: leak the Box so
+        // the host keeps a `&'static Expr`. Each `load_json` call leaks
+        // one AST; acceptable for a demo host, but a production host
+        // owning a `Box<Expr>` would drop the previous program here.
+        let leaked: &'static Expr = Box::leak(Box::new(program));
+        self.program = leaked;
+        self.reset();
+        Ok(())
+    }
 }
 
 fn default_resolution(name: &str) -> i64 {

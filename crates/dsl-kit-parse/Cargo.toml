@@ -1,0 +1,15 @@
+[package]
+name = "dsl-kit-parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parser trunk for dsl-kit DSLs (ParseTree, schema conformance, serde bridge, DslBuild consumer)."
+
+[dependencies]
+dsl-kit-core   = { workspace = true }
+dsl-kit-schema = { workspace = true }
+dsl-kit-macros = { workspace = true }
+serde      = "1"
+serde_json = "1"
+
+[dev-dependencies]
