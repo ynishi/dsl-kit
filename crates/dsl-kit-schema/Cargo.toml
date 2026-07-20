@@ -1,0 +1,11 @@
+[package]
+name = "dsl-kit-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Compile-time schema reflection for dsl-kit DSLs (external shape for parsers, editors, and AI clients)."
+
+[dependencies]
+serde_json = "1"
+
+[dev-dependencies]

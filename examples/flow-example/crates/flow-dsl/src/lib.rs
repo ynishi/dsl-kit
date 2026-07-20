@@ -38,7 +38,7 @@ use dsl_kit::{
 // ---------- AST ---------------------------------------------------------
 
 /// AST of the flow DSL.
-#[derive(Debug, dsl_kit_macros::DslNode)]
+#[derive(Debug, dsl_kit_macros::DslNode, dsl_kit_macros::DslSchema)]
 pub enum Flow {
     /// Runs its children in order.
     Seq {
@@ -1216,5 +1216,78 @@ mod tests {
             }
             other => panic!("expected Blocked{{Call}}, got {other:?}"),
         }
+    }
+
+    // ---------- DslSchema derive smoke tests -----------------------------
+
+    #[test]
+    fn dsl_schema_lists_every_variant_in_declaration_order() {
+        use dsl_kit_schema::DslSchema;
+
+        let schema = Flow::schema();
+        assert_eq!(schema.name, "Flow");
+        let names: Vec<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["Seq", "Par", "Call", "Scope", "Maybe"]);
+    }
+
+    #[test]
+    fn dsl_schema_strips_id_and_classifies_child_multiplicity() {
+        use dsl_kit_schema::{DslSchema, Multiplicity};
+
+        let schema = Flow::schema();
+
+        // Seq { id, children: Vec<Flow> } — id stripped, children Many.
+        let seq = schema.variant("Seq").expect("Seq");
+        assert!(seq.fields.is_empty(), "Seq has no non-recursive payload");
+        assert_eq!(seq.children.len(), 1);
+        assert_eq!(seq.children[0].name, "children");
+        assert_eq!(seq.children[0].multiplicity, Multiplicity::Many);
+
+        // Par { id, children: Vec<Flow>, policy: Option<JoinPolicy>,
+        // reducer_id: Option<String> } — children Many, policy and
+        // reducer_id are non-recursive payload (Option<T> where T is
+        // not the enum).
+        let par = schema.variant("Par").expect("Par");
+        assert_eq!(par.children.len(), 1);
+        assert_eq!(par.children[0].multiplicity, Multiplicity::Many);
+        let field_names: Vec<&str> = par.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(field_names, vec!["policy", "reducer_id"]);
+
+        // Call { id, label: String } — id stripped, label payload.
+        let call = schema.variant("Call").expect("Call");
+        assert!(call.children.is_empty());
+        assert_eq!(call.fields.len(), 1);
+        assert_eq!(call.fields[0].name, "label");
+        assert_eq!(call.fields[0].ty, "String");
+
+        // Scope { id, label: String, body: Box<Flow> } — body is One.
+        let scope = schema.variant("Scope").expect("Scope");
+        assert_eq!(scope.children.len(), 1);
+        assert_eq!(scope.children[0].name, "body");
+        assert_eq!(scope.children[0].multiplicity, Multiplicity::One);
+
+        // Maybe { id, body: Option<Box<Flow>> } — body is Optional.
+        let maybe = schema.variant("Maybe").expect("Maybe");
+        assert_eq!(maybe.children.len(), 1);
+        assert_eq!(maybe.children[0].name, "body");
+        assert_eq!(maybe.children[0].multiplicity, Multiplicity::Optional);
+    }
+
+    #[test]
+    fn dsl_schema_to_json_round_trip_shape() {
+        use dsl_kit_schema::DslSchema;
+
+        let json = Flow::schema().to_json();
+        assert_eq!(json["name"], "Flow");
+        let variants = json["variants"].as_array().expect("variants array");
+        assert_eq!(variants.len(), 5);
+
+        // Spot-check Maybe.body → optional.
+        let maybe = variants
+            .iter()
+            .find(|v| v["name"] == "Maybe")
+            .expect("Maybe variant");
+        assert_eq!(maybe["children"][0]["name"], "body");
+        assert_eq!(maybe["children"][0]["multiplicity"], "optional");
     }
 }

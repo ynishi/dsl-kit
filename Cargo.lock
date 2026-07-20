@@ -235,6 +235,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl-kit-schema"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -308,6 +315,7 @@ dependencies = [
  "dsl-kit",
  "dsl-kit-core",
  "dsl-kit-macros",
+ "dsl-kit-schema",
  "serde_json",
  "smallvec",
  "thiserror",

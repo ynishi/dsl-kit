@@ -10,6 +10,11 @@
 //!   `Vec<T>`, where `T` is the enum itself, is treated as a child.
 //! - `WalkMut` — mutable counterpart of `Walk`.
 //!
+//! `#[derive(DslSchema)]` accepts the same shape and emits an
+//! `impl DslSchema` returning a `NodeSchema` — the type-level view of
+//! variants, non-recursive payload fields, and child-field
+//! multiplicity. See `dsl-kit-schema` for the target types.
+//!
 //! Variants may carry additional fields of unrelated types (payload); those
 //! fields are ignored by the traversal.
 //!
@@ -20,7 +25,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{ToTokens, quote};
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments, Type, TypePath,
     parse_macro_input,
@@ -259,6 +264,104 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             fn children_mut(&mut self) -> ::std::vec::Vec<&mut Self> {
                 match self {
                     #(#child_mut_arms)*
+                }
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Derives `dsl_kit_schema::DslSchema` for the same enum shape accepted
+/// by [`DslNode`]. The generated `schema()` method returns a
+/// `NodeSchema` describing every variant, its non-recursive payload
+/// fields, and the multiplicity of each recursive child field.
+///
+/// The `id: NodeId` field is stripped from the schema — it is an
+/// implementation detail of the observability layer, not part of the
+/// DSL's external shape. Recursive fields (`T` / `Box<T>` /
+/// `Option<T>` / `Option<Box<T>>` / `Vec<T>` / `Vec<Box<T>>` where `T`
+/// is the enum itself) become `ChildSchema` entries; every other named
+/// field becomes a `FieldSchema` carrying the Rust type source text.
+#[proc_macro_derive(DslSchema)]
+pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+    let name_str = name.to_string();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(
+            &input,
+            "#[derive(DslSchema)] currently supports enums only",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let mut variant_ctors = Vec::new();
+
+    for variant in &data.variants {
+        let variant_ident = &variant.ident;
+        let variant_name = variant_ident.to_string();
+
+        let Fields::Named(fields) = &variant.fields else {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslSchema)] requires every variant to use named fields",
+            )
+            .to_compile_error()
+            .into();
+        };
+
+        let mut field_ctors = Vec::new();
+        let mut child_ctors = Vec::new();
+
+        for f in &fields.named {
+            let Some(ident) = &f.ident else { continue };
+            let ident_str = ident.to_string();
+            if ident_str == "id" {
+                continue;
+            }
+
+            if let Some(kind) = detect_recursion(&f.ty, &name) {
+                let mult = match kind {
+                    Recursion::Direct | Recursion::Boxed => quote!(One),
+                    Recursion::Optional | Recursion::OptionalBoxed => quote!(Optional),
+                    Recursion::Many | Recursion::ManyBoxed => quote!(Many),
+                };
+                child_ctors.push(quote! {
+                    ::dsl_kit_schema::ChildSchema {
+                        name: #ident_str.to_string(),
+                        multiplicity: ::dsl_kit_schema::Multiplicity::#mult,
+                    }
+                });
+            } else {
+                let ty_src = f.ty.to_token_stream().to_string();
+                field_ctors.push(quote! {
+                    ::dsl_kit_schema::FieldSchema {
+                        name: #ident_str.to_string(),
+                        ty: #ty_src.to_string(),
+                    }
+                });
+            }
+        }
+
+        variant_ctors.push(quote! {
+            ::dsl_kit_schema::VariantSchema {
+                name: #variant_name.to_string(),
+                fields: ::std::vec![#(#field_ctors),*],
+                children: ::std::vec![#(#child_ctors),*],
+            }
+        });
+    }
+
+    let expanded: TokenStream2 = quote! {
+        impl #impl_generics ::dsl_kit_schema::DslSchema for #name #ty_generics #where_clause {
+            fn schema() -> ::dsl_kit_schema::NodeSchema {
+                ::dsl_kit_schema::NodeSchema {
+                    name: #name_str.to_string(),
+                    variants: ::std::vec![#(#variant_ctors),*],
                 }
             }
         }
