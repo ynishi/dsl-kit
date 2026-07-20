@@ -57,6 +57,11 @@
 //!
 //! - `%ident` — `[A-Za-z_][A-Za-z_0-9]*`
 //! - `%int`   — `-?[0-9]+`
+//! - `%str`   — a double-quoted string literal with `\"` `\\` `\n`
+//!   `\t` `\r` escapes. Unlike every other token, the production it
+//!   contributes is the **decoded inner content** (quotes stripped,
+//!   escapes resolved), so a `Field` wrapping `%str` binds the string
+//!   value directly.
 //! - `%ws`    — `[ \t\r\n]+` (skip is disabled for this class)
 //! - `%kw:<word>` — literal `<word>` with a word-boundary guard: the
 //!   byte immediately after the match must not be a word char. This is
@@ -131,7 +136,8 @@ pub enum Peg {
     Token {
         /// Stable node id.
         id: NodeId,
-        /// Token pattern (literal or `%ident` / `%int` / `%ws`).
+        /// Token pattern (literal or `%ident` / `%int` / `%str` /
+        /// `%ws` / `%kw:<word>`).
         pat: String,
     },
     /// Opens a `ParseTree` capture scope with the given `variant` name.
@@ -676,6 +682,22 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             self.skip_ws();
         }
         let start = self.pos;
+        if pat == "%str" {
+            // Special-cased because the contributed production is the
+            // decoded inner content, not the matched source slice.
+            return match self.match_str() {
+                Some(decoded) => {
+                    let end = self.pos;
+                    self.contribute_text(decoded, Span::new(start, end));
+                    Ok(())
+                }
+                None => {
+                    self.expected(pat);
+                    self.pos = start;
+                    Err(())
+                }
+            };
+        }
         let ok = if pat == "%ident" {
             self.match_ident()
         } else if pat == "%int" {
@@ -749,6 +771,37 @@ impl<'g, 'i> Interpreter<'g, 'i> {
         } else {
             false
         }
+    }
+
+    /// Matches a double-quoted string literal and returns the decoded
+    /// inner content. `None` on no opening quote, an unterminated
+    /// literal, or an unknown escape.
+    fn match_str(&mut self) -> Option<String> {
+        let rest = &self.input[self.pos..];
+        let mut chars = rest.char_indices();
+        match chars.next() {
+            Some((_, '"')) => {}
+            _ => return None,
+        }
+        let mut out = String::new();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '"' => {
+                    self.pos += i + 1;
+                    return Some(out);
+                }
+                '\\' => match chars.next() {
+                    Some((_, '"')) => out.push('"'),
+                    Some((_, '\\')) => out.push('\\'),
+                    Some((_, 'n')) => out.push('\n'),
+                    Some((_, 't')) => out.push('\t'),
+                    Some((_, 'r')) => out.push('\r'),
+                    _ => return None,
+                },
+                other => out.push(other),
+            }
+        }
+        None
     }
 
     fn match_ws_required(&mut self) -> bool {

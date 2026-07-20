@@ -35,6 +35,7 @@ use std::fmt;
 
 pub mod grammar_check;
 pub mod peg;
+pub mod schema_gen;
 pub mod serde_bridge;
 
 // ---------------------------------------------------------------------------
