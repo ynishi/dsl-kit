@@ -7,5 +7,7 @@ publish = false
 description = "Second reference DSL for dsl-kit: a tiny arithmetic expression language with unbound-variable suspensions. Example DSL, not part of the kit surface."
 
 [dependencies]
-dsl-kit      = { workspace = true }
-dsl-kit-core = { workspace = true }
+dsl-kit        = { workspace = true }
+dsl-kit-core   = { workspace = true }
+dsl-kit-macros = { workspace = true }
+dsl-kit-schema = { workspace = true }

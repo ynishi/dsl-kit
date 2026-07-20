@@ -300,6 +300,28 @@ impl DslHost for FlowHost {
             ),
         ]
     }
+
+    fn schema_json(&self) -> Option<String> {
+        use dsl_kit_schema::DslSchema;
+        Some(Flow::schema().to_json().to_string())
+    }
+
+    fn lint_json(&self) -> Option<String> {
+        use dsl_kit_lint::Linter;
+        let diagnostics = Linter::<Flow>::with_defaults().lint(self.program);
+        let value: Vec<serde_json::Value> = diagnostics
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "rule": d.rule,
+                    "severity": format!("{:?}", d.severity),
+                    "node": d.node.0,
+                    "message": d.message,
+                })
+            })
+            .collect();
+        Some(serde_json::Value::Array(value).to_string())
+    }
 }
 
 /// Adapt the v3 [`StepOutcome`] shape to the DSL-agnostic
@@ -348,5 +370,63 @@ fn pending_to_location(ctx: &dsl_kit::NodeContext) -> HostLocation {
         depth: ctx.depth,
         frame: ctx.frame.map(|f| f.0),
         iteration: ctx.iteration.map(|i| i.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsl_kit_mcp::host::DslHost;
+
+    #[test]
+    fn schema_json_serializes_flow_shape() {
+        let host = FlowHost::new_with_default_program();
+        let text = host.schema_json().expect("FlowHost wires schema_json");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("schema_json must be valid JSON");
+        assert_eq!(value["name"], "Flow");
+        let variants = value["variants"].as_array().expect("variants array");
+        // Flow has 5 variants: Seq / Par / Call / Scope / Maybe.
+        assert_eq!(variants.len(), 5);
+        // Spot-check: Maybe's body child is Optional.
+        let maybe = variants
+            .iter()
+            .find(|v| v["name"] == "Maybe")
+            .expect("Maybe variant");
+        assert_eq!(maybe["children"][0]["multiplicity"], "optional");
+    }
+
+    #[test]
+    fn lint_json_returns_empty_array_for_clean_program() {
+        let host = FlowHost::new_with_default_program();
+        let text = host.lint_json().expect("FlowHost wires lint_json");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("lint_json must be valid JSON");
+        let arr = value.as_array().expect("lint_json is a JSON array");
+        assert!(
+            arr.is_empty(),
+            "reference research_pipeline should lint clean, got {arr:?}"
+        );
+    }
+
+    #[test]
+    fn lint_json_reports_empty_seq_via_no_empty_many_children() {
+        // Build a program with an empty Seq — NoEmptyManyChildren should
+        // fire, and the diagnostic must flow through lint_json unchanged.
+        let ids = IdGen::new();
+        let empty_seq_id = ids.node();
+        let program: &'static Flow = Box::leak(Box::new(Flow::Seq {
+            id: ids.node(),
+            children: vec![Flow::Seq { id: empty_seq_id, children: vec![] }],
+        }));
+        let host = FlowHost::with_program(program);
+        let text = host.lint_json().expect("FlowHost wires lint_json");
+        let value: serde_json::Value =
+            serde_json::from_str(&text).expect("lint_json must be valid JSON");
+        let arr = value.as_array().expect("lint_json is a JSON array");
+        assert_eq!(arr.len(), 1, "diags = {arr:?}");
+        assert_eq!(arr[0]["rule"], "no-empty-many-children");
+        assert_eq!(arr[0]["severity"], "Error");
+        assert_eq!(arr[0]["node"], empty_seq_id.0);
     }
 }

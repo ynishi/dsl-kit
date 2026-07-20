@@ -270,6 +270,28 @@ impl DslHost for ExprHost {
             ),
         ]
     }
+
+    fn schema_json(&self) -> Option<String> {
+        use dsl_kit_schema::DslSchema;
+        Some(Expr::schema().to_json().to_string())
+    }
+
+    fn lint_json(&self) -> Option<String> {
+        use dsl_kit_lint::Linter;
+        let diagnostics = Linter::<Expr>::with_defaults().lint(self.program);
+        let value: Vec<serde_json::Value> = diagnostics
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "rule": d.rule,
+                    "severity": format!("{:?}", d.severity),
+                    "node": d.node.0,
+                    "message": d.message,
+                })
+            })
+            .collect();
+        Some(serde_json::Value::Array(value).to_string())
+    }
 }
 
 fn default_resolution(name: &str) -> i64 {

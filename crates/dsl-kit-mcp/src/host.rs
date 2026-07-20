@@ -247,4 +247,27 @@ pub trait DslHost: Send + Sync {
     fn resources(&self) -> Vec<crate::ResourceEntry> {
         Vec::new()
     }
+
+    /// Type-level shape of the DSL as a JSON document (mirror of
+    /// `dsl_kit_schema::NodeSchema::to_json`).
+    ///
+    /// Hosts whose DSL derives `DslSchema` return the serialized
+    /// schema; hosts that have not wired schema reflection return
+    /// `None` (the default), and the corresponding MCP tool reports
+    /// the DSL as schema-less rather than fabricating a value.
+    fn schema_json(&self) -> Option<String> {
+        None
+    }
+
+    /// Lint diagnostics against the currently-loaded AST as a JSON
+    /// array (`[{"rule": .., "severity": .., "node": .., "message": ..}, …]`).
+    ///
+    /// Hosts wire this by running a
+    /// [`dsl_kit_lint::Linter`](https://docs.rs/dsl-kit-lint) over
+    /// their AST and serializing the diagnostics. Hosts that opt out
+    /// return `None` (the default), and the tool reports the DSL as
+    /// lint-less.
+    fn lint_json(&self) -> Option<String> {
+        None
+    }
 }

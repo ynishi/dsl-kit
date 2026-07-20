@@ -21,7 +21,7 @@ use dsl_kit::{
 };
 
 /// AST of the arithmetic DSL.
-#[derive(Debug, DslNode)]
+#[derive(Debug, DslNode, dsl_kit_macros::DslSchema)]
 pub enum Expr {
     /// Integer literal.
     Lit {

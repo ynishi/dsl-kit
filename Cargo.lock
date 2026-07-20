@@ -271,6 +271,8 @@ version = "0.0.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-core",
+ "dsl-kit-macros",
+ "dsl-kit-schema",
 ]
 
 [[package]]
@@ -292,8 +294,11 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
+ "dsl-kit-lint",
  "dsl-kit-mcp",
+ "dsl-kit-schema",
  "expr-dsl",
+ "serde_json",
 ]
 
 [[package]]
@@ -346,8 +351,11 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
+ "dsl-kit-lint",
  "dsl-kit-mcp",
+ "dsl-kit-schema",
  "flow-dsl",
+ "serde_json",
 ]
 
 [[package]]

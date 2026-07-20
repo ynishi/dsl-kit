@@ -440,6 +440,44 @@ impl DslMcpHandler {
         guard.host.reset();
         Ok(json!({ "reset": true }).to_string())
     }
+
+    /// Returns the loaded DSL's type-level schema as JSON.
+    ///
+    /// Envelope: `{ "wired": bool, "schema": <NodeSchema JSON> | null }`.
+    /// `wired=false` means the host has not implemented
+    /// [`DslHost::schema_json`] — the DSL is running through the MCP
+    /// surface but hasn't opted into schema reflection.
+    #[tool(name = "dsl_kit_schema")]
+    pub async fn dsl_kit_schema(&self) -> Result<String, String> {
+        let guard = self.state.lock().await;
+        match guard.host.schema_json() {
+            Some(text) => {
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("host schema_json is not valid JSON: {e}"))?;
+                Ok(json!({ "wired": true, "schema": value }).to_string())
+            }
+            None => Ok(json!({ "wired": false, "schema": null }).to_string()),
+        }
+    }
+
+    /// Runs the host's lint pass over the currently-loaded AST and
+    /// returns the diagnostics as JSON.
+    ///
+    /// Envelope: `{ "wired": bool, "diagnostics": [...] | null }`.
+    /// `wired=false` means the host has not implemented
+    /// [`DslHost::lint_json`].
+    #[tool(name = "dsl_kit_lint")]
+    pub async fn dsl_kit_lint(&self) -> Result<String, String> {
+        let guard = self.state.lock().await;
+        match guard.host.lint_json() {
+            Some(text) => {
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|e| format!("host lint_json is not valid JSON: {e}"))?;
+                Ok(json!({ "wired": true, "diagnostics": value }).to_string())
+            }
+            None => Ok(json!({ "wired": false, "diagnostics": null }).to_string()),
+        }
+    }
 }
 
 // ---------- ServerHandler impl -----------------------------------------
