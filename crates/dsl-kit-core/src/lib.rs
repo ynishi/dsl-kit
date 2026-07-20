@@ -361,6 +361,63 @@ impl CountingSink {
     }
 }
 
+/// Recording event sink that keeps every observed [`Event`] in order.
+///
+/// Complements [`CountingSink`] (built-in on `Engine`) by preserving the
+/// full event history for downstream inspection — debuggers, tracers,
+/// test assertions, etc. Attach one to an engine via
+/// `Engine::attach_sink` and drain / snapshot it between mutations.
+#[derive(Debug, Default, Clone)]
+pub struct BufferingSink {
+    events: Vec<Event>,
+}
+
+impl BufferingSink {
+    /// Creates an empty, unbounded buffer.
+    pub fn new() -> Self {
+        Self { events: Vec::new() }
+    }
+
+    /// Creates an empty buffer with pre-allocated capacity `cap`.
+    ///
+    /// The buffer is still logically unbounded; `cap` is only a
+    /// hint to avoid early re-allocations.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { events: Vec::with_capacity(cap) }
+    }
+
+    /// Returns a slice view of the recorded events without draining.
+    pub fn snapshot(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Takes every recorded event and clears the buffer.
+    pub fn drain(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Discards every recorded event without returning them.
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    /// Number of recorded events currently held.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// True when no events are held.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+impl EventSink for BufferingSink {
+    fn emit(&mut self, event: &Event) {
+        self.events.push(event.clone());
+    }
+}
+
 // ---------- Errors ------------------------------------------------------
 
 /// Structured error type for engine and evaluator failures.

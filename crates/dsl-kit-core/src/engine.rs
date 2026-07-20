@@ -319,6 +319,12 @@ pub struct Engine<A: Ast> {
     /// `Engine` `Send + Sync` (required by `DslHost`).
     frame_tree_cache:
         std::sync::OnceLock<Box<FrameTree<A::Value, A::Cursor, A::Delta, A::EffectError>>>,
+
+    /// Optional user-attached sink that receives every event alongside
+    /// the built-in [`CountingSink`]. Set via [`Engine::attach_sink`];
+    /// unset at construction so events emitted while `Engine::new`
+    /// spawns the root frame don't leak into user-visible history.
+    external_sink: Option<Box<dyn EventSink + Send + Sync>>,
 }
 
 impl<A: Ast> Engine<A> {
@@ -349,6 +355,7 @@ impl<A: Ast> Engine<A> {
             pending_bp: None,
             next_call_frame: 1,
             frame_tree_cache: std::sync::OnceLock::new(),
+            external_sink: None,
         };
         let root_path = Path::root().push(root_id);
         let root_frame = engine.spawn_frame(root_id, root_path)?;
@@ -374,6 +381,42 @@ impl<A: Ast> Engine<A> {
     /// Convenience wrapper around [`CountingSink::summarise`].
     pub fn event_summary(&self) -> String {
         self.events.summarise()
+    }
+
+    /// Attaches an external sink that receives every subsequent event
+    /// alongside the built-in [`CountingSink`].
+    ///
+    /// Multiple attachments are not supported: calling `attach_sink`
+    /// twice replaces the earlier sink and returns it via the return
+    /// value so the caller can drain any leftover state. Use a
+    /// combinator sink (e.g. one that internally fans out) when more
+    /// than one downstream observer is needed.
+    ///
+    /// Events emitted while `Engine::new` spawns the root frame are
+    /// **not** forwarded to any attached sink — attach after `new`
+    /// returns.
+    pub fn attach_sink(
+        &mut self,
+        sink: Box<dyn EventSink + Send + Sync>,
+    ) -> Option<Box<dyn EventSink + Send + Sync>> {
+        self.external_sink.replace(sink)
+    }
+
+    /// Removes the currently attached external sink (if any) and
+    /// returns it to the caller.
+    pub fn detach_sink(&mut self) -> Option<Box<dyn EventSink + Send + Sync>> {
+        self.external_sink.take()
+    }
+
+    /// Emits `event` to the built-in [`CountingSink`] and — if
+    /// present — to the user-attached external sink.
+    fn emit_event(&mut self, event: &Event) {
+        // NOTE: call the CountingSink's `emit` directly on the field to
+        // avoid an infinite recursion into `emit_event` itself.
+        <CountingSink as EventSink>::emit(&mut self.events, event);
+        if let Some(sink) = self.external_sink.as_deref_mut() {
+            sink.emit(event);
+        }
     }
 
     /// Path of the currently-active leaf (a `Pending`, or the next node
@@ -448,7 +491,7 @@ impl<A: Ast> Engine<A> {
                     };
                     self.pending.push(pending.clone());
                     self.pending_bp = Some(sid);
-                    self.events.emit(&Event::Suspend {
+                    self.emit_event(&Event::Suspend {
                         at: ctx,
                         reason: SuspendReason::Breakpoint,
                     });
@@ -562,7 +605,7 @@ impl<A: Ast> Engine<A> {
         node_id: NodeId,
         path: Path,
     ) -> Result<FrameHandle, EngineError> {
-        self.events.emit(&Event::VisitPre {
+        self.emit_event(&Event::VisitPre {
             at: Self::synthetic_ctx(node_id, path.clone()),
         });
         match self.ast.node_kind(node_id) {
@@ -660,8 +703,8 @@ impl<A: Ast> Engine<A> {
                     label: label.clone(),
                     payload: serde_json::Value::Null,
                 };
-                self.events.emit(&Event::FrameEnter { at: ctx.clone() });
-                self.events.emit(&Event::Suspend {
+                self.emit_event(&Event::FrameEnter { at: ctx.clone() });
+                self.emit_event(&Event::Suspend {
                     at: ctx.clone(),
                     reason: SuspendReason::Call { spec: spec.clone() },
                 });
@@ -834,7 +877,7 @@ impl<A: Ast> Engine<A> {
             let child_path = path.push(next_id);
             // `next_child` here is the index the child about to spawn
             // occupies (0-based); increment for IterationTick display.
-            self.events.emit(&Event::IterationTick {
+            self.emit_event(&Event::IterationTick {
                 at: Self::synthetic_ctx(node, path.clone()),
             });
             let child = self.spawn_frame(next_id, child_path)?;
@@ -858,7 +901,7 @@ impl<A: Ast> Engine<A> {
             let value = last_value.unwrap_or_else(|| self.ast.unit_value());
             let promoted = InternalFrame::Value { node, value: value.clone() };
             *self.get_mut(h) = promoted;
-            self.events.emit(&Event::VisitPost {
+            self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
             });
             self.notify_par_slot(h, value);
@@ -878,7 +921,7 @@ impl<A: Ast> Engine<A> {
             let value = value.clone();
             self.vacate(body);
             *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
-            self.events.emit(&Event::VisitPost {
+            self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
             });
             self.notify_par_slot(h, value);
@@ -911,7 +954,7 @@ impl<A: Ast> Engine<A> {
                 self.vacate(body);
             }
             *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
-            self.events.emit(&Event::VisitPost {
+            self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
             });
             self.notify_par_slot(h, v);
@@ -1079,7 +1122,7 @@ impl<A: Ast> Engine<A> {
 
         // Mark Par as joined + promote to Value.
         *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
-        self.events.emit(&Event::VisitPost {
+        self.emit_event(&Event::VisitPost {
             at: Self::synthetic_ctx(node, path),
         });
         // If this Par sits inside another Par slot, notify.
@@ -1173,10 +1216,10 @@ impl<A: Ast> Engine<A> {
                 self.newly_pending.retain(|p| p.id != sid);
                 self.sid_to_frame.remove(&sid);
                 self.cancellations.push(sid);
-                self.events.emit(&Event::Cancel { id: sid });
+                self.emit_event(&Event::Cancel { id: sid });
                 let mut leave_ctx = Self::synthetic_ctx(node, path);
                 leave_ctx.frame = Some(call_frame);
-                self.events.emit(&Event::FrameLeave { at: leave_ctx });
+                self.emit_event(&Event::FrameLeave { at: leave_ctx });
                 *self.get_mut(h) = InternalFrame::Cancelled { node, reason };
                 return;
             }
@@ -1437,11 +1480,11 @@ impl<A: Ast> Stepper for Engine<A> {
                     };
                 let mut ctx = Self::synthetic_ctx(node, path);
                 ctx.frame = Some(call_frame);
-                self.events.emit(&Event::Resume { at: ctx.clone() });
-                self.events.emit(&Event::FrameLeave { at: ctx.clone() });
+                self.emit_event(&Event::Resume { at: ctx.clone() });
+                self.emit_event(&Event::FrameLeave { at: ctx.clone() });
                 // Replace leaf with Value.
                 *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
-                self.events.emit(&Event::VisitPost { at: ctx });
+                self.emit_event(&Event::VisitPost { at: ctx });
                 // If parent is a Par, fill the slot.
                 if let Some(&parent) = self.parent.get(&h) {
                     if let InternalFrame::Par { children, slots, completion_order, .. } =
@@ -1464,7 +1507,7 @@ impl<A: Ast> Stepper for Engine<A> {
                     };
                 let mut leave_ctx = Self::synthetic_ctx(node, path.clone());
                 leave_ctx.frame = Some(call_frame);
-                self.events.emit(&Event::FrameLeave { at: leave_ctx });
+                self.emit_event(&Event::FrameLeave { at: leave_ctx });
                 // Determine enclosing Par (if any) fail policy.
                 let mut enclosing_par_fail: Option<FailPolicy> = None;
                 let mut cur = h;
@@ -1540,7 +1583,7 @@ impl<A: Ast> Stepper for Engine<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Reducer, ReducerCollectAll};
+    use crate::{BufferingSink, Reducer, ReducerCollectAll};
 
     // ---- A minimal in-core test DSL --------------------------------
 
@@ -2494,6 +2537,106 @@ mod tests {
         // Verify cancellation channel drained the sibling sid.
         let cancels = e.take_cancellations();
         assert_eq!(cancels, vec![sids[1]]);
+    }
+
+    // ---- F1-e external sink + BufferingSink -----------------------
+
+    #[test]
+    fn attached_buffering_sink_records_walk_time_events_only() {
+        // Round 17 invariant: emits from `Engine::new`'s root spawn
+        // must not leak to a sink attached after construction.
+        let ast = N::Seq(vec![N::Call("hello".into())]);
+        let mut e = build(ast);
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(BufferingSink::new()));
+        let handle = std::sync::Arc::clone(&buf);
+        struct Shared(std::sync::Arc<std::sync::Mutex<BufferingSink>>);
+        impl EventSink for Shared {
+            fn emit(&mut self, event: &Event) {
+                self.0.lock().unwrap().emit(event);
+            }
+        }
+        let prev = e.attach_sink(Box::new(Shared(handle)));
+        assert!(prev.is_none(), "no sink previously attached");
+        // First step spawns the Call → emits VisitPre + FrameEnter + Suspend.
+        let sid = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!("expected Blocked"),
+        };
+        let recorded = buf.lock().unwrap().drain();
+        assert!(
+            recorded.iter().any(|e| matches!(e, Event::FrameEnter { .. })),
+            "attached sink saw the walk-time FrameEnter"
+        );
+        assert!(
+            recorded.iter().any(|e| matches!(e, Event::Suspend { .. })),
+            "attached sink saw the walk-time Suspend"
+        );
+        assert!(
+            recorded.iter().any(|e| matches!(e, Event::VisitPre { .. })),
+            "attached sink saw the walk-time VisitPre for the Call child"
+        );
+        // Resolve → emits Resume + FrameLeave + VisitPost.
+        e.resolve(sid, Ok(V::S("done".into()))).unwrap();
+        let recorded = buf.lock().unwrap().drain();
+        let kinds: Vec<&str> = recorded
+            .iter()
+            .map(|e| match e {
+                Event::Resume { .. } => "resume",
+                Event::FrameLeave { .. } => "frame_leave",
+                Event::VisitPost { .. } => "visit_post",
+                Event::VisitPre { .. } => "visit_pre",
+                Event::FrameEnter { .. } => "frame_enter",
+                Event::Suspend { .. } => "suspend",
+                Event::IterationTick { .. } => "iter",
+                Event::Cancel { .. } => "cancel",
+            })
+            .collect();
+        assert!(kinds.contains(&"resume"), "resume observed: {:?}", kinds);
+        assert!(kinds.contains(&"frame_leave"), "frame_leave observed: {:?}", kinds);
+    }
+
+    #[test]
+    fn detach_sink_returns_the_installed_sink_and_stops_forwarding() {
+        let ast = N::Seq(vec![N::Call("x".into()), N::Call("y".into())]);
+        let mut e = build(ast);
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(BufferingSink::new()));
+        struct Shared(std::sync::Arc<std::sync::Mutex<BufferingSink>>);
+        impl EventSink for Shared {
+            fn emit(&mut self, event: &Event) {
+                self.0.lock().unwrap().emit(event);
+            }
+        }
+        e.attach_sink(Box::new(Shared(std::sync::Arc::clone(&buf))));
+        let sid = match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            _ => panic!(),
+        };
+        let after_first_step = buf.lock().unwrap().len();
+        assert!(after_first_step > 0, "sink accumulated events during first step");
+        // Detach: subsequent activity must not accrue in the buffer.
+        let previous = e.detach_sink();
+        assert!(previous.is_some(), "detach returned the installed sink");
+        buf.lock().unwrap().clear();
+        e.resolve(sid, Ok(V::S("X".into()))).unwrap();
+        let after_resolve = buf.lock().unwrap().len();
+        assert_eq!(
+            after_resolve, 0,
+            "no more events forwarded post-detach (found {after_resolve})"
+        );
+        // Counting sink still advances (built-in observability unaffected).
+        assert!(e.events().frame_enter > 0);
+        assert!(e.events().frame_leave > 0);
+    }
+
+    #[test]
+    fn attach_sink_replaces_previous_and_returns_it() {
+        let ast = N::Call("root".into());
+        let mut e = build(ast);
+        let first = Box::new(BufferingSink::new());
+        let second = Box::new(BufferingSink::new());
+        assert!(e.attach_sink(first).is_none());
+        let replaced = e.attach_sink(second);
+        assert!(replaced.is_some(), "previous sink returned to caller");
     }
 
     #[test]
