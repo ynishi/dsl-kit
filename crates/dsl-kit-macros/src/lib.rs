@@ -147,11 +147,13 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
     };
 
     let mut node_arms = Vec::new();
+    let mut variant_name_arms = Vec::new();
     let mut child_arms = Vec::new();
     let mut child_mut_arms = Vec::new();
 
     for variant in &data.variants {
         let variant_ident = &variant.ident;
+        let variant_name_str = variant_ident.to_string();
 
         let Fields::Named(fields) = &variant.fields else {
             return syn::Error::new_spanned(
@@ -192,6 +194,11 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
         // node_id arm.
         node_arms.push(quote! {
             Self::#variant_ident { id, .. } => *id,
+        });
+
+        // variant_name arm.
+        variant_name_arms.push(quote! {
+            Self::#variant_ident { .. } => #variant_name_str,
         });
 
         // children arm.
@@ -248,6 +255,12 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             fn node_id(&self) -> ::dsl_kit_core::NodeId {
                 match self {
                     #(#node_arms)*
+                }
+            }
+
+            fn variant_name(&self) -> &'static str {
+                match self {
+                    #(#variant_name_arms)*
                 }
             }
         }

@@ -948,6 +948,18 @@ pub struct Env<D> {
 pub trait DslNode {
     /// Returns the stable ID assigned to this node.
     fn node_id(&self) -> NodeId;
+
+    /// Returns the enum variant name of this node as a static string
+    /// (e.g. `"Seq"`, `"Par"`, `"Call"`).
+    ///
+    /// The name matches the variant's Rust source ident and lines up
+    /// with `dsl_kit_schema::VariantSchema::name` when the type also
+    /// derives `DslSchema`. Consumers use this to correlate a runtime
+    /// node with its type-level schema entry — schema-aware lint
+    /// rules, editor tooling, and any other component that needs to
+    /// go from an AST value to "which variant is this" without
+    /// downcasting.
+    fn variant_name(&self) -> &'static str;
 }
 
 // ---------- Breakpoints -------------------------------------------------

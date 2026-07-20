@@ -1423,4 +1423,107 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, NoEmptyLabels::NAME);
     }
+
+    // ---------- R-22: variant_name + NoEmptyManyChildren -------------
+
+    #[test]
+    fn variant_name_returns_source_ident_for_every_variant() {
+        let ids = IdGen::new();
+        let seq = Flow::Seq { id: ids.node(), children: vec![] };
+        let par = Flow::Par {
+            id: ids.node(),
+            children: vec![],
+            policy: None,
+            reducer_id: None,
+        };
+        let call = Flow::Call { id: ids.node(), label: "x".into() };
+        let scope = Flow::Scope {
+            id: ids.node(),
+            label: "s".into(),
+            body: Box::new(Flow::Call { id: ids.node(), label: "y".into() }),
+        };
+        let maybe = Flow::Maybe { id: ids.node(), body: None };
+
+        assert_eq!(seq.variant_name(), "Seq");
+        assert_eq!(par.variant_name(), "Par");
+        assert_eq!(call.variant_name(), "Call");
+        assert_eq!(scope.variant_name(), "Scope");
+        assert_eq!(maybe.variant_name(), "Maybe");
+    }
+
+    #[test]
+    fn no_empty_many_children_fires_on_empty_seq_and_par() {
+        use dsl_kit_lint::{Linter, NoEmptyManyChildren, Severity};
+
+        let ids = IdGen::new();
+        // Two many-only variants (Seq / Par) both empty. Nested inside
+        // a populated outer Seq so the outer itself lints clean.
+        let empty_seq_id = ids.node();
+        let empty_par_id = ids.node();
+        let program = Flow::Seq {
+            id: ids.node(),
+            children: vec![
+                Flow::Seq { id: empty_seq_id, children: vec![] },
+                Flow::Par {
+                    id: empty_par_id,
+                    children: vec![],
+                    policy: None,
+                    reducer_id: None,
+                },
+            ],
+        };
+        let diags = Linter::<Flow>::new()
+            .with_rule(NoEmptyManyChildren)
+            .lint(&program);
+        assert_eq!(diags.len(), 2, "diags = {diags:?}");
+        assert!(diags.iter().all(|d| d.rule == "no-empty-many-children"));
+        assert!(diags.iter().all(|d| d.severity == Severity::Error));
+        let hit: Vec<NodeId> = diags.iter().map(|d| d.node).collect();
+        assert!(hit.contains(&empty_seq_id));
+        assert!(hit.contains(&empty_par_id));
+    }
+
+    #[test]
+    fn no_empty_many_children_leaves_call_and_scope_and_maybe_alone() {
+        use dsl_kit_lint::{Linter, NoEmptyManyChildren};
+
+        let ids = IdGen::new();
+        // Call is a leaf (no children fields at all) — must not fire.
+        // Scope has body: One → not many-only → must not fire.
+        // Maybe body=None → children empty, but variant is Optional-only
+        // → not many-only → must not fire.
+        let program = Flow::Seq {
+            id: ids.node(),
+            children: vec![
+                Flow::Call { id: ids.node(), label: "leaf-call".into() },
+                Flow::Scope {
+                    id: ids.node(),
+                    label: "scoped".into(),
+                    body: Box::new(Flow::Call { id: ids.node(), label: "inner".into() }),
+                },
+                Flow::Maybe { id: ids.node(), body: None },
+            ],
+        };
+        let diags = Linter::<Flow>::new()
+            .with_rule(NoEmptyManyChildren)
+            .lint(&program);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn lint_defaults_now_include_no_empty_many_children() {
+        use dsl_kit_lint::Linter;
+
+        let ids = IdGen::new();
+        let empty_seq_id = ids.node();
+        let program = Flow::Seq {
+            id: ids.node(),
+            children: vec![Flow::Seq { id: empty_seq_id, children: vec![] }],
+        };
+        let diags = Linter::<Flow>::with_defaults().lint(&program);
+        // Only NoEmptyManyChildren should fire (other defaults are clean).
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, "no-empty-many-children");
+        assert_eq!(diags[0].node, empty_seq_id);
+    }
 }

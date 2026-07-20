@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 
 use dsl_kit_core::{NodeId, Phase, Walk};
-use dsl_kit_schema::DslSchema;
+use dsl_kit_schema::{DslSchema, Multiplicity};
 
 // ---------- Diagnostics -------------------------------------------------
 
@@ -171,16 +171,15 @@ impl<A: Walk> Linter<A> {
 
 impl<A: Walk + DslSchema> Linter<A> {
     /// Registers the built-in rule set — [`UniqueNodeIds`],
-    /// [`MaxDepth`] with the [`MaxDepth::DEFAULT_LIMIT`], and
-    /// [`MaxFanOut`] with the [`MaxFanOut::DEFAULT_LIMIT`].
-    ///
-    /// The `DslSchema` bound is reserved for future Schema-aware
-    /// defaults; the current set consults only [`Walk`].
+    /// [`MaxDepth`] with the [`MaxDepth::DEFAULT_LIMIT`],
+    /// [`MaxFanOut`] with the [`MaxFanOut::DEFAULT_LIMIT`], and
+    /// [`NoEmptyManyChildren`].
     pub fn with_defaults() -> Self {
         Self::new()
             .with_rule(UniqueNodeIds)
             .with_rule(MaxDepth::new(MaxDepth::DEFAULT_LIMIT))
             .with_rule(MaxFanOut::new(MaxFanOut::DEFAULT_LIMIT))
+            .with_rule(NoEmptyManyChildren)
     }
 }
 
@@ -324,6 +323,77 @@ impl<A: Walk> Rule<A> for MaxFanOut {
     }
 }
 
+/// Errors on a node whose variant declares at least one `Many` child
+/// field, no `One` child field, and is instantiated with zero direct
+/// children.
+///
+/// Schema-driven: matches the runtime node against its
+/// [`VariantSchema`](dsl_kit_schema::VariantSchema) via
+/// [`dsl_kit_core::DslNode::variant_name`], inspects the multiplicity of the
+/// variant's child fields, and only fires on variants whose child
+/// shape guarantees at least one child (i.e. the variant has ≥1
+/// `Many` child field and no `One` field — `Optional` alone would
+/// permit zero children legitimately, so those are excluded).
+///
+/// This is the precise version enabled by R-22's
+/// [`dsl_kit_core::DslNode::variant_name`] addition; a coarse `variant_name`-less
+/// implementation was deferred in R-21 to avoid mis-flagging genuine
+/// leaf variants.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEmptyManyChildren;
+
+impl NoEmptyManyChildren {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "no-empty-many-children";
+}
+
+impl<A: Walk + DslSchema> Rule<A> for NoEmptyManyChildren {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        // Precompute: which variant names carry the "≥1 Many field,
+        // no One field" shape.
+        let schema = A::schema();
+        let many_only: HashSet<String> = schema
+            .variants
+            .iter()
+            .filter(|v| {
+                let has_many = v
+                    .children
+                    .iter()
+                    .any(|c| c.multiplicity == Multiplicity::Many);
+                let has_one = v
+                    .children
+                    .iter()
+                    .any(|c| c.multiplicity == Multiplicity::One);
+                has_many && !has_one
+            })
+            .map(|v| v.name.clone())
+            .collect();
+
+        if many_only.is_empty() {
+            return;
+        }
+
+        ast.walk(&mut |node, phase| {
+            if phase != Phase::Pre {
+                return;
+            }
+            let name = node.variant_name();
+            if many_only.contains(name) && node.children().is_empty() {
+                ctx.report(
+                    Self::NAME,
+                    Severity::Error,
+                    node.node_id(),
+                    format!("{name} requires at least one child but has none"),
+                );
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,12 +413,36 @@ mod tests {
                 Tiny::Node { id, .. } => *id,
             }
         }
+
+        fn variant_name(&self) -> &'static str {
+            match self {
+                Tiny::Node { .. } => "Node",
+            }
+        }
     }
 
     impl Walk for Tiny {
         fn children(&self) -> Vec<&Self> {
             match self {
                 Tiny::Node { kids, .. } => kids.iter().collect(),
+            }
+        }
+    }
+
+    // Minimal DslSchema for Tiny so we can exercise NoEmptyManyChildren.
+    // Tiny has one variant with a Vec<Tiny> child field = many-only.
+    impl DslSchema for Tiny {
+        fn schema() -> dsl_kit_schema::NodeSchema {
+            dsl_kit_schema::NodeSchema {
+                name: "Tiny".into(),
+                variants: vec![dsl_kit_schema::VariantSchema {
+                    name: "Node".into(),
+                    fields: vec![],
+                    children: vec![dsl_kit_schema::ChildSchema {
+                        name: "kids".into(),
+                        multiplicity: Multiplicity::Many,
+                    }],
+                }],
             }
         }
     }
@@ -458,5 +552,39 @@ mod tests {
             .with_rule(UniqueNodeIds)
             .with_rule(MaxDepth::new(8));
         assert_eq!(l.rule_count(), 2);
+    }
+
+    #[test]
+    fn tiny_variant_name_returns_literal_ident() {
+        // Sanity check on the DslNode extension: hand-written impl
+        // returns the source-level variant ident.
+        let ast = leaf(1);
+        assert_eq!(ast.variant_name(), "Node");
+    }
+
+    #[test]
+    fn no_empty_many_children_fires_on_empty_many_only_variant() {
+        // Tiny::Node is many-only per its Schema — empty kids → fires.
+        let ast = leaf(1);
+        let diags = Linter::<Tiny>::new()
+            .with_rule(NoEmptyManyChildren)
+            .lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, NoEmptyManyChildren::NAME);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(diags[0].node, NodeId(1));
+        assert!(diags[0].message.contains("Node"));
+    }
+
+    #[test]
+    fn no_empty_many_children_passes_when_children_present() {
+        let ast = node(1, vec![leaf(2)]);
+        // Note: leaf(2) itself is still empty → fires on it. Only the
+        // populated root is clean.
+        let diags = Linter::<Tiny>::new()
+            .with_rule(NoEmptyManyChildren)
+            .lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].node, NodeId(2));
     }
 }
