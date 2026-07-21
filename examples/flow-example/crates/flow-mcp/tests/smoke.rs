@@ -119,7 +119,7 @@ async fn advance_to_par_fanout(h: &DslMcpHandler) -> Vec<u64> {
     let first = call_step(h, "to_yield").await;
     assert_eq!(first["kind"], "suspended");
     // Resolve fetch_query so the pipeline can enter the Scope + Par.
-    let _ = call_resolve(h, Some("q".into())).await;
+    let _ = call_resolve(h, Some("q")).await;
     // Keep stepping until pending has 3 entries.
     for _ in 0..16 {
         let _ = call_step(h, "to_yield").await;
@@ -300,7 +300,7 @@ async fn reset_starts_from_scratch() {
     let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()));
     let _ = call_step(&handler, "to_done").await;
     let before = call_state(&handler).await;
-    assert!(before["results"].as_array().unwrap().len() > 0);
+    assert!(!before["results"].as_array().unwrap().is_empty());
 
     call_reset(&handler).await;
     let after = call_state(&handler).await;

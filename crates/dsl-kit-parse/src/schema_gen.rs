@@ -547,7 +547,7 @@ mod tests {
     fn many_child_empty_list_is_conformant() {
         let tree = parse_ok("List(items: [])");
         assert!(
-            tree.child_slot("items").map_or(true, <[_]>::is_empty),
+            tree.child_slot("items").is_none_or(<[_]>::is_empty),
             "empty list = zero children"
         );
     }

@@ -1,6 +1,6 @@
 //! G-1d end-to-end smoke: JSON document → `dsl_kit_load` swaps the
 //! program → `dsl_kit_lint` reports on the fresh AST → `dsl_kit_step`
-//! + `dsl_kit_resolve` drive it to completion, and `dsl_kit_state`
+//! and `dsl_kit_resolve` drive it to completion, and `dsl_kit_state`
 //! surfaces `16` as the final result.
 //!
 //! Exercises the closed consumer loop the parser-design note (§3.3)
@@ -57,7 +57,7 @@ async fn load_then_lint_then_run_yields_sixteen() {
     let _ = h.dsl_kit_breakpoint_add(Parameters(bp_body)).await.unwrap();
     let before = parse(&h.dsl_kit_breakpoint_list().await.unwrap());
     assert!(
-        before["entries"].as_array().unwrap().len() >= 1,
+        !before["entries"].as_array().unwrap().is_empty(),
         "sanity: bp added"
     );
 

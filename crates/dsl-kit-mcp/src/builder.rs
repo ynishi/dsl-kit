@@ -509,8 +509,7 @@ mod tests {
         let bad = serde_json::json!({});
         let err = (tool.handler)(bad, ToolCtx)
             .await
-            .err()
-            .expect("expected err");
+            .expect_err("expected err");
         assert!(err.contains("failed to parse args"));
     }
 }
