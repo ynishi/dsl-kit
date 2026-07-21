@@ -20,8 +20,8 @@
 //!   `take_cancellations()` and looks them up in its own runtime-handle
 //!   map.
 //!
-//! See `workspace/tasks/dsl-kit-carry/async-join-design.md` for the full
-//! specification.
+//! The full behavioural specification lives in the rustdoc of
+//! [`Engine`], [`Stepper`], and the item-level contracts they link.
 
 #![warn(missing_docs)]
 

@@ -30,8 +30,12 @@
 //!
 //! # Reference
 //!
-//! See `workspace/tasks/dsl-kit-carry/async-join-design.md` — this
-//! module is the concrete implementation of §3, §4, §5, §7.
+//! This module is the concrete implementation of the async-join design:
+//! the frame arena and spawn schedule, structured fan-out with join
+//! policies, cooperative cancellation, and the event stream. The
+//! load-bearing contracts live in the item-level docs below
+//! ([`Engine::step_with_breakpoints`], [`Stepper::resolve`],
+//! [`Engine::events`]).
 
 use std::collections::HashMap;
 use std::fmt::Debug;

@@ -1,7 +1,6 @@
 //! Static grammar checks (G-3) for a [`crate::peg::Grammar`] value.
 //!
-//! Per `parser-design.md §4` (G-3 row) and `round-26-handoff.md` closing
-//! notes, `GrammarCheck` is the *static* side of parser-core quality.
+//! `GrammarCheck` is the *static* side of parser-core quality.
 //! The runtime interpreter in [`crate::peg`] carries backstops for left
 //! recursion and nullable-body [`crate::peg::Peg::Repeat`], but the
 //! grammar author wants to be told before parse time — every ill-formed
