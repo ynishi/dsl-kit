@@ -34,7 +34,20 @@
 //!   `bool` → `true` / `false`. Any other payload type fails
 //!   generation with [`codes::UNSUPPORTED_FIELD`] — loudly, per
 //!   variant, rather than silently dropping the variant from the
-//!   grammar.
+//!   grammar — unless a [`SyntaxOverrides`] entry supplies its value
+//!   production.
+//!
+//! # Syntax overrides
+//!
+//! [`grammar_from_schema_with`] accepts a [`SyntaxOverrides`] carrying
+//! value productions for payload types the built-in mapping rejects
+//! (e.g. `Option<JoinPolicy>`), keyed by type source text or pinned to
+//! one `(variant, field)` site. The override supplies only the value
+//! [`Peg`] — the surrounding `name: value` argument shape stays
+//! canonical — and its matched text becomes the field's production, so
+//! the override author owns making that text consumable downstream
+//! (typically `FromStr` on the field type, via
+//! [`build_field`](crate::build_field)).
 //!
 //! # Guarantees
 //!
@@ -45,6 +58,8 @@
 //! against it — the tests pin this. Trees produced by parsing satisfy
 //! [`check_conformance`](crate::check_conformance) against the source
 //! schema.
+
+use std::collections::HashMap;
 
 use crate::grammar_check;
 use crate::peg::{Grammar, Peg, choice, field, node, repeat, rule, rule_ref, seq, token};
@@ -63,6 +78,81 @@ pub mod codes {
 /// Name of the generated start rule.
 pub const START_RULE: &str = "node";
 
+/// A deferred value-production constructor: overrides are registered
+/// before the [`IdGen`] doing the generation exists, so each entry is a
+/// factory invoked with the generator's `ids` at build time.
+type PegFactory = Box<dyn Fn(&IdGen) -> Peg>;
+
+/// Value-production overrides for payload fields whose Rust type has no
+/// built-in canonical-syntax mapping (see the module docs).
+///
+/// Two granularities, resolved most-specific-first:
+///
+/// 1. **Per field** ([`Self::for_field`]) — pinned to one
+///    `(variant, field)` site.
+/// 2. **Per type** ([`Self::for_type`]) — keyed by the field's Rust
+///    type source text; whitespace is ignored, so
+///    `"Option<JoinPolicy>"` matches the derive-extracted
+///    `"Option < JoinPolicy >"` spelling.
+///
+/// A field with neither entry falls back to the built-in mapping, and
+/// failing that still fails generation loudly with
+/// [`codes::UNSUPPORTED_FIELD`].
+///
+/// The factory builds only the **value** production; the enclosing
+/// `name ':' <value>` argument shape (and the `Field` sink binding the
+/// matched text to the field name) stays canonical, which keeps the
+/// generated grammar's `GrammarCheck` guarantees intact.
+#[derive(Default)]
+pub struct SyntaxOverrides {
+    by_type: HashMap<String, PegFactory>,
+    by_field: HashMap<(String, String), PegFactory>,
+}
+
+impl SyntaxOverrides {
+    /// An empty override set (equivalent to the built-in mapping only).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a value production for every payload field of Rust
+    /// type `ty` (source-text comparison, whitespace-insensitive).
+    pub fn for_type(
+        mut self,
+        ty: impl AsRef<str>,
+        value: impl Fn(&IdGen) -> Peg + 'static,
+    ) -> Self {
+        self.by_type.insert(strip_ws(ty.as_ref()), Box::new(value));
+        self
+    }
+
+    /// Registers a value production for the single field `field` of
+    /// variant `variant`, winning over any [`Self::for_type`] entry.
+    pub fn for_field(
+        mut self,
+        variant: impl Into<String>,
+        field: impl Into<String>,
+        value: impl Fn(&IdGen) -> Peg + 'static,
+    ) -> Self {
+        self.by_field.insert((variant.into(), field.into()), Box::new(value));
+        self
+    }
+
+    /// Most-specific matching factory for `field` of `variant`, if any.
+    fn resolve(&self, variant: &str, field: &FieldSchema) -> Option<&PegFactory> {
+        self.by_field
+            .get(&(variant.to_string(), field.name.clone()))
+            .or_else(|| self.by_type.get(&strip_ws(&field.ty)))
+    }
+}
+
+/// Whitespace-insensitive type key: `Option < JoinPolicy >` (the
+/// token-stream spelling `#[derive(DslSchema)]` extracts) and
+/// `Option<JoinPolicy>` (what an author writes) must compare equal.
+fn strip_ws(ty: &str) -> String {
+    ty.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 impl Grammar {
     /// Generates the canonical-syntax grammar for `schema`. See
     /// [`grammar_from_schema`].
@@ -72,12 +162,25 @@ impl Grammar {
 }
 
 /// Generates a [`Grammar`] for the canonical named-argument syntax of
-/// `schema` (see the module docs for the syntax).
+/// `schema` (see the module docs for the syntax), built-in field
+/// mapping only.
 ///
 /// Fails with one [`codes::UNSUPPORTED_FIELD`] diagnostic per
 /// unmappable payload field (collected across all variants, so the
-/// author sees the full list at once).
+/// author sees the full list at once). To map such fields instead of
+/// failing, use [`grammar_from_schema_with`].
 pub fn grammar_from_schema(schema: &NodeSchema, ids: &IdGen) -> Result<Grammar, BuildError> {
+    grammar_from_schema_with(schema, ids, &SyntaxOverrides::default())
+}
+
+/// [`grammar_from_schema`] with [`SyntaxOverrides`] consulted before
+/// the built-in field mapping (per-field entries win over per-type
+/// entries win over built-ins).
+pub fn grammar_from_schema_with(
+    schema: &NodeSchema,
+    ids: &IdGen,
+    overrides: &SyntaxOverrides,
+) -> Result<Grammar, BuildError> {
     if schema.variants.is_empty() {
         return Err(BuildError::single(Diagnostic::error(
             codes::EMPTY_SCHEMA,
@@ -88,12 +191,13 @@ pub fn grammar_from_schema(schema: &NodeSchema, ids: &IdGen) -> Result<Grammar, 
     let mut bad_fields = Vec::new();
     for v in &schema.variants {
         for f in &v.fields {
-            if field_value_peg(f, ids).is_none() {
+            if resolved_field_value_peg(&v.name, f, ids, overrides).is_none() {
                 bad_fields.push(Diagnostic::error(
                     codes::UNSUPPORTED_FIELD,
                     format!(
                         "variant `{}` field `{}`: type `{}` has no canonical-syntax \
-                         mapping (supported: String, bool, the integer types)",
+                         mapping (supported: String, bool, the integer types; or \
+                         register a `SyntaxOverrides` value production)",
                         v.name, f.name, f.ty
                     ),
                 ));
@@ -118,7 +222,7 @@ pub fn grammar_from_schema(schema: &NodeSchema, ids: &IdGen) -> Result<Grammar, 
         ),
     ));
     for v in &schema.variants {
-        rules.push(variant_rule(v, ids));
+        rules.push(variant_rule(v, ids, overrides));
     }
     Ok(Grammar::new(rules, START_RULE))
 }
@@ -126,10 +230,10 @@ pub fn grammar_from_schema(schema: &NodeSchema, ids: &IdGen) -> Result<Grammar, 
 /// Builds the rule for one variant:
 /// `Node { variant } [ %kw:V "(" arg ("," arg)* ")" ]` with arguments
 /// in schema order (fields, then children).
-fn variant_rule(v: &VariantSchema, ids: &IdGen) -> Peg {
+fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> Peg {
     let mut args: Vec<Peg> = Vec::new();
     for f in &v.fields {
-        let value = field_value_peg(f, ids)
+        let value = resolved_field_value_peg(&v.name, f, ids, overrides)
             .expect("unsupported field types were rejected before rule generation");
         args.push(seq(
             ids,
@@ -156,8 +260,22 @@ fn variant_rule(v: &VariantSchema, ids: &IdGen) -> Peg {
     rule(ids, v.name.clone(), node(ids, v.name.clone(), seq(ids, items)))
 }
 
-/// Value production for a payload field, by Rust type source text.
-/// `None` when the type has no canonical-syntax mapping.
+/// Value production for a payload field: the most specific
+/// [`SyntaxOverrides`] entry if registered, else the built-in mapping.
+fn resolved_field_value_peg(
+    variant: &str,
+    f: &FieldSchema,
+    ids: &IdGen,
+    overrides: &SyntaxOverrides,
+) -> Option<Peg> {
+    match overrides.resolve(variant, f) {
+        Some(factory) => Some(factory(ids)),
+        None => field_value_peg(f, ids),
+    }
+}
+
+/// Built-in value production for a payload field, by Rust type source
+/// text. `None` when the type has no canonical-syntax mapping.
 fn field_value_peg(f: &FieldSchema, ids: &IdGen) -> Option<Peg> {
     const INT_TYPES: &[&str] = &[
         "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
@@ -246,7 +364,17 @@ pub fn checked_grammar_from_schema(
     schema: &NodeSchema,
     ids: &IdGen,
 ) -> Result<Grammar, BuildError> {
-    let grammar = grammar_from_schema(schema, ids)?;
+    checked_grammar_from_schema_with(schema, ids, &SyntaxOverrides::default())
+}
+
+/// [`checked_grammar_from_schema`] with [`SyntaxOverrides`] consulted
+/// before the built-in field mapping.
+pub fn checked_grammar_from_schema_with(
+    schema: &NodeSchema,
+    ids: &IdGen,
+    overrides: &SyntaxOverrides,
+) -> Result<Grammar, BuildError> {
+    let grammar = grammar_from_schema_with(schema, ids, overrides)?;
     let mut diags = grammar_check::check_left_recursion(&grammar);
     diags.extend(grammar_check::check_nullable_repeat(&grammar));
     diags.extend(
@@ -427,6 +555,118 @@ mod tests {
                 .iter()
                 .all(|d| d.code == codes::UNSUPPORTED_FIELD)
         );
+    }
+
+    /// Flow-shaped schema whose `Par` payload fields the built-in
+    /// mapping rejects — the override motivating case.
+    fn par_schema() -> NodeSchema {
+        NodeSchema {
+            name: "Flow".into(),
+            variants: vec![
+                VariantSchema {
+                    name: "Par".into(),
+                    fields: vec![
+                        FieldSchema {
+                            name: "policy".into(),
+                            // Token-stream spelling, as the derive extracts it.
+                            ty: "Option < JoinPolicy >".into(),
+                        },
+                        FieldSchema {
+                            name: "reducer_id".into(),
+                            ty: "Option < String >".into(),
+                        },
+                    ],
+                    children: vec![ChildSchema {
+                        name: "children".into(),
+                        multiplicity: Multiplicity::Many,
+                    }],
+                },
+                VariantSchema {
+                    name: "Call".into(),
+                    fields: vec![FieldSchema { name: "label".into(), ty: "String".into() }],
+                    children: vec![],
+                },
+            ],
+        }
+    }
+
+    fn par_overrides() -> SyntaxOverrides {
+        SyntaxOverrides::new()
+            .for_type("Option<JoinPolicy>", |ids| {
+                choice(
+                    ids,
+                    vec![
+                        token(ids, "%kw:none"),
+                        token(ids, "%kw:all_failfast"),
+                        token(ids, "%kw:any_failfast"),
+                    ],
+                )
+            })
+            .for_type("Option<String>", |ids| {
+                choice(ids, vec![token(ids, "%kw:none"), token(ids, "%str")])
+            })
+    }
+
+    #[test]
+    fn type_overrides_unlock_exotic_payload_fields() {
+        // Without overrides the Flow-shaped schema fails generation
+        // (pinned by unsupported_field_type_fails_generation_with_full_list);
+        // with them it generates check-clean and parses. Note the
+        // override keys are written without whitespace while the schema
+        // carries the token-stream spelling.
+        let g = checked_grammar_from_schema_with(&par_schema(), &IdGen::new(), &par_overrides())
+            .expect("overridden Flow schema generates a clean grammar");
+        let tree = g
+            .parse(
+                r#"Par(policy: all_failfast, reducer_id: "reduce_all_ordered",
+                     children: [Call(label: "a"), Call(label: "b")])"#,
+            )
+            .expect("canonical Par text parses");
+        let diags = check_conformance(&tree, &par_schema());
+        assert!(diags.is_empty(), "conformance clean: {diags:?}");
+        assert_eq!(tree.field("policy"), Some(&RawValue::Text("all_failfast".into())));
+        assert_eq!(
+            tree.field("reducer_id"),
+            Some(&RawValue::Text("reduce_all_ordered".into()))
+        );
+        assert_eq!(tree.child_slot("children").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn field_override_wins_over_type_override() {
+        // Same type in both entries; the (variant, field)-pinned one
+        // must decide the syntax.
+        let overrides = par_overrides().for_field("Par", "policy", |ids| {
+            token(ids, "%kw:pinned")
+        });
+        let g = checked_grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides)
+            .expect("clean grammar with field-level override");
+        let tree = g
+            .parse(r#"Par(policy: pinned, reducer_id: none, children: [])"#)
+            .expect("field-level syntax parses");
+        assert_eq!(tree.field("policy"), Some(&RawValue::Text("pinned".into())));
+        // The type-level spelling is no longer accepted at that site.
+        assert!(
+            g.parse(r#"Par(policy: all_failfast, reducer_id: none, children: [])"#)
+                .is_err(),
+            "type-level syntax rejected once the field is pinned"
+        );
+    }
+
+    #[test]
+    fn unrelated_override_leaves_builtin_mapping_and_failure_intact() {
+        // An override for some other type neither rescues the
+        // unsupported fields nor perturbs built-in ones.
+        let overrides =
+            SyntaxOverrides::new().for_type("Uuid", |ids| token(ids, "%str"));
+        let err = grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides)
+            .unwrap_err();
+        assert_eq!(err.diagnostics.len(), 2, "both Par fields still unmapped");
+        assert!(err.diagnostics.iter().all(|d| d.code == codes::UNSUPPORTED_FIELD));
+        // Built-in demo schema is unaffected by the stray entry.
+        let g = checked_grammar_from_schema_with(&demo_schema(), &IdGen::new(), &overrides)
+            .expect("demo schema still generates");
+        assert_eq!(g.parse("Lit(value: 7)").unwrap().variant, "Lit");
     }
 
     #[test]

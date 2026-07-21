@@ -38,7 +38,9 @@ use dsl_kit::{
 // ---------- AST ---------------------------------------------------------
 
 /// AST of the flow DSL.
-#[derive(Debug, dsl_kit_macros::DslNode, dsl_kit_macros::DslSchema)]
+#[derive(
+    Debug, dsl_kit_macros::DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild,
+)]
 pub enum Flow {
     /// Runs its children in order.
     Seq {
@@ -56,8 +58,10 @@ pub enum Flow {
         children: Vec<Flow>,
         /// Join policy (shape + fail). `None` defaults to
         /// `{ shape: All, fail: FailFast }`.
+        #[dsl_build(with = parse_policy)]
         policy: Option<JoinPolicy>,
         /// Reducer id. `None` defaults to `reduce_all_ordered`.
+        #[dsl_build(with = parse_reducer_id)]
         reducer_id: Option<String>,
     },
     /// Denotes an external effect; the engine yields a `Pending` and
@@ -97,6 +101,83 @@ impl Flow {
             Flow::Maybe { .. } => "Maybe".into(),
         }
     }
+}
+
+// ---------- Text façade (canonical syntax overrides + converters) -------
+//
+// The grammar spelling and its build-side parser are two halves of one
+// contract, so both live here: `flow_syntax_overrides` teaches
+// `schema_gen` how `Par`'s exotic payload fields read as text, and the
+// `#[dsl_build(with = ...)]` converters below turn exactly those
+// spellings back into typed values. Change them together.
+
+use dsl_kit_parse::peg::{Peg, choice, token};
+use dsl_kit_parse::schema_gen::SyntaxOverrides;
+use dsl_kit_parse::{BuildError, Diagnostic, ParseTree, field_text};
+
+/// Fixed spellings for `Par`'s `policy` argument, one per supported
+/// [`JoinPolicy`] combination (plus `none` for the default).
+const POLICY_SPELLINGS: &[(&str, JoinPolicy)] = &[
+    ("all_failfast", JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast }),
+    ("all_collect", JoinPolicy { shape: JoinShape::All, fail: FailPolicy::CollectAll }),
+    ("any_failfast", JoinPolicy { shape: JoinShape::Any, fail: FailPolicy::FailFast }),
+];
+
+/// [`SyntaxOverrides`] making `Flow::schema()` generatable by
+/// `schema_gen`: value productions for the two `Par` payload fields the
+/// built-in mapping rejects.
+///
+/// - `policy` — `none` or one of the [`POLICY_SPELLINGS`] keywords.
+/// - `reducer_id` — `none` or the reducer name as a string literal.
+///   (The literal `"none"` is indistinguishable from the keyword after
+///   parsing and also maps to the default reducer.)
+pub fn flow_syntax_overrides() -> SyntaxOverrides {
+    fn policy_value(ids: &IdGen) -> Peg {
+        let mut arms = vec![token(ids, "%kw:none")];
+        arms.extend(
+            POLICY_SPELLINGS
+                .iter()
+                .map(|(kw, _)| token(ids, format!("%kw:{kw}"))),
+        );
+        choice(ids, arms)
+    }
+    SyntaxOverrides::new()
+        .for_type("Option<JoinPolicy>", policy_value)
+        .for_type("Option<String>", |ids| {
+            choice(ids, vec![token(ids, "%kw:none"), token(ids, "%str")])
+        })
+}
+
+/// `#[dsl_build(with)]` converter for `Par::policy`: inverse of the
+/// `policy` production in [`flow_syntax_overrides`].
+pub fn parse_policy(tree: &ParseTree, name: &str) -> Result<Option<JoinPolicy>, BuildError> {
+    let text = field_text(tree, name)?;
+    if text == "none" {
+        return Ok(None);
+    }
+    POLICY_SPELLINGS
+        .iter()
+        .find(|(kw, _)| *kw == text)
+        .map(|(_, policy)| Some(*policy))
+        .ok_or_else(|| {
+            BuildError::single(
+                Diagnostic::error(
+                    dsl_kit_parse::codes::FIELD_TYPE,
+                    format!(
+                        "field `{name}`: unknown policy spelling `{text}` (expected \
+                         none or one of the flow_syntax_overrides keywords)"
+                    ),
+                )
+                .with_span(tree.span),
+            )
+        })
+}
+
+/// `#[dsl_build(with)]` converter for `Par::reducer_id`: inverse of the
+/// `reducer_id` production in [`flow_syntax_overrides`].
+pub fn parse_reducer_id(tree: &ParseTree, name: &str) -> Result<Option<String>, BuildError> {
+    let text = field_text(tree, name)?;
+    Ok(if text == "none" { None } else { Some(text.to_string()) })
 }
 
 /// Renders a `Flow` as an indented text tree using the derived

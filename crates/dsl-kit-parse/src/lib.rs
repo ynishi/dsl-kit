@@ -705,6 +705,34 @@ where
     }
 }
 
+/// Extracts a payload field's raw text production.
+///
+/// Convenience for `#[dsl_build(with = ...)]` converter functions,
+/// which typically match on the spelling the grammar (often a
+/// `schema_gen::SyntaxOverrides` value production) captured. Errors
+/// mirror [`build_field`]: [`codes::MISSING_FIELD`] when absent,
+/// [`codes::FIELD_TYPE`] when the field carries a
+/// [`RawValue::Json`] payload instead of text.
+pub fn field_text<'t>(tree: &'t ParseTree, name: &str) -> Result<&'t str, BuildError> {
+    match tree.field(name) {
+        Some(RawValue::Text(s)) => Ok(s),
+        Some(RawValue::Json(_)) => Err(BuildError::single(
+            Diagnostic::error(
+                codes::FIELD_TYPE,
+                format!("field `{name}`: expected a text production, found JSON"),
+            )
+            .with_span(tree.span),
+        )),
+        None => Err(BuildError::single(
+            Diagnostic::error(
+                codes::MISSING_FIELD,
+                format!("missing required field `{name}`"),
+            )
+            .with_span(tree.span),
+        )),
+    }
+}
+
 /// Builds the single child of a [`Multiplicity::One`] slot.
 ///
 /// Returns [`codes::ARITY_ONE`] if the slot is absent or holds more

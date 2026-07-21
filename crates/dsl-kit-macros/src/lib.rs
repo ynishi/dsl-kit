@@ -21,7 +21,11 @@
 //! delegates payload deserialization to `dsl_kit_parse::build_field`
 //! and child-slot recursion to `build_child_one` / `build_child_optional`
 //! / `build_child_many`. Types deriving `DslBuild` must also derive
-//! `DslSchema` (used for the level-scoped conformance check).
+//! `DslSchema` (used for the level-scoped conformance check). Payload
+//! fields whose type has no `FromStr` route (e.g. `Option<T>`, which
+//! the orphan rule bars downstream crates from implementing) opt out of
+//! `build_field` with `#[dsl_build(with = path)]` — the named function
+//! converts the field itself. See [`derive_dsl_build`].
 //!
 //! Variants may carry additional fields of unrelated types (payload); those
 //! fields are ignored by the traversal.
@@ -404,7 +408,16 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 ///    Rust type must implement both `serde::de::DeserializeOwned` and
 ///    `FromStr`. `RawValue::Json` payloads dispatch through serde;
 ///    `RawValue::Text` payloads (the PEG front-end's natural output)
-///    dispatch through `FromStr`.
+///    dispatch through `FromStr`. A field annotated
+///    `#[dsl_build(with = path)]` bypasses `build_field`: `path` must
+///    name a function
+///    `fn(&ParseTree, &str) -> Result<T, BuildError>` (the field name
+///    is passed as the second argument), lifting the two trait bounds.
+///    This is the build-layer twin of `schema_gen::SyntaxOverrides` —
+///    required for types like `Option<JoinPolicy>` where the orphan
+///    rule bars a downstream `FromStr` impl. The attribute applies to
+///    payload fields only; annotating a recursive child field is a
+///    compile error.
 /// 4. For each recursive child field, calls the appropriate helper
 ///    ([`build_child_one`] / `_optional` / `_many`) and re-wraps the
 ///    result in `Box` where the source field is boxed.
@@ -418,7 +431,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 /// [`DslSchema`]: dsl_kit_schema::DslSchema
 /// [`ParseTree`]: dsl_kit_parse::ParseTree
 /// [`NodeId`]: dsl_kit_core::NodeId
-#[proc_macro_derive(DslBuild)]
+#[proc_macro_derive(DslBuild, attributes(dsl_build))]
 pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident.clone();
@@ -469,6 +482,25 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                 continue;
             }
             let ident_str = ident.to_string();
+
+            let with = match dsl_build_with_attr(f) {
+                Ok(w) => w,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            if let Some(path) = &with {
+                if detect_recursion(&f.ty, &name).is_some() {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_build(with = ...)] applies to payload fields only, \
+                         not recursive child fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let_bindings.push(quote! { let #ident = #path(tree, #ident_str)?; });
+                ctor_fields.push(quote! { #ident });
+                continue;
+            }
 
             if let Some(kind) = detect_recursion(&f.ty, &name) {
                 let helper_call = match kind {
@@ -546,4 +578,30 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Parses a field's `#[dsl_build(with = path)]` annotation, if present.
+/// `Ok(None)` when the field carries no `dsl_build` attribute.
+fn dsl_build_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
+    let mut with: Option<syn::Path> = None;
+    for attr in &f.attrs {
+        if !attr.path().is_ident("dsl_build") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("with") {
+                with = Some(meta.value()?.parse::<syn::Path>()?);
+                Ok(())
+            } else {
+                Err(meta.error("unsupported #[dsl_build(...)] key; expected `with = <path>`"))
+            }
+        })?;
+        if with.is_none() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[dsl_build] requires `with = <path>`",
+            ));
+        }
+    }
+    Ok(with)
 }

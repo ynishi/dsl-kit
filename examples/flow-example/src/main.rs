@@ -43,7 +43,7 @@ use dsl_kit::{
 use dsl_kit_schema::DslSchema;
 use flow_dsl::{
     Flow, FlowAst, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids,
-    flow_default_registry, pretty, research_pipeline,
+    flow_default_registry, flow_syntax_overrides, pretty, research_pipeline,
 };
 
 /// Sync effect backend for the drive layer: answers every `Call` with
@@ -258,6 +258,37 @@ async fn run_flow_async_fanout(
 /// Small standalone `Par`-of-three-calls program used by the FailFast
 /// demo. Kept separate from the research pipeline so a single failure
 /// isolates the fan-out cancellation behavior.
+/// The rescue for the fail-loud section above: with
+/// `flow_syntax_overrides` (grammar layer) and the
+/// `#[dsl_build(with = ...)]` converters (build layer) the same schema
+/// goes canonical text → generated grammar → typed `Flow` → engine.
+fn demonstrate_text_round_trip() {
+    use dsl_kit_parse::DslBuild;
+
+    let text = r#"Par(policy: any_failfast, reducer_id: "reduce_any_first_winner",
+                    children: [Call(label: "search_arxiv"), Call(label: "search_web")])"#;
+    let grammar = dsl_kit_parse::schema_gen::checked_grammar_from_schema_with(
+        &Flow::schema(),
+        &IdGen::new(),
+        &flow_syntax_overrides(),
+    )
+    .expect("overridden Flow schema generates a clean grammar");
+    println!("  {} rules generated with flow_syntax_overrides()", grammar.rules.len());
+    println!("  text: {}", text.lines().map(str::trim).collect::<Vec<_>>().join(" "));
+
+    let tree = grammar.parse(text).expect("canonical Flow text parses");
+    let flow = Flow::from_parse_tree(&tree, &IdGen::new()).expect("typed build");
+    println!("  typed: {}", pretty(&flow).trim_end().replace('\n', " / "));
+
+    let mut engine = Engine::new(FlowAst::new(&flow), Arc::new(flow_default_registry()))
+        .expect("root Ast validation");
+    let mut resolver = CannedResolver::default();
+    match drive(&mut engine, &mut resolver, &BreakpointSet::new()).expect("drive to done") {
+        DriveOutcome::Done(v) => println!("  engine result: {v:?}"),
+        DriveOutcome::Break { .. } => unreachable!("no breakpoints registered"),
+    }
+}
+
 fn par_three_searches(ids: &IdGen) -> Flow {
     Flow::Par {
         id: ids.node(),
@@ -432,9 +463,11 @@ async fn main() -> miette::Result<()> {
             for d in &e.diagnostics {
                 println!("    [{}] {}", d.code, d.message);
             }
-            println!("  (expr-example shows the succeeding path end to end.)");
         }
     }
+
+    println!("\n=== ...rescued by the per-field hooks (text -> typed -> engine) ===");
+    demonstrate_text_round_trip();
 
     println!("\n=== Breakpoints (static condition matching) ===");
     demonstrate_breakpoints(&program);

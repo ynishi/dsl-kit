@@ -3039,6 +3039,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn resolve_err_while_bp_halted_abandons_unspawned_spawns() {
+        // Seq(1) → Par(2, FailFast) → Call a(3), Call b(4). Halt on b's
+        // spawn site, then fail a's pending call *while halted*: the
+        // failure must propagate on the next step and kid b — still an
+        // unspawned entry on the spawn stack — must be abandoned, never
+        // spawned and never reported as a cancellation (it has no sid).
+        let ast = N::Seq(vec![N::Par {
+            children: vec![N::Call("a".into()), N::Call("b".into())],
+            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            reducer: "all_ordered",
+        }]);
+        let mut e = build(ast);
+        let bps = bp_at(4);
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(4)), "halted on kid b's ctx");
+        assert_eq!(e.events().frame_enter, 1, "only kid a spawned so far");
+        let a_sid = e
+            .pending()
+            .iter()
+            .find(|p| matches!(p.reason, SuspendReason::Call { .. }))
+            .map(|p| p.id)
+            .expect("kid a pending while halted");
+        e.resolve(a_sid, Err(EE("boom".into()))).unwrap();
+        // Resume: failure propagation runs before any spawn drains.
+        let err = e.step_with_breakpoints(&bps).unwrap_err();
+        assert!(matches!(err, ExecError::Effect(EE(ref s)) if s == "boom"));
+        assert_eq!(e.events().frame_enter, 1, "kid b never spawned");
+        assert!(
+            e.take_cancellations().is_empty(),
+            "abandoned spawn is not a cancellation (no sid was ever issued)"
+        );
+        assert!(e.pending().is_empty(), "synthetic BP and a's call both gone");
+        // Terminal: further stepping stays blocked with nothing new.
+        match e.step_with_breakpoints(&bps).unwrap() {
+            StepOutcome::Blocked { newly_pending } => assert!(newly_pending.is_empty()),
+            other => panic!("expected terminal Blocked, got {other:?}"),
+        }
+    }
+
     // ---- F2: sans-io drive layer -----------------------------------
 
     use crate::drive::{AsyncEffectResolver, DriveOutcome, EffectResolver, drive, drive_async};

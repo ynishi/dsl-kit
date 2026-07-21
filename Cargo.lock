@@ -295,6 +295,8 @@ dependencies = [
  "async-trait",
  "dsl-kit",
  "dsl-kit-mcp",
+ "dsl-kit-parse",
+ "dsl-kit-schema",
  "expr-dsl",
  "expr-host",
  "miette",
@@ -345,6 +347,7 @@ dependencies = [
  "dsl-kit-core",
  "dsl-kit-lint",
  "dsl-kit-macros",
+ "dsl-kit-parse",
  "dsl-kit-schema",
  "serde_json",
  "smallvec",
@@ -356,6 +359,8 @@ name = "flow-example"
 version = "0.0.0"
 dependencies = [
  "dsl-kit",
+ "dsl-kit-parse",
+ "dsl-kit-schema",
  "flow-dsl",
  "miette",
  "tokio",

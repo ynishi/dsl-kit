@@ -11,6 +11,7 @@ dsl-kit         = { workspace = true }
 dsl-kit-core    = { workspace = true }
 dsl-kit-macros  = { workspace = true }
 dsl-kit-schema  = { workspace = true }
+dsl-kit-parse   = { workspace = true }
 smallvec        = "1"
 serde_json      = "1"
 thiserror       = "2"
