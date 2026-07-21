@@ -33,6 +33,7 @@ use dsl_kit_schema::{ChildSchema, Multiplicity, NodeSchema, VariantSchema};
 use serde_json::{Value, json};
 use std::fmt;
 
+pub mod example_gen;
 pub mod grammar_check;
 pub mod peg;
 pub mod schema_gen;

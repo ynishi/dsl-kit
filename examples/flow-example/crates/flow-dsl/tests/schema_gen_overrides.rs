@@ -108,6 +108,36 @@ fn none_spellings_build_to_typed_defaults() {
     assert!(policy.is_none() && reducer_id.is_none());
 }
 
+#[test]
+fn synthesized_examples_cover_every_variant_and_build_typed() {
+    // Q-1 on the override case: examples are walked out of the
+    // *generated grammar*, so the override spellings (`none` /
+    // `all_failfast` / `%str`) surface with no extra registration.
+    let grammar = generated_grammar();
+    let examples = dsl_kit_parse::example_gen::examples_from_grammar(&grammar)
+        .expect("examples synthesize");
+    assert_eq!(examples.per_rule.len(), 5, "one example per Flow variant");
+    for e in &examples.per_rule {
+        let tree = grammar.parse(&e.text).unwrap_or_else(|err| {
+            panic!("example for `{}` failed to parse: {:?}\n  text: {}",
+                e.rule, err.diagnostics, e.text)
+        });
+        assert_eq!(tree.variant, e.rule);
+        // Every synthesized example builds a typed Flow through the
+        // #[dsl_build(with)] converters as well.
+        Flow::from_parse_tree(&tree, &IdGen::new()).unwrap_or_else(|err| {
+            panic!("example for `{}` failed typed build: {:?}", e.rule, err.diagnostics)
+        });
+    }
+    let par = examples.per_rule.iter().find(|e| e.rule == "Par").unwrap();
+    assert_eq!(
+        par.text, "Par(policy: none, reducer_id: none, children: [])",
+        "override spellings fall out of the grammar walk"
+    );
+    let composite_tree = grammar.parse(&examples.composite).expect("composite parses");
+    Flow::from_parse_tree(&composite_tree, &IdGen::new()).expect("composite builds typed");
+}
+
 /// Answers each `Call` with `done:<label>`.
 struct EchoResolver;
 
