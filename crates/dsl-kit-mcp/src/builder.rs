@@ -237,8 +237,18 @@ impl DslMcpBuilder {
         let host = Arc::new(Mutex::new(host));
         let breakpoints = Arc::new(dsl_kit::BreakpointSet::new());
 
-        // Input schema: an empty object; the tool accepts no args.
-        let input_schema = Arc::new(Default::default());
+        // Input schema for a no-arg tool. MCP spec requires
+        // `inputSchema` to be a JSON Schema *object* (`type: "object"`);
+        // sending an empty `{}` is rejected by strict clients (Claude
+        // Code returns `tools fetch failed`), so emit the minimum
+        // canonical empty-object schema.
+        let input_schema = Arc::new({
+            let mut m = JsonObject::new();
+            m.insert("type".into(), Value::String("object".into()));
+            m.insert("properties".into(), Value::Object(JsonObject::new()));
+            m.insert("additionalProperties".into(), Value::Bool(false));
+            m
+        });
 
         let boxed: BoxedHandler = Arc::new(move |_args: Value, _ctx: ToolCtx| {
             let host = host.clone();
