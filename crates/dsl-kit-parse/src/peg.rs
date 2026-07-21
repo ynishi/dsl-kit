@@ -183,7 +183,10 @@ pub struct Grammar {
 impl Grammar {
     /// Constructs a new [`Grammar`].
     pub fn new(rules: Vec<Peg>, start: impl Into<String>) -> Self {
-        Self { rules, start: start.into() }
+        Self {
+            rules,
+            start: start.into(),
+        }
     }
 
     /// Parses `input` against this grammar.
@@ -205,15 +208,10 @@ impl Grammar {
             .get(self.start.as_str())
             .copied()
             .ok_or_else(|| {
-                BuildError::single(
-                    Diagnostic::error(
-                        codes::UNKNOWN_RULE,
-                        format!(
-                            "start rule `{}` is not defined in the grammar",
-                            self.start
-                        ),
-                    ),
-                )
+                BuildError::single(Diagnostic::error(
+                    codes::UNKNOWN_RULE,
+                    format!("start rule `{}` is not defined in the grammar", self.start),
+                ))
             })?;
 
         let mut interp = Interpreter::new(input, rules_by_name);
@@ -243,10 +241,7 @@ impl Grammar {
             } else {
                 Diagnostic::error(
                     codes::UNEXPECTED,
-                    format!(
-                        "unexpected trailing input at byte {}",
-                        interp.pos
-                    ),
+                    format!("unexpected trailing input at byte {}", interp.pos),
                 )
                 .with_span(Some(Span::new(interp.pos, input.len())))
             };
@@ -416,8 +411,12 @@ impl<'g, 'i> Interpreter<'g, 'i> {
         if productions.is_empty() {
             return;
         }
-        let all_text = productions.iter().all(|p| matches!(p, Production::Text(..)));
-        let all_tree = productions.iter().all(|p| matches!(p, Production::Tree(..)));
+        let all_text = productions
+            .iter()
+            .all(|p| matches!(p, Production::Text(..)));
+        let all_tree = productions
+            .iter()
+            .all(|p| matches!(p, Production::Tree(..)));
 
         let Some(ActiveSink::Node(node_sink)) = self.sink_stack.last_mut() else {
             // Field outside a Node — silently ignored at runtime.
@@ -503,8 +502,8 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             let bytes = self.input.as_bytes();
             // Grab a small snippet — up to 8 bytes — to help the reader.
             let snip_end = self.input.len().min(self.farthest_pos + 8);
-            let snip = std::str::from_utf8(&bytes[self.farthest_pos..snip_end])
-                .unwrap_or("<non-utf8>");
+            let snip =
+                std::str::from_utf8(&bytes[self.farthest_pos..snip_end]).unwrap_or("<non-utf8>");
             format!("`{}`", snip)
         };
         Diagnostic::error(
@@ -578,11 +577,13 @@ impl<'g, 'i> Interpreter<'g, 'i> {
                         // permit this, so the interpreter's job is
                         // termination, not diagnosis.
                         if count < min {
-                            self.fatal_error = Some(Diagnostic::error(
-                                codes::NULLABLE_REPEAT,
-                                "repeat body succeeded without consuming input".to_string(),
-                            )
-                            .with_span(Some(Span::new(saved_pos, saved_pos))));
+                            self.fatal_error = Some(
+                                Diagnostic::error(
+                                    codes::NULLABLE_REPEAT,
+                                    "repeat body succeeded without consuming input".to_string(),
+                                )
+                                .with_span(Some(Span::new(saved_pos, saved_pos))),
+                            );
                             return Err(());
                         }
                         break;
@@ -604,11 +605,13 @@ impl<'g, 'i> Interpreter<'g, 'i> {
 
     fn run_rule_ref(&mut self, name: &str) -> Result<(), ()> {
         let Some(&rule) = self.rules_by_name.get(name) else {
-            self.fatal_error = Some(Diagnostic::error(
-                codes::UNKNOWN_RULE,
-                format!("reference to undefined rule `{name}`"),
-            )
-            .with_span(Some(Span::new(self.pos, self.pos))));
+            self.fatal_error = Some(
+                Diagnostic::error(
+                    codes::UNKNOWN_RULE,
+                    format!("reference to undefined rule `{name}`"),
+                )
+                .with_span(Some(Span::new(self.pos, self.pos))),
+            );
             return Err(());
         };
         // Look up by pointer so we keep the &'g lifetime attached.
@@ -625,14 +628,16 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             .iter()
             .any(|(n, p)| *n == rule_name && *p == self.pos)
         {
-            self.fatal_error = Some(Diagnostic::error(
-                codes::LEFT_RECURSION,
-                format!(
-                    "left recursion detected: rule `{name}` re-entered at byte {}",
-                    self.pos
-                ),
-            )
-            .with_span(Some(Span::new(self.pos, self.pos))));
+            self.fatal_error = Some(
+                Diagnostic::error(
+                    codes::LEFT_RECURSION,
+                    format!(
+                        "left recursion detected: rule `{name}` re-entered at byte {}",
+                        self.pos
+                    ),
+                )
+                .with_span(Some(Span::new(self.pos, self.pos))),
+            );
             return Err(());
         }
         self.call_stack.push((rule_name, self.pos));
@@ -662,7 +667,8 @@ impl<'g, 'i> Interpreter<'g, 'i> {
     }
 
     fn run_field(&mut self, name: &str, body: &'g Peg) -> Result<(), ()> {
-        self.sink_stack.push(ActiveSink::Field(FieldSink::default()));
+        self.sink_stack
+            .push(ActiveSink::Field(FieldSink::default()));
         let body_result = self.run_peg(body);
         let field_sink = match self.sink_stack.pop() {
             Some(ActiveSink::Field(s)) => s,
@@ -863,42 +869,71 @@ use dsl_kit_core::IdGen;
 
 /// Builds a [`Peg::Rule`] node with a fresh id.
 pub fn rule(ids: &IdGen, name: impl Into<String>, body: Peg) -> Peg {
-    Peg::Rule { id: ids.node(), name: name.into(), body: Box::new(body) }
+    Peg::Rule {
+        id: ids.node(),
+        name: name.into(),
+        body: Box::new(body),
+    }
 }
 
 /// Builds a [`Peg::Seq`] node with a fresh id.
 pub fn seq(ids: &IdGen, items: Vec<Peg>) -> Peg {
-    Peg::Seq { id: ids.node(), items }
+    Peg::Seq {
+        id: ids.node(),
+        items,
+    }
 }
 
 /// Builds a [`Peg::Choice`] node with a fresh id.
 pub fn choice(ids: &IdGen, alts: Vec<Peg>) -> Peg {
-    Peg::Choice { id: ids.node(), alts }
+    Peg::Choice {
+        id: ids.node(),
+        alts,
+    }
 }
 
 /// Builds a [`Peg::Repeat`] node with a fresh id.
 pub fn repeat(ids: &IdGen, body: Peg, min: u32, max: Option<u32>) -> Peg {
-    Peg::Repeat { id: ids.node(), body: Box::new(body), min, max }
+    Peg::Repeat {
+        id: ids.node(),
+        body: Box::new(body),
+        min,
+        max,
+    }
 }
 
 /// Builds a [`Peg::RuleRef`] node with a fresh id.
 pub fn rule_ref(ids: &IdGen, name: impl Into<String>) -> Peg {
-    Peg::RuleRef { id: ids.node(), name: name.into() }
+    Peg::RuleRef {
+        id: ids.node(),
+        name: name.into(),
+    }
 }
 
 /// Builds a [`Peg::Token`] node with a fresh id.
 pub fn token(ids: &IdGen, pat: impl Into<String>) -> Peg {
-    Peg::Token { id: ids.node(), pat: pat.into() }
+    Peg::Token {
+        id: ids.node(),
+        pat: pat.into(),
+    }
 }
 
 /// Builds a [`Peg::Node`] capture node with a fresh id.
 pub fn node(ids: &IdGen, variant: impl Into<String>, body: Peg) -> Peg {
-    Peg::Node { id: ids.node(), variant: variant.into(), body: Box::new(body) }
+    Peg::Node {
+        id: ids.node(),
+        variant: variant.into(),
+        body: Box::new(body),
+    }
 }
 
 /// Builds a [`Peg::Field`] capture node with a fresh id.
 pub fn field(ids: &IdGen, name: impl Into<String>, body: Peg) -> Peg {
-    Peg::Field { id: ids.node(), name: name.into(), body: Box::new(body) }
+    Peg::Field {
+        id: ids.node(),
+        name: name.into(),
+        body: Box::new(body),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +955,9 @@ mod tests {
         let names: Vec<&str> = s.variants.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Rule", "Seq", "Choice", "Repeat", "RuleRef", "Token", "Node", "Field"]
+            vec![
+                "Rule", "Seq", "Choice", "Repeat", "RuleRef", "Token", "Node", "Field"
+            ]
         );
         let repeat = s.variant("Repeat").unwrap();
         // body -> one child; min / max -> fields.
@@ -983,7 +1020,11 @@ mod tests {
         let err = parse_one(&g, "ab").unwrap_err();
         // The literal matched; trailing "b" tripped the EOF check.
         assert_eq!(err.diagnostics[0].code, codes::UNEXPECTED);
-        assert!(err.diagnostics[0].message.contains("trailing"), "{}", err.diagnostics[0].message);
+        assert!(
+            err.diagnostics[0].message.contains("trailing"),
+            "{}",
+            err.diagnostics[0].message
+        );
     }
 
     #[test]
@@ -1048,7 +1089,11 @@ mod tests {
         // Should complain about trailing "b", not attempt the second
         // alt.
         assert_eq!(err.diagnostics[0].code, codes::UNEXPECTED);
-        assert!(err.diagnostics[0].message.contains("byte 1"), "{}", err.diagnostics[0].message);
+        assert!(
+            err.diagnostics[0].message.contains("byte 1"),
+            "{}",
+            err.diagnostics[0].message
+        );
     }
 
     #[test]
@@ -1062,7 +1107,11 @@ mod tests {
         let g = one_rule_grammar(&ids, "s", choice(&ids, vec![alt_abc, alt_a]));
         let err = parse_one(&g, "ab").unwrap_err();
         // Trailing "b" at byte 1.
-        assert!(err.diagnostics[0].message.contains("byte 1"), "{}", err.diagnostics[0].message);
+        assert!(
+            err.diagnostics[0].message.contains("byte 1"),
+            "{}",
+            err.diagnostics[0].message
+        );
     }
 
     #[test]
@@ -1080,10 +1129,7 @@ mod tests {
                 "N",
                 seq(
                     &ids,
-                    vec![
-                        repeat(&ids, token(&ids, "a"), 0, None),
-                        token(&ids, "a"),
-                    ],
+                    vec![repeat(&ids, token(&ids, "a"), 0, None), token(&ids, "a")],
                 ),
             ),
         );
@@ -1122,11 +1168,7 @@ mod tests {
                 "N",
                 seq(
                     &ids,
-                    vec![
-                        token(&ids, "let"),
-                        token(&ids, "x"),
-                        token(&ids, "="),
-                    ],
+                    vec![token(&ids, "let"), token(&ids, "x"), token(&ids, "=")],
                 ),
             ),
         );
@@ -1143,7 +1185,11 @@ mod tests {
         let ids = IdGen::new();
         // r <- r "a" — direct left recursion. Should trip the guard
         // rather than hang.
-        let r = rule(&ids, "r", seq(&ids, vec![rule_ref(&ids, "r"), token(&ids, "a")]));
+        let r = rule(
+            &ids,
+            "r",
+            seq(&ids, vec![rule_ref(&ids, "r"), token(&ids, "a")]),
+        );
         let g = Grammar::new(vec![r], "r");
         let err = g.parse("aaa").unwrap_err();
         assert_eq!(err.diagnostics[0].code, codes::LEFT_RECURSION);

@@ -21,8 +21,7 @@ use dsl_kit_mcp::resources::ResourceEntry;
 use flow_dsl::{Flow, FlowStepper, FlowValue, canned_response, pretty, research_pipeline};
 
 const FLOW_GRAMMAR: &str = include_str!("./resources_data/grammar.md");
-const FLOW_RESEARCH_PIPELINE: &str =
-    include_str!("./resources_data/research-pipeline.md");
+const FLOW_RESEARCH_PIPELINE: &str = include_str!("./resources_data/research-pipeline.md");
 
 /// `DslHost` that owns a leaked-static [`Flow`] program plus its
 /// stepper.
@@ -89,10 +88,12 @@ impl DslHost for FlowHost {
         results.sort_by_key(|(id, _)| *id);
 
         let suspended_call =
-            self.stepper.suspended_call().map(|(_sid, node_id, label)| SuspendedCall {
-                node: node_id.0,
-                label: label.to_string(),
-            });
+            self.stepper
+                .suspended_call()
+                .map(|(_sid, node_id, label)| SuspendedCall {
+                    node: node_id.0,
+                    label: label.to_string(),
+                });
 
         let pending: Vec<PendingProjection> = self
             .stepper
@@ -125,7 +126,10 @@ impl DslHost for FlowHost {
 
         HostSnapshot {
             depth: self.stepper.depth(),
-            current_path: self.stepper.current_path().map(|p| p.0.iter().map(|n| n.0).collect()),
+            current_path: self
+                .stepper
+                .current_path()
+                .map(|p| p.0.iter().map(|n| n.0).collect()),
             suspended_call,
             pending,
             results,
@@ -221,7 +225,11 @@ impl DslHost for FlowHost {
         self.stepper
             .resolve(sid, Ok(FlowValue::Text(response.clone())))
             .map_err(|e| e.to_string())?;
-        Ok(ResolvedCall { node: node_id.0, label, result: response })
+        Ok(ResolvedCall {
+            node: node_id.0,
+            label,
+            result: response,
+        })
     }
 
     async fn resolve_by_id(
@@ -251,7 +259,11 @@ impl DslHost for FlowHost {
                 self.stepper
                     .resolve(sid, Ok(FlowValue::Text(text.clone())))
                     .map_err(|e| e.to_string())?;
-                Ok(ResolvedCall { node: node_id, label, result: text })
+                Ok(ResolvedCall {
+                    node: node_id,
+                    label,
+                    result: text,
+                })
             }
             Err(err) => {
                 self.stepper
@@ -419,7 +431,10 @@ mod tests {
         let empty_seq_id = ids.node();
         let program: &'static Flow = Box::leak(Box::new(Flow::Seq {
             id: ids.node(),
-            children: vec![Flow::Seq { id: empty_seq_id, children: vec![] }],
+            children: vec![Flow::Seq {
+                id: empty_seq_id,
+                children: vec![],
+            }],
         }));
         let host = FlowHost::with_program(program);
         let text = host.lint_json().expect("FlowHost wires lint_json");

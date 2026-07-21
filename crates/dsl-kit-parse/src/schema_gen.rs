@@ -134,7 +134,8 @@ impl SyntaxOverrides {
         field: impl Into<String>,
         value: impl Fn(&IdGen) -> Peg + 'static,
     ) -> Self {
-        self.by_field.insert((variant.into(), field.into()), Box::new(value));
+        self.by_field
+            .insert((variant.into(), field.into()), Box::new(value));
         self
     }
 
@@ -257,7 +258,11 @@ fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> 
     }
     items.push(token(ids, ")"));
 
-    rule(ids, v.name.clone(), node(ids, v.name.clone(), seq(ids, items)))
+    rule(
+        ids,
+        v.name.clone(),
+        node(ids, v.name.clone(), seq(ids, items)),
+    )
 }
 
 /// Value production for a payload field: the most specific
@@ -403,14 +408,23 @@ mod tests {
             variants: vec![
                 VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 },
                 VariantSchema {
                     name: "Name".into(),
                     fields: vec![
-                        FieldSchema { name: "text".into(), ty: "String".into() },
-                        FieldSchema { name: "quoted".into(), ty: "bool".into() },
+                        FieldSchema {
+                            name: "text".into(),
+                            ty: "String".into(),
+                        },
+                        FieldSchema {
+                            name: "quoted".into(),
+                            ty: "bool".into(),
+                        },
                     ],
                     children: vec![],
                 },
@@ -418,8 +432,14 @@ mod tests {
                     name: "Add".into(),
                     fields: vec![],
                     children: vec![
-                        ChildSchema { name: "lhs".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "rhs".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "lhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "rhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
                 VariantSchema {
@@ -438,7 +458,11 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                     }],
                 },
-                VariantSchema { name: "Unit".into(), fields: vec![], children: vec![] },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
             ],
         }
     }
@@ -451,11 +475,14 @@ mod tests {
     /// Parse + conformance-check against the demo schema in one go.
     fn parse_ok(input: &str) -> crate::ParseTree {
         let g = demo_grammar();
-        let tree = g.parse(input).unwrap_or_else(|e| {
-            panic!("parse failed for {input:?}: {:?}", e.diagnostics)
-        });
+        let tree = g
+            .parse(input)
+            .unwrap_or_else(|e| panic!("parse failed for {input:?}: {:?}", e.diagnostics));
         let diags = check_conformance(&tree, &demo_schema());
-        assert!(diags.is_empty(), "conformance clean for {input:?}: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "conformance clean for {input:?}: {diags:?}"
+        );
         tree
     }
 
@@ -496,7 +523,10 @@ mod tests {
     #[test]
     fn optional_child_none_leaves_slot_absent() {
         let tree = parse_ok("Neg(body: none)");
-        assert!(tree.child_slot("body").is_none(), "bare `none` = absent slot");
+        assert!(
+            tree.child_slot("body").is_none(),
+            "bare `none` = absent slot"
+        );
     }
 
     #[test]
@@ -542,8 +572,14 @@ mod tests {
             variants: vec![VariantSchema {
                 name: "Par".into(),
                 fields: vec![
-                    FieldSchema { name: "policy".into(), ty: "Option<JoinPolicy>".into() },
-                    FieldSchema { name: "reducer".into(), ty: "ReducerId".into() },
+                    FieldSchema {
+                        name: "policy".into(),
+                        ty: "Option<JoinPolicy>".into(),
+                    },
+                    FieldSchema {
+                        name: "reducer".into(),
+                        ty: "ReducerId".into(),
+                    },
                 ],
                 children: vec![],
             }],
@@ -583,7 +619,10 @@ mod tests {
                 },
                 VariantSchema {
                     name: "Call".into(),
-                    fields: vec![FieldSchema { name: "label".into(), ty: "String".into() }],
+                    fields: vec![FieldSchema {
+                        name: "label".into(),
+                        ty: "String".into(),
+                    }],
                     children: vec![],
                 },
             ],
@@ -624,7 +663,10 @@ mod tests {
             .expect("canonical Par text parses");
         let diags = check_conformance(&tree, &par_schema());
         assert!(diags.is_empty(), "conformance clean: {diags:?}");
-        assert_eq!(tree.field("policy"), Some(&RawValue::Text("all_failfast".into())));
+        assert_eq!(
+            tree.field("policy"),
+            Some(&RawValue::Text("all_failfast".into()))
+        );
         assert_eq!(
             tree.field("reducer_id"),
             Some(&RawValue::Text("reduce_all_ordered".into()))
@@ -636,9 +678,7 @@ mod tests {
     fn field_override_wins_over_type_override() {
         // Same type in both entries; the (variant, field)-pinned one
         // must decide the syntax.
-        let overrides = par_overrides().for_field("Par", "policy", |ids| {
-            token(ids, "%kw:pinned")
-        });
+        let overrides = par_overrides().for_field("Par", "policy", |ids| token(ids, "%kw:pinned"));
         let g = checked_grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides)
             .expect("clean grammar with field-level override");
         let tree = g
@@ -657,12 +697,14 @@ mod tests {
     fn unrelated_override_leaves_builtin_mapping_and_failure_intact() {
         // An override for some other type neither rescues the
         // unsupported fields nor perturbs built-in ones.
-        let overrides =
-            SyntaxOverrides::new().for_type("Uuid", |ids| token(ids, "%str"));
-        let err = grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides)
-            .unwrap_err();
+        let overrides = SyntaxOverrides::new().for_type("Uuid", |ids| token(ids, "%str"));
+        let err = grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides).unwrap_err();
         assert_eq!(err.diagnostics.len(), 2, "both Par fields still unmapped");
-        assert!(err.diagnostics.iter().all(|d| d.code == codes::UNSUPPORTED_FIELD));
+        assert!(
+            err.diagnostics
+                .iter()
+                .all(|d| d.code == codes::UNSUPPORTED_FIELD)
+        );
         // Built-in demo schema is unaffected by the stray entry.
         let g = checked_grammar_from_schema_with(&demo_schema(), &IdGen::new(), &overrides)
             .expect("demo schema still generates");
@@ -671,7 +713,10 @@ mod tests {
 
     #[test]
     fn empty_schema_fails_generation() {
-        let schema = NodeSchema { name: "Void".into(), variants: vec![] };
+        let schema = NodeSchema {
+            name: "Void".into(),
+            variants: vec![],
+        };
         let err = grammar_from_schema(&schema, &IdGen::new()).unwrap_err();
         assert_eq!(err.diagnostics[0].code, codes::EMPTY_SCHEMA);
     }

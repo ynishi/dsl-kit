@@ -94,7 +94,10 @@ pub fn examples_from_grammar(grammar: &Grammar) -> Result<GrammarExamples, Build
         }
         let mut tokens = Vec::new();
         synth.emit(body, 0, &mut tokens)?;
-        per_rule.push(RuleExample { rule: name.clone(), text: render(&tokens) });
+        per_rule.push(RuleExample {
+            rule: name.clone(),
+            text: render(&tokens),
+        });
     }
 
     let start_body = synth.rule_body(&grammar.start)?;
@@ -102,7 +105,10 @@ pub fn examples_from_grammar(grammar: &Grammar) -> Result<GrammarExamples, Build
     synth.emit(start_body, COMPOSITE_DEPTH, &mut tokens)?;
     let composite = render(&tokens);
 
-    Ok(GrammarExamples { per_rule, composite })
+    Ok(GrammarExamples {
+        per_rule,
+        composite,
+    })
 }
 
 /// Sentinel cost for "no finite derivation".
@@ -131,8 +137,10 @@ impl<'g> Synth<'g> {
         // Shortest-derivation cost fixpoint: start every rule at
         // INFINITE and relax until stable. Monotone non-increasing and
         // bounded, so it terminates.
-        let mut costs: HashMap<String, u64> =
-            rules_in_order.iter().map(|(n, _)| (n.clone(), INFINITE)).collect();
+        let mut costs: HashMap<String, u64> = rules_in_order
+            .iter()
+            .map(|(n, _)| (n.clone(), INFINITE))
+            .collect();
         loop {
             let mut changed = false;
             for (name, body) in &rules_in_order {
@@ -147,7 +155,11 @@ impl<'g> Synth<'g> {
             }
         }
 
-        Ok(Self { by_name, rules_in_order, costs })
+        Ok(Self {
+            by_name,
+            rules_in_order,
+            costs,
+        })
     }
 
     fn rule_cost(&self, name: &str) -> u64 {
@@ -166,12 +178,7 @@ impl<'g> Synth<'g> {
     /// Appends the input tokens of one derivation of `peg`.
     /// `rich_depth > 0` selects the expansive arm at choices and up to
     /// two iterations at repeats; `0` is the minimal mode.
-    fn emit(
-        &self,
-        peg: &Peg,
-        rich_depth: u32,
-        out: &mut Vec<String>,
-    ) -> Result<(), BuildError> {
+    fn emit(&self, peg: &Peg, rich_depth: u32, out: &mut Vec<String>) -> Result<(), BuildError> {
         match peg {
             Peg::Token { pat, .. } => {
                 out.push(token_input(pat));
@@ -234,20 +241,32 @@ impl<'g> Synth<'g> {
 fn peg_cost(peg: &Peg, costs: &HashMap<String, u64>) -> u64 {
     match peg {
         Peg::Token { .. } => 1,
-        Peg::Seq { items, .. } => items.iter().try_fold(0u64, |acc, i| {
-            let c = peg_cost(i, costs);
-            if c == INFINITE { None } else { Some(acc.saturating_add(c)) }
-        })
-        .unwrap_or(INFINITE),
-        Peg::Choice { alts, .. } => {
-            alts.iter().map(|a| peg_cost(a, costs)).min().unwrap_or(INFINITE)
-        }
+        Peg::Seq { items, .. } => items
+            .iter()
+            .try_fold(0u64, |acc, i| {
+                let c = peg_cost(i, costs);
+                if c == INFINITE {
+                    None
+                } else {
+                    Some(acc.saturating_add(c))
+                }
+            })
+            .unwrap_or(INFINITE),
+        Peg::Choice { alts, .. } => alts
+            .iter()
+            .map(|a| peg_cost(a, costs))
+            .min()
+            .unwrap_or(INFINITE),
         Peg::Repeat { body, min, .. } => {
             if *min == 0 {
                 0
             } else {
                 let c = peg_cost(body, costs);
-                if c == INFINITE { INFINITE } else { c.saturating_mul(u64::from(*min)) }
+                if c == INFINITE {
+                    INFINITE
+                } else {
+                    c.saturating_mul(u64::from(*min))
+                }
             }
         }
         Peg::RuleRef { name, .. } => costs.get(name).copied().unwrap_or(INFINITE),
@@ -303,14 +322,23 @@ mod tests {
             variants: vec![
                 VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 },
                 VariantSchema {
                     name: "Name".into(),
                     fields: vec![
-                        FieldSchema { name: "text".into(), ty: "String".into() },
-                        FieldSchema { name: "quoted".into(), ty: "bool".into() },
+                        FieldSchema {
+                            name: "text".into(),
+                            ty: "String".into(),
+                        },
+                        FieldSchema {
+                            name: "quoted".into(),
+                            ty: "bool".into(),
+                        },
                     ],
                     children: vec![],
                 },
@@ -318,8 +346,14 @@ mod tests {
                     name: "Add".into(),
                     fields: vec![],
                     children: vec![
-                        ChildSchema { name: "lhs".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "rhs".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "lhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "rhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
                 VariantSchema {
@@ -338,7 +372,11 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                     }],
                 },
-                VariantSchema { name: "Unit".into(), fields: vec![], children: vec![] },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
             ],
         }
     }
@@ -356,29 +394,43 @@ mod tests {
         assert_eq!(ex.per_rule.len(), 6, "one example per variant");
         for e in &ex.per_rule {
             let tree = g.parse(&e.text).unwrap_or_else(|err| {
-                panic!("example for `{}` failed to parse: {:?}\n  text: {}",
-                    e.rule, err.diagnostics, e.text)
+                panic!(
+                    "example for `{}` failed to parse: {:?}\n  text: {}",
+                    e.rule, err.diagnostics, e.text
+                )
             });
             assert_eq!(tree.variant, e.rule, "example enters at its own variant");
             let diags = check_conformance(&tree, &demo_schema());
-            assert!(diags.is_empty(), "conformance clean for {}: {diags:?}", e.rule);
+            assert!(
+                diags.is_empty(),
+                "conformance clean for {}: {diags:?}",
+                e.rule
+            );
         }
     }
 
     #[test]
     fn minimal_examples_have_the_expected_spellings() {
         let (_, ex) = demo_examples();
-        let by_rule: HashMap<&str, &str> =
-            ex.per_rule.iter().map(|e| (e.rule.as_str(), e.text.as_str())).collect();
+        let by_rule: HashMap<&str, &str> = ex
+            .per_rule
+            .iter()
+            .map(|e| (e.rule.as_str(), e.text.as_str()))
+            .collect();
         assert_eq!(by_rule["Lit"], "Lit(value: 1)");
         assert_eq!(by_rule["Name"], "Name(text: \"example\", quoted: true)");
         assert_eq!(
-            by_rule["Add"],
-            "Add(lhs: Unit(), rhs: Unit())",
+            by_rule["Add"], "Add(lhs: Unit(), rhs: Unit())",
             "nested slots fill with the cheapest variant"
         );
-        assert_eq!(by_rule["Neg"], "Neg(body: none)", "Optional minimal = absent");
-        assert_eq!(by_rule["List"], "List(items: [])", "Many minimal = empty list");
+        assert_eq!(
+            by_rule["Neg"], "Neg(body: none)",
+            "Optional minimal = absent"
+        );
+        assert_eq!(
+            by_rule["List"], "List(items: [])",
+            "Many minimal = empty list"
+        );
         assert_eq!(by_rule["Unit"], "Unit()");
     }
 
@@ -386,15 +438,18 @@ mod tests {
     fn composite_parses_and_shows_nesting() {
         let (g, ex) = demo_examples();
         let tree = g.parse(&ex.composite).unwrap_or_else(|err| {
-            panic!("composite failed to parse: {:?}\n  text: {}",
-                err.diagnostics, ex.composite)
+            panic!(
+                "composite failed to parse: {:?}\n  text: {}",
+                err.diagnostics, ex.composite
+            )
         });
         assert!(check_conformance(&tree, &demo_schema()).is_empty());
         // Rich mode picked an expansive variant and expanded at least
         // one nested child — pin the property, not the exact string.
         assert!(
             !tree.children.is_empty(),
-            "composite has child structure: {}", ex.composite
+            "composite has child structure: {}",
+            ex.composite
         );
     }
 
@@ -417,8 +472,11 @@ mod tests {
             .expect("generation itself succeeds");
         let err = examples_from_grammar(&g).expect_err("no finite derivation");
         assert!(
-            err.diagnostics.iter().all(|d| d.code == codes::NO_FINITE_DERIVATION),
-            "{:?}", err.diagnostics
+            err.diagnostics
+                .iter()
+                .all(|d| d.code == codes::NO_FINITE_DERIVATION),
+            "{:?}",
+            err.diagnostics
         );
         // Both the start rule and the variant rule are underivable.
         assert_eq!(err.diagnostics.len(), 2);

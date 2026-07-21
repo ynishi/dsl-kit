@@ -1,5 +1,7 @@
 //! MCP server framework for `dsl-kit`.
 //!
+//! ## Architecture
+//!
 //! Two surfaces:
 //!
 //! - [`DslMcpHandler`] — the debugger. A fixed ten-tool surface driven

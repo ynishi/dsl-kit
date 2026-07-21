@@ -63,8 +63,16 @@ impl ExprHost {
         let path = path_to(self.program, node)
             .map(|ids| ids.into_iter().map(|n| n.0).collect())
             .unwrap_or_default();
-        let depth = path_to(self.program, node).map(|ids| ids.len() as u32).unwrap_or(0);
-        HostLocation { node: node.0, path, depth, frame: None, iteration: None }
+        let depth = path_to(self.program, node)
+            .map(|ids| ids.len() as u32)
+            .unwrap_or(0);
+        HostLocation {
+            node: node.0,
+            path,
+            depth,
+            frame: None,
+            iteration: None,
+        }
     }
 
     fn check_breakpoint(&mut self, breakpoints: &BreakpointSet) -> Option<HostOutcome> {
@@ -128,10 +136,11 @@ impl ExprHost {
             if phase != Phase::Pre {
                 return;
             }
-            if let Expr::Var { id, name } = node {
-                if name == target_name && found.is_none() {
-                    found = Some(*id);
-                }
+            if let Expr::Var { id, name } = node
+                && name == target_name
+                && found.is_none()
+            {
+                found = Some(*id);
             }
         });
         found.map(|id| id.0).unwrap_or(0)
@@ -171,10 +180,10 @@ impl DslHost for ExprHost {
         }
         results.sort_by_key(|(id, _)| *id);
 
-        let suspended_call = self
-            .pending
-            .as_ref()
-            .map(|(node, name)| SuspendedCall { node: node.0, label: name.clone() });
+        let suspended_call = self.pending.as_ref().map(|(node, name)| SuspendedCall {
+            node: node.0,
+            label: name.clone(),
+        });
 
         HostSnapshot {
             depth: if self.final_value.is_some() { 0 } else { 1 },
@@ -241,7 +250,11 @@ impl DslHost for ExprHost {
             .parse()
             .map_err(|e| format!("invalid integer literal {text:?}: {e}"))?;
         self.resolved.insert(name.clone(), value);
-        Ok(ResolvedCall { node: node.0, label: name, result: value.to_string() })
+        Ok(ResolvedCall {
+            node: node.0,
+            label: name,
+            result: value.to_string(),
+        })
     }
 
     fn reset(&mut self) {
@@ -299,8 +312,7 @@ impl DslHost for ExprHost {
         // Bridge → conformance-checked build. Diagnostics are serialized
         // as the shared envelope so the handler can pass them through to
         // the client unchanged (see `dsl_kit_load`).
-        let tree =
-            from_json_str(input, &Expr::schema()).map_err(|e| e.to_json().to_string())?;
+        let tree = from_json_str(input, &Expr::schema()).map_err(|e| e.to_json().to_string())?;
         let ids = IdGen::new();
         let program = Expr::from_parse_tree(&tree, &ids).map_err(|e| e.to_json().to_string())?;
         // Same lifetime shape as the default program: leak the Box so

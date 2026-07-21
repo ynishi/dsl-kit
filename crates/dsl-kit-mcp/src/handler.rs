@@ -166,7 +166,10 @@ impl DslMcpHandler {
     pub fn new(host: Box<dyn DslHost>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            state: Arc::new(Mutex::new(HandlerState { host, breakpoints: BreakpointSet::new() })),
+            state: Arc::new(Mutex::new(HandlerState {
+                host,
+                breakpoints: BreakpointSet::new(),
+            })),
             expose_kit_resources: true,
         }
     }
@@ -283,8 +286,11 @@ impl DslMcpHandler {
     pub async fn dsl_kit_pending(&self) -> Result<String, String> {
         let guard = self.state.lock().await;
         let snap = guard.host.snapshot();
-        let pending_json: Vec<Value> =
-            snap.pending.into_iter().map(|p| pending_to_json(&p)).collect();
+        let pending_json: Vec<Value> = snap
+            .pending
+            .into_iter()
+            .map(|p| pending_to_json(&p))
+            .collect();
         Ok(json!({ "pending": pending_json }).to_string())
     }
 
@@ -430,9 +436,7 @@ impl DslMcpHandler {
                 Ok(json!({ "codes": codes }).to_string())
             }
             Some(code) => match entries.iter().find(|e| e.code == code) {
-                Some(entry) => {
-                    Ok(json!({ "code": entry.code, "help": entry.help }).to_string())
-                }
+                Some(entry) => Ok(json!({ "code": entry.code, "help": entry.help }).to_string()),
                 None => {
                     let known: Vec<&str> = entries.iter().map(|e| e.code.as_str()).collect();
                     Err(format!(
@@ -592,9 +596,12 @@ impl ServerHandler for DslMcpHandler {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, McpError> {
         let entries = self.all_resources().await;
-        let entry = entries.iter().find(|e| e.uri == request.uri).ok_or_else(|| {
-            McpError::resource_not_found(format!("unknown resource uri: {}", request.uri), None)
-        })?;
+        let entry = entries
+            .iter()
+            .find(|e| e.uri == request.uri)
+            .ok_or_else(|| {
+                McpError::resource_not_found(format!("unknown resource uri: {}", request.uri), None)
+            })?;
         let body = entry
             .read()
             .map_err(|e| McpError::internal_error(format!("read resource: {e}"), None))?;

@@ -139,7 +139,10 @@ async fn main() -> miette::Result<()> {
     let outcome = host.step_one(&bp).await.expect("step");
     print_outcome("first step (should hit await-effect on y)", &outcome);
     if let Ok(outcome) = host.step_one(&bp).await {
-        print_outcome("second step (breakpoint on y should fire before eval)", &outcome);
+        print_outcome(
+            "second step (breakpoint on y should fire before eval)",
+            &outcome,
+        );
     }
 
     println!("\n(For an MCP-driven session, install this binary or point");
@@ -168,12 +171,12 @@ fn find_var_node(expr: &expr_dsl::Expr, target: &str) -> Option<NodeId> {
         if phase != Phase::Pre {
             return;
         }
-        if let expr_dsl::Expr::Var { id, name } = node {
-            if name == target && found.is_none() {
-                found = Some(*id);
-            }
+        if let expr_dsl::Expr::Var { id, name } = node
+            && name == target
+            && found.is_none()
+        {
+            found = Some(*id);
         }
     });
     found
 }
-

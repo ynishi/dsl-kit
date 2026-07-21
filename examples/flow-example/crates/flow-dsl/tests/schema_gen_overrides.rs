@@ -67,7 +67,10 @@ fn canonical_flow_text_parses_and_conforms() {
     let kids = tree.child_slot("children").expect("Seq children bound");
     assert_eq!(kids.len(), 3);
     let par = &kids[2];
-    assert_eq!(par.field("policy"), Some(&RawValue::Text("all_failfast".into())));
+    assert_eq!(
+        par.field("policy"),
+        Some(&RawValue::Text("all_failfast".into()))
+    );
     assert_eq!(
         par.field("reducer_id"),
         Some(&RawValue::Text("reduce_all_ordered".into()))
@@ -83,13 +86,19 @@ fn text_builds_a_typed_flow_via_dsl_build_converters() {
     let Flow::Seq { children, .. } = &flow else {
         panic!("root is Seq, got {}", flow.summary());
     };
-    let Flow::Par { policy, reducer_id, .. } = &children[2] else {
+    let Flow::Par {
+        policy, reducer_id, ..
+    } = &children[2]
+    else {
         panic!("third child is Par, got {}", children[2].summary());
     };
     assert!(
         matches!(
             policy,
-            Some(JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast })
+            Some(JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast
+            })
         ),
         "parse_policy decoded all_failfast: {policy:?}"
     );
@@ -102,7 +111,10 @@ fn none_spellings_build_to_typed_defaults() {
         .parse("Par(policy: none, reducer_id: none, children: [Call(label: \"x\")])")
         .expect("parses");
     let flow = Flow::from_parse_tree(&tree, &IdGen::new()).expect("typed build succeeds");
-    let Flow::Par { policy, reducer_id, .. } = &flow else {
+    let Flow::Par {
+        policy, reducer_id, ..
+    } = &flow
+    else {
         panic!("root is Par");
     };
     assert!(policy.is_none() && reducer_id.is_none());
@@ -114,19 +126,24 @@ fn synthesized_examples_cover_every_variant_and_build_typed() {
     // *generated grammar*, so the override spellings (`none` /
     // `all_failfast` / `%str`) surface with no extra registration.
     let grammar = generated_grammar();
-    let examples = dsl_kit_parse::example_gen::examples_from_grammar(&grammar)
-        .expect("examples synthesize");
+    let examples =
+        dsl_kit_parse::example_gen::examples_from_grammar(&grammar).expect("examples synthesize");
     assert_eq!(examples.per_rule.len(), 5, "one example per Flow variant");
     for e in &examples.per_rule {
         let tree = grammar.parse(&e.text).unwrap_or_else(|err| {
-            panic!("example for `{}` failed to parse: {:?}\n  text: {}",
-                e.rule, err.diagnostics, e.text)
+            panic!(
+                "example for `{}` failed to parse: {:?}\n  text: {}",
+                e.rule, err.diagnostics, e.text
+            )
         });
         assert_eq!(tree.variant, e.rule);
         // Every synthesized example builds a typed Flow through the
         // #[dsl_build(with)] converters as well.
         Flow::from_parse_tree(&tree, &IdGen::new()).unwrap_or_else(|err| {
-            panic!("example for `{}` failed typed build: {:?}", e.rule, err.diagnostics)
+            panic!(
+                "example for `{}` failed typed build: {:?}",
+                e.rule, err.diagnostics
+            )
         });
     }
     let par = examples.per_rule.iter().find(|e| e.rule == "Par").unwrap();
@@ -134,7 +151,9 @@ fn synthesized_examples_cover_every_variant_and_build_typed() {
         par.text, "Par(policy: none, reducer_id: none, children: [])",
         "override spellings fall out of the grammar walk"
     );
-    let composite_tree = grammar.parse(&examples.composite).expect("composite parses");
+    let composite_tree = grammar
+        .parse(&examples.composite)
+        .expect("composite parses");
     Flow::from_parse_tree(&composite_tree, &IdGen::new()).expect("composite builds typed");
 }
 
@@ -157,8 +176,12 @@ fn text_round_trips_through_the_engine_to_a_joined_value() {
 
     let mut engine = Engine::new(FlowAst::new(&flow), Arc::new(flow_default_registry()))
         .expect("root Ast validation");
-    let outcome = drive(&mut engine, &mut EchoResolver, &dsl_kit::BreakpointSet::new())
-        .expect("drive completes");
+    let outcome = drive(
+        &mut engine,
+        &mut EchoResolver,
+        &dsl_kit::BreakpointSet::new(),
+    )
+    .expect("drive completes");
     // The Seq's value is its last child's — the Par folded by the
     // reducer the *text* named.
     let DriveOutcome::Done(value) = outcome else {

@@ -103,5 +103,9 @@ fn fresh_ids_are_unique() {
     }
     collect(&expr, &mut seen);
     // Program has 9 nodes: Let, Lit(3), Mul, Add, Var(x), Var(y), Var(z), plus expected boxing.
-    assert!(seen.len() >= 7, "expected at least 7 unique ids, got {}", seen.len());
+    assert!(
+        seen.len() >= 7,
+        "expected at least 7 unique ids, got {}",
+        seen.len()
+    );
 }

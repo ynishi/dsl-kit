@@ -8,9 +8,7 @@
 //! debugger (L3) apply to your program".
 
 use dsl_kit_mcp::DslMcpHandler;
-use dsl_kit_mcp::handler::{
-    BreakpointAddParams, LoadParams, ResolveParams, StepParams,
-};
+use dsl_kit_mcp::handler::{BreakpointAddParams, LoadParams, ResolveParams, StepParams};
 use expr_host::ExprHost;
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{Value, json};
@@ -111,9 +109,7 @@ async fn load_then_lint_then_run_yields_sixteen() {
     // formats non-final rows as `"x = 3"` and the final row as the raw
     // integer, so we look for a row whose `result` contains `16`.
     let state = parse(&h.dsl_kit_state().await.unwrap());
-    let results = state["results"]
-        .as_array()
-        .expect("results is an array");
+    let results = state["results"].as_array().expect("results is an array");
     assert!(
         results.iter().any(|row| {
             row["result"]
@@ -184,7 +180,10 @@ async fn ids_restart_on_reload() {
 #[tokio::test]
 async fn resolve_after_load_records_result() {
     let h = handler();
-    let _ = h.dsl_kit_load(Parameters(LoadParams { input: program() })).await.unwrap();
+    let _ = h
+        .dsl_kit_load(Parameters(LoadParams { input: program() }))
+        .await
+        .unwrap();
 
     // Step to the first suspension.
     let outcome = parse(

@@ -11,7 +11,7 @@
 //! flows through one [`Diagnostic`] envelope so the consumer AI sees a
 //! single dialect across parsing, conformance, lint, and debugger.
 //!
-//! # Layers
+//! ## Architecture (layers)
 //!
 //! - [`ParseTree`] — untyped trunk. Variant name + field payloads +
 //!   named child slots + optional source [`Span`].
@@ -298,7 +298,9 @@ impl BuildError {
 
     /// Convenience constructor for a single-diagnostic error.
     pub fn single(diag: Diagnostic) -> Self {
-        Self { diagnostics: vec![diag] }
+        Self {
+            diagnostics: vec![diag],
+        }
     }
 
     /// Renders the whole bag as a JSON array of
@@ -310,7 +312,11 @@ impl BuildError {
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "build failed with {} diagnostic(s):", self.diagnostics.len())?;
+        write!(
+            f,
+            "build failed with {} diagnostic(s):",
+            self.diagnostics.len()
+        )?;
         for d in &self.diagnostics {
             write!(f, "\n  [{}] {}: {}", d.severity.as_str(), d.code, d.message)?;
         }
@@ -415,10 +421,7 @@ pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnosti
     let Some(variant) = schema.variant(&tree.variant) else {
         let candidates = nearest_candidates(&tree.variant, &schema.variants, 3);
         let msg = if candidates.is_empty() {
-            format!(
-                "unknown variant `{}` for `{}`",
-                tree.variant, schema.name
-            )
+            format!("unknown variant `{}` for `{}`", tree.variant, schema.name)
         } else {
             format!(
                 "unknown variant `{}` for `{}` (did you mean: {})",
@@ -427,9 +430,7 @@ pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnosti
                 candidates.join(", ")
             )
         };
-        out.push(
-            Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_span(tree.span),
-        );
+        out.push(Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_span(tree.span));
         return out;
     };
 
@@ -494,10 +495,7 @@ fn check_fields(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnos
             out.push(
                 Diagnostic::error(
                     codes::UNKNOWN_FIELD,
-                    format!(
-                        "unknown field `{}` on variant `{}`",
-                        name, variant.name
-                    ),
+                    format!("unknown field `{}` on variant `{}`", name, variant.name),
                 )
                 .with_span(tree.span),
             );
@@ -610,11 +608,7 @@ fn diag_arity(
 // Nearest-candidate suggestions (small Levenshtein)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn nearest_candidates(
-    query: &str,
-    variants: &[VariantSchema],
-    k: usize,
-) -> Vec<String> {
+pub(crate) fn nearest_candidates(query: &str, variants: &[VariantSchema], k: usize) -> Vec<String> {
     let mut scored: Vec<(usize, &str)> = variants
         .iter()
         .map(|v| (levenshtein(query, &v.name), v.name.as_str()))
@@ -644,10 +638,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) { 0 } else { 1 };
-            curr[j] = (curr[j - 1] + 1)
-                .min(prev[j] + 1)
-                .min(prev[j - 1] + cost);
+            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) {
+                0
+            } else {
+                1
+            };
+            curr[j] = (curr[j - 1] + 1).min(prev[j] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -680,20 +676,14 @@ where
     match tree.field(name) {
         Some(RawValue::Json(v)) => serde_json::from_value(v.clone()).map_err(|e| {
             BuildError::single(
-                Diagnostic::error(
-                    codes::FIELD_TYPE,
-                    format!("field `{name}`: {e}"),
-                )
-                .with_span(tree.span),
+                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
+                    .with_span(tree.span),
             )
         }),
         Some(RawValue::Text(s)) => s.parse::<T>().map_err(|e| {
             BuildError::single(
-                Diagnostic::error(
-                    codes::FIELD_TYPE,
-                    format!("field `{name}`: {e}"),
-                )
-                .with_span(tree.span),
+                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
+                    .with_span(tree.span),
             )
         }),
         None => Err(BuildError::single(
@@ -824,23 +814,41 @@ mod tests {
             variants: vec![
                 VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 },
                 VariantSchema {
                     name: "Add".into(),
                     fields: vec![],
                     children: vec![
-                        ChildSchema { name: "lhs".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "rhs".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "lhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "rhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
                 VariantSchema {
                     name: "Let".into(),
-                    fields: vec![FieldSchema { name: "name".into(), ty: "String".into() }],
+                    fields: vec![FieldSchema {
+                        name: "name".into(),
+                        ty: "String".into(),
+                    }],
                     children: vec![
-                        ChildSchema { name: "value".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "body".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "value".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "body".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
             ],

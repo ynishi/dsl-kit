@@ -16,9 +16,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use dsl_kit::{
-    DslNode, EngineError, IdGen, NodeContext, NodeId, Path, Phase, Walk,
-};
+use dsl_kit::{DslNode, EngineError, IdGen, NodeContext, NodeId, Path, Phase, Walk};
 
 /// AST of the arithmetic DSL.
 #[derive(Debug, DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild)]
@@ -128,7 +126,11 @@ pub fn path_to(expr: &Expr, target: NodeId) -> Option<Vec<NodeId>> {
         false
     }
     let mut acc = Vec::new();
-    if go(expr, target, &mut acc) { Some(acc) } else { None }
+    if go(expr, target, &mut acc) {
+        Some(acc)
+    } else {
+        None
+    }
 }
 
 /// Counts every node in the AST (pre-order visits).
@@ -178,18 +180,28 @@ pub fn eval(
             if let Some(v) = resolved.get(name) {
                 return Ok(*v);
             }
-            Err(UnboundVar { node: *id, name: name.clone() })
+            Err(UnboundVar {
+                node: *id,
+                name: name.clone(),
+            })
         }
         Expr::Add { lhs, rhs, .. } => Ok(eval(lhs, env, resolved)? + eval(rhs, env, resolved)?),
         Expr::Mul { lhs, rhs, .. } => Ok(eval(lhs, env, resolved)? * eval(rhs, env, resolved)?),
-        Expr::Let { name, value, body, .. } => {
+        Expr::Let {
+            name, value, body, ..
+        } => {
             let v = eval(value, env, resolved)?;
             env.push((name.clone(), v));
             let result = eval(body, env, resolved);
             env.pop();
             result
         }
-        Expr::If { cond, then_branch, else_branch, .. } => {
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             let c = eval(cond, env, resolved)?;
             if c != 0 {
                 eval(then_branch, env, resolved)
@@ -208,12 +220,32 @@ pub fn eval(
 ///
 /// With external bindings `y = 5`, `z = 2`, this evaluates to `16`.
 pub fn demo_program(ids: &IdGen) -> Expr {
-    let x_lit = Expr::Lit { id: ids.node(), value: 3 };
-    let x_ref = Expr::Var { id: ids.node(), name: "x".into() };
-    let y_ref = Expr::Var { id: ids.node(), name: "y".into() };
-    let z_ref = Expr::Var { id: ids.node(), name: "z".into() };
-    let add = Expr::Add { id: ids.node(), lhs: Box::new(x_ref), rhs: Box::new(y_ref) };
-    let mul = Expr::Mul { id: ids.node(), lhs: Box::new(add), rhs: Box::new(z_ref) };
+    let x_lit = Expr::Lit {
+        id: ids.node(),
+        value: 3,
+    };
+    let x_ref = Expr::Var {
+        id: ids.node(),
+        name: "x".into(),
+    };
+    let y_ref = Expr::Var {
+        id: ids.node(),
+        name: "y".into(),
+    };
+    let z_ref = Expr::Var {
+        id: ids.node(),
+        name: "z".into(),
+    };
+    let add = Expr::Add {
+        id: ids.node(),
+        lhs: Box::new(x_ref),
+        rhs: Box::new(y_ref),
+    };
+    let mul = Expr::Mul {
+        id: ids.node(),
+        lhs: Box::new(add),
+        rhs: Box::new(z_ref),
+    };
     Expr::Let {
         id: ids.node(),
         name: "x".into(),

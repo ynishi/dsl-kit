@@ -266,10 +266,7 @@ enum InternalFrame<A: Ast> {
     },
     /// A completed leaf whose value is waiting to be consumed by its
     /// parent.
-    Value {
-        node: NodeId,
-        value: A::Value,
-    },
+    Value { node: NodeId, value: A::Value },
     /// A leaf whose `resolve` returned `Err(_)`. The next `step()`
     /// applies the enclosing `Par.policy.fail`.
     Failed {
@@ -279,10 +276,7 @@ enum InternalFrame<A: Ast> {
     },
     /// A sub-tree the engine cancelled. Retained so `frame_tree()` can
     /// render it.
-    Cancelled {
-        node: NodeId,
-        reason: CancelReason,
-    },
+    Cancelled { node: NodeId, reason: CancelReason },
 }
 
 impl<A: Ast> InternalFrame<A> {
@@ -303,6 +297,19 @@ impl<A: Ast> InternalFrame<A> {
 // =====================================================================
 // The Engine
 // =====================================================================
+
+/// Lazy [`FrameTree`] projection slot (see the field docs on
+/// `Engine::frame_tree_cache`).
+type FrameTreeCache<A> = std::sync::OnceLock<
+    Box<
+        FrameTree<
+            <A as Ast>::Value,
+            <A as Ast>::Cursor,
+            <A as Ast>::Delta,
+            <A as Ast>::EffectError,
+        >,
+    >,
+>;
 
 /// The engine: takes ownership of an [`Ast`] + a [`ReducerRegistry`]
 /// and drives the interpretation via the [`Stepper`] trait.
@@ -361,8 +368,7 @@ pub struct Engine<A: Ast> {
     /// about to mutate the internal frames. `OnceLock` gives us safe
     /// interior-mutability for the `&self` read path while keeping
     /// `Engine` `Send + Sync` (required by `DslHost`).
-    frame_tree_cache:
-        std::sync::OnceLock<Box<FrameTree<A::Value, A::Cursor, A::Delta, A::EffectError>>>,
+    frame_tree_cache: FrameTreeCache<A>,
 
     /// Optional user-attached sink that receives every event alongside
     /// the built-in [`CountingSink`]. Set via [`Engine::attach_sink`];
@@ -431,7 +437,11 @@ impl<A: Ast> Engine<A> {
             }
             match ast.node_kind(id) {
                 NodeKind::Seq { children } => stack.extend(children),
-                NodeKind::Par { children, policy, reducer_id } => {
+                NodeKind::Par {
+                    children,
+                    policy,
+                    reducer_id,
+                } => {
                     Self::validate_par(id, &children, policy)?;
                     registry.resolve(&reducer_id, policy.fail)?;
                     stack.extend(children);
@@ -598,7 +608,9 @@ impl<A: Ast> Engine<A> {
                 return Ok(StepOutcome::Done(v));
             }
             // Terminal failure state; caller must treat prior Err as terminal.
-            return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
+            return Ok(StepOutcome::Blocked {
+                newly_pending: SmallVec::new(),
+            });
         }
 
         // Root-already-Value fast path — a `Call` root whose leaf was
@@ -639,7 +651,9 @@ impl<A: Ast> Engine<A> {
                                     .into_iter()
                                     .collect();
                             newly.push(pending);
-                            return Ok(StepOutcome::Blocked { newly_pending: newly });
+                            return Ok(StepOutcome::Blocked {
+                                newly_pending: newly,
+                            });
                         }
                     }
                 }
@@ -672,15 +686,20 @@ impl<A: Ast> Engine<A> {
                     continue;
                 }
                 StepStep::Blocked => {
-                    let newly: SmallVec<[Pending; 1]> =
-                        std::mem::take(&mut self.newly_pending).into_iter().collect();
-                    return Ok(StepOutcome::Blocked { newly_pending: newly });
+                    let newly: SmallVec<[Pending; 1]> = std::mem::take(&mut self.newly_pending)
+                        .into_iter()
+                        .collect();
+                    return Ok(StepOutcome::Blocked {
+                        newly_pending: newly,
+                    });
                 }
                 StepStep::Done => {
                     if let Some(v) = self.root_value.clone() {
                         return Ok(StepOutcome::Done(v));
                     }
-                    return Ok(StepOutcome::Blocked { newly_pending: SmallVec::new() });
+                    return Ok(StepOutcome::Blocked {
+                        newly_pending: SmallVec::new(),
+                    });
                 }
                 StepStep::_Phantom(_) => unreachable!(),
             }
@@ -741,9 +760,7 @@ impl<A: Ast> Engine<A> {
                     })
                 }
             }
-            InternalFrame::Par { children, .. } => {
-                children.iter().find_map(|c| self.peek_at(*c))
-            }
+            InternalFrame::Par { children, .. } => children.iter().find_map(|c| self.peek_at(*c)),
             InternalFrame::Scope { body: Some(b), .. } => self.peek_at(*b),
             InternalFrame::Maybe { body: Some(b), .. } => self.peek_at(*b),
             InternalFrame::Pending { .. }
@@ -823,11 +840,7 @@ impl<A: Ast> Engine<A> {
     /// cascade: their children / bodies are pushed onto the spawn stack
     /// (in reverse, preserving DFS pre-order across pops) and enter the
     /// arena on subsequent passes. Validates `Par` shape.
-    fn spawn_one(
-        &mut self,
-        node_id: NodeId,
-        path: Path,
-    ) -> Result<FrameHandle, EngineError> {
+    fn spawn_one(&mut self, node_id: NodeId, path: Path) -> Result<FrameHandle, EngineError> {
         self.emit_event(&Event::VisitPre {
             at: Self::synthetic_ctx(node_id, path.clone()),
         });
@@ -843,7 +856,11 @@ impl<A: Ast> Engine<A> {
                 };
                 Ok(self.allocate(frame))
             }
-            NodeKind::Par { children, policy, reducer_id } => {
+            NodeKind::Par {
+                children,
+                policy,
+                reducer_id,
+            } => {
                 Self::validate_par(node_id, &children, policy)?;
                 let reducer = self.registry.resolve(&reducer_id, policy.fail)?;
                 let n = children.len();
@@ -969,7 +986,9 @@ impl<A: Ast> Engine<A> {
             JoinShape::All => Ok(()),
             JoinShape::Any => {
                 if n == 0 {
-                    Err(malformed("Par with JoinShape::Any requires >= 1 child".into()))
+                    Err(malformed(
+                        "Par with JoinShape::Any requires >= 1 child".into(),
+                    ))
                 } else {
                     Ok(())
                 }
@@ -1086,7 +1105,9 @@ impl<A: Ast> Engine<A> {
             if let InternalFrame::Value { value, .. } = self.get(c) {
                 let value = value.clone();
                 if let InternalFrame::Seq {
-                    current, last_value, ..
+                    current,
+                    last_value,
+                    ..
                 } = self.get_mut(h)
                 {
                     *current = None;
@@ -1107,7 +1128,11 @@ impl<A: Ast> Engine<A> {
         let (node, path, next_child, children_len, next_id) = {
             let f = self.get(h);
             if let InternalFrame::Seq {
-                node, path, children, next_child, ..
+                node,
+                path,
+                children,
+                next_child,
+                ..
             } = f
             {
                 let id = children.get(*next_child).copied();
@@ -1126,7 +1151,9 @@ impl<A: Ast> Engine<A> {
             let child = self.spawn_one(next_id, child_path)?;
             self.set_parent(child, h);
             if let InternalFrame::Seq {
-                current, next_child, ..
+                current,
+                next_child,
+                ..
             } = self.get_mut(h)
             {
                 *current = Some(child);
@@ -1135,14 +1162,20 @@ impl<A: Ast> Engine<A> {
             Ok(true)
         } else {
             // No more children — promote Seq to a Value.
-            let last = if let InternalFrame::Seq { last_value, path, .. } = self.get(h) {
+            let last = if let InternalFrame::Seq {
+                last_value, path, ..
+            } = self.get(h)
+            {
                 (last_value.clone(), path.clone())
             } else {
                 unreachable!()
             };
             let (last_value, path) = last;
             let value = last_value.unwrap_or_else(|| self.ast.unit_value());
-            let promoted = InternalFrame::Value { node, value: value.clone() };
+            let promoted = InternalFrame::Value {
+                node,
+                value: value.clone(),
+            };
             *self.get_mut(h) = promoted;
             self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
@@ -1154,7 +1187,9 @@ impl<A: Ast> Engine<A> {
     }
 
     fn try_scope_promote(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
-        let (node, body, path) = if let InternalFrame::Scope { node, body, path, .. } = self.get(h)
+        let (node, body, path) = if let InternalFrame::Scope {
+            node, body, path, ..
+        } = self.get(h)
         {
             (*node, *body, path.clone())
         } else {
@@ -1167,7 +1202,10 @@ impl<A: Ast> Engine<A> {
         if let InternalFrame::Value { value, .. } = self.get(body) {
             let value = value.clone();
             self.vacate(body);
-            *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
+            *self.get_mut(h) = InternalFrame::Value {
+                node,
+                value: value.clone(),
+            };
             self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
             });
@@ -1178,7 +1216,9 @@ impl<A: Ast> Engine<A> {
     }
 
     fn try_maybe_promote(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
-        let (node, body, path) = if let InternalFrame::Maybe { node, body, path, .. } = self.get(h)
+        let (node, body, path) = if let InternalFrame::Maybe {
+            node, body, path, ..
+        } = self.get(h)
         {
             (*node, *body, path.clone())
         } else {
@@ -1191,7 +1231,11 @@ impl<A: Ast> Engine<A> {
             } else {
                 None
             }
-        } else if let InternalFrame::Maybe { body_value: Some(v), .. } = self.get(h) {
+        } else if let InternalFrame::Maybe {
+            body_value: Some(v),
+            ..
+        } = self.get(h)
+        {
             Some(v.clone())
         } else {
             None
@@ -1200,7 +1244,10 @@ impl<A: Ast> Engine<A> {
             if let Some(body) = body {
                 self.vacate(body);
             }
-            *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
+            *self.get_mut(h) = InternalFrame::Value {
+                node,
+                value: v.clone(),
+            };
             self.emit_event(&Event::VisitPost {
                 at: Self::synthetic_ctx(node, path),
             });
@@ -1243,9 +1290,7 @@ impl<A: Ast> Engine<A> {
                 }
                 None
             }
-            InternalFrame::Seq { current, .. } => {
-                current.and_then(|c| self.find_fireable_par(c))
-            }
+            InternalFrame::Seq { current, .. } => current.and_then(|c| self.find_fireable_par(c)),
             InternalFrame::Scope { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             InternalFrame::Maybe { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             _ => None,
@@ -1357,8 +1402,7 @@ impl<A: Ast> Engine<A> {
 
         // Cancel losing children (any child not in winners and not yet
         // succeeded / failed).
-        let winner_set: std::collections::HashSet<ChildIndex> =
-            winners.iter().copied().collect();
+        let winner_set: std::collections::HashSet<ChildIndex> = winners.iter().copied().collect();
         for (i, &child) in children.iter().enumerate() {
             if slots[i].is_some() {
                 // Winner or a slot-filled success — mark unused winners as
@@ -1375,7 +1419,10 @@ impl<A: Ast> Engine<A> {
         }
 
         // Mark Par as joined + promote to Value.
-        *self.get_mut(h) = InternalFrame::Value { node, value: value.clone() };
+        *self.get_mut(h) = InternalFrame::Value {
+            node,
+            value: value.clone(),
+        };
         self.emit_event(&Event::VisitPost {
             at: Self::synthetic_ctx(node, path),
         });
@@ -1390,9 +1437,7 @@ impl<A: Ast> Engine<A> {
     fn find_failed_leaf(&self, h: FrameHandle) -> Option<FrameHandle> {
         match self.get(h) {
             InternalFrame::Failed { .. } => Some(h),
-            InternalFrame::Seq { current, .. } => {
-                current.and_then(|c| self.find_failed_leaf(c))
-            }
+            InternalFrame::Seq { current, .. } => current.and_then(|c| self.find_failed_leaf(c)),
             InternalFrame::Par {
                 children, policy, ..
             } => {
@@ -1461,7 +1506,13 @@ impl<A: Ast> Engine<A> {
             InternalFrame::Cancelled { .. }
             | InternalFrame::Value { .. }
             | InternalFrame::Failed { .. } => return,
-            InternalFrame::Pending { sid, node, path, frame, .. } => {
+            InternalFrame::Pending {
+                sid,
+                node,
+                path,
+                frame,
+                ..
+            } => {
                 let sid = *sid;
                 let node = *node;
                 let path = path.clone();
@@ -1527,7 +1578,13 @@ impl<A: Ast> Engine<A> {
         h: FrameHandle,
     ) -> FrameTree<A::Value, A::Cursor, A::Delta, A::EffectError> {
         match self.get(h) {
-            InternalFrame::Seq { children, current, node, path, .. } => {
+            InternalFrame::Seq {
+                children,
+                current,
+                node,
+                path,
+                ..
+            } => {
                 // Project each spawned child (only the current one is
                 // live under the DFS-pre-order kids list).
                 let mut kids = Vec::new();
@@ -1572,7 +1629,10 @@ impl<A: Ast> Engine<A> {
                     joined: *joined,
                 };
                 let _ = node;
-                FrameTree { root: Frame::Par(par), kids }
+                FrameTree {
+                    root: Frame::Par(par),
+                    kids,
+                }
             }
             InternalFrame::Scope { label, body, .. } => {
                 // `body: None` (spawn still queued) projects as a
@@ -1611,11 +1671,15 @@ impl<A: Ast> Engine<A> {
                 kids: vec![],
             },
             InternalFrame::Failed { .. } => FrameTree {
-                root: Frame::Cancelled { reason: CancelReason::SiblingFailed },
+                root: Frame::Cancelled {
+                    reason: CancelReason::SiblingFailed,
+                },
                 kids: vec![],
             },
             InternalFrame::Cancelled { reason, .. } => FrameTree {
-                root: Frame::Cancelled { reason: reason.clone() },
+                root: Frame::Cancelled {
+                    reason: reason.clone(),
+                },
                 kids: vec![],
             },
         }
@@ -1670,7 +1734,10 @@ impl<A: Ast> Stepper for Engine<A> {
         match result {
             Ok(v) => {
                 let (node, path, call_frame) =
-                    if let InternalFrame::Pending { node, path, frame, .. } = self.get(h) {
+                    if let InternalFrame::Pending {
+                        node, path, frame, ..
+                    } = self.get(h)
+                    {
                         (*node, path.clone(), *frame)
                     } else {
                         return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
@@ -1680,12 +1747,19 @@ impl<A: Ast> Stepper for Engine<A> {
                 self.emit_event(&Event::Resume { at: ctx.clone() });
                 self.emit_event(&Event::FrameLeave { at: ctx.clone() });
                 // Replace leaf with Value.
-                *self.get_mut(h) = InternalFrame::Value { node, value: v.clone() };
+                *self.get_mut(h) = InternalFrame::Value {
+                    node,
+                    value: v.clone(),
+                };
                 self.emit_event(&Event::VisitPost { at: ctx });
                 // If parent is a Par, fill the slot.
                 if let Some(&parent) = self.parent.get(&h) {
-                    if let InternalFrame::Par { children, slots, completion_order, .. } =
-                        self.get_mut(parent)
+                    if let InternalFrame::Par {
+                        children,
+                        slots,
+                        completion_order,
+                        ..
+                    } = self.get_mut(parent)
                     {
                         if let Some(idx) = children.iter().position(|c| *c == h) {
                             slots[idx] = Some(v);
@@ -1697,7 +1771,10 @@ impl<A: Ast> Stepper for Engine<A> {
             }
             Err(e) => {
                 let (node, path, call_frame) =
-                    if let InternalFrame::Pending { node, path, frame, .. } = self.get(h) {
+                    if let InternalFrame::Pending {
+                        node, path, frame, ..
+                    } = self.get(h)
+                    {
                         (*node, path.clone(), *frame)
                     } else {
                         return Err(ExecError::Engine(EngineError::UnknownSuspension { id }));
@@ -1722,8 +1799,9 @@ impl<A: Ast> Stepper for Engine<A> {
                         // Actually: leaf becomes an Cancelled-like state that won't trigger propagation.
                         // Fill the Par's failures[idx].
                         if let Some(&parent) = self.parent.get(&h) {
-                            if let InternalFrame::Par { children, failures, .. } =
-                                self.get_mut(parent)
+                            if let InternalFrame::Par {
+                                children, failures, ..
+                            } = self.get_mut(parent)
                             {
                                 if let Some(idx) = children.iter().position(|c| *c == h) {
                                     failures[idx] = Some(e);
@@ -1739,7 +1817,11 @@ impl<A: Ast> Stepper for Engine<A> {
                     _ => {
                         // FailFast or no enclosing Par — leaf transitions
                         // to Failed and the next step() propagates.
-                        *self.get_mut(h) = InternalFrame::Failed { node, path, error: e };
+                        *self.get_mut(h) = InternalFrame::Failed {
+                            node,
+                            path,
+                            error: e,
+                        };
                     }
                 }
                 Ok(())
@@ -1755,9 +1837,7 @@ impl<A: Ast> Stepper for Engine<A> {
         std::mem::take(&mut self.cancellations)
     }
 
-    fn frame_tree(
-        &self,
-    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
+    fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
         // Lazy projection cache backed by `OnceLock`. `step` / `resolve`
         // clear the slot whenever they mutate the internal frames (see
         // `invalidate_frame_tree_cache`), so the first read after a
@@ -1832,11 +1912,21 @@ mod tests {
         *next += 1;
         let cooked = match node {
             N::Seq(children) => {
-                let cs = children.iter().map(|c| assign_ids(c, next)).collect::<Vec<_>>();
+                let cs = children
+                    .iter()
+                    .map(|c| assign_ids(c, next))
+                    .collect::<Vec<_>>();
                 Node::Seq(id, cs)
             }
-            N::Par { children, policy, reducer } => {
-                let cs = children.iter().map(|c| assign_ids(c, next)).collect::<Vec<_>>();
+            N::Par {
+                children,
+                policy,
+                reducer,
+            } => {
+                let cs = children
+                    .iter()
+                    .map(|c| assign_ids(c, next))
+                    .collect::<Vec<_>>();
                 Node::Par(id, cs, *policy, ReducerId::from(*reducer))
             }
             N::Scope(label, body) => {
@@ -1879,7 +1969,12 @@ mod tests {
         match n {
             Node::Seq(id, children) => {
                 let child_ids: Vec<NodeId> = children.iter().map(|(cid, _)| *cid).collect();
-                out.insert(id, NodeKind::Seq { children: child_ids });
+                out.insert(
+                    id,
+                    NodeKind::Seq {
+                        children: child_ids,
+                    },
+                );
                 for (_, c) in children {
                     flatten(c, out);
                 }
@@ -1888,7 +1983,11 @@ mod tests {
                 let child_ids: Vec<NodeId> = children.iter().map(|(cid, _)| *cid).collect();
                 out.insert(
                     id,
-                    NodeKind::Par { children: child_ids, policy, reducer_id },
+                    NodeKind::Par {
+                        children: child_ids,
+                        policy,
+                        reducer_id,
+                    },
                 );
                 for (_, c) in children {
                     flatten(c, out);
@@ -1910,7 +2009,10 @@ mod tests {
             Node::Call(id, label) => {
                 out.insert(
                     id,
-                    NodeKind::Call { label, payload: serde_json::Value::Null },
+                    NodeKind::Call {
+                        label,
+                        payload: serde_json::Value::Null,
+                    },
                 );
             }
         }
@@ -2013,16 +2115,28 @@ mod tests {
     }
 
     fn all_ff() -> JoinPolicy {
-        JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast }
+        JoinPolicy {
+            shape: JoinShape::All,
+            fail: FailPolicy::FailFast,
+        }
     }
     fn any_ff() -> JoinPolicy {
-        JoinPolicy { shape: JoinShape::Any, fail: FailPolicy::FailFast }
+        JoinPolicy {
+            shape: JoinShape::Any,
+            fail: FailPolicy::FailFast,
+        }
     }
     fn first_k_ff(k: usize) -> JoinPolicy {
-        JoinPolicy { shape: JoinShape::FirstK(k), fail: FailPolicy::FailFast }
+        JoinPolicy {
+            shape: JoinShape::FirstK(k),
+            fail: FailPolicy::FailFast,
+        }
     }
     fn all_ca() -> JoinPolicy {
-        JoinPolicy { shape: JoinShape::All, fail: FailPolicy::CollectAll }
+        JoinPolicy {
+            shape: JoinShape::All,
+            fail: FailPolicy::CollectAll,
+        }
     }
 
     // ---- Actual tests ---------------------------------------------
@@ -2102,7 +2216,11 @@ mod tests {
     #[test]
     fn par_of_calls_all_ordered_fans_out() {
         let ast = N::Par {
-            children: vec![N::Call("a".into()), N::Call("b".into()), N::Call("c".into())],
+            children: vec![
+                N::Call("a".into()),
+                N::Call("b".into()),
+                N::Call("c".into()),
+            ],
             policy: all_ff(),
             reducer: "all_ordered",
         };
@@ -2252,7 +2370,11 @@ mod tests {
     #[test]
     fn failfast_propagates_and_cancels_siblings() {
         let ast = N::Par {
-            children: vec![N::Call("ok".into()), N::Call("bad".into()), N::Call("ok2".into())],
+            children: vec![
+                N::Call("ok".into()),
+                N::Call("bad".into()),
+                N::Call("ok2".into()),
+            ],
             policy: all_ff(),
             reducer: "all_ordered",
         };
@@ -2347,7 +2469,10 @@ mod tests {
         let mut e = build(ast);
         let _ = e.step().unwrap();
         let err = e.resolve(SuspensionId(9999), Ok(V::Unit)).unwrap_err();
-        assert!(matches!(err, ExecError::Engine(EngineError::UnknownSuspension { .. })));
+        assert!(matches!(
+            err,
+            ExecError::Engine(EngineError::UnknownSuspension { .. })
+        ));
     }
 
     #[test]
@@ -2366,7 +2491,10 @@ mod tests {
         let _ = e.step().unwrap();
         // sids[1] was cancelled — late resolve is unknown.
         let err = e.resolve(sids[1], Ok(V::S("late".into()))).unwrap_err();
-        assert!(matches!(err, ExecError::Engine(EngineError::UnknownSuspension { .. })));
+        assert!(matches!(
+            err,
+            ExecError::Engine(EngineError::UnknownSuspension { .. })
+        ));
     }
 
     #[test]
@@ -2389,9 +2517,7 @@ mod tests {
 
     #[test]
     fn deep_seq_of_five_calls() {
-        let ast = N::Seq(
-            (0..5).map(|i| N::Call(format!("c{i}"))).collect(),
-        );
+        let ast = N::Seq((0..5).map(|i| N::Call(format!("c{i}"))).collect());
         let mut e = build(ast);
         for i in 0..5 {
             let sid = match e.step().unwrap() {
@@ -2444,7 +2570,11 @@ mod tests {
 
     #[test]
     fn seq_wrapping_maybe_none() {
-        let ast = N::Seq(vec![N::Call("a".into()), N::Maybe(None), N::Call("b".into())]);
+        let ast = N::Seq(vec![
+            N::Call("a".into()),
+            N::Maybe(None),
+            N::Call("b".into()),
+        ]);
         let mut e = build(ast);
         let sid1 = match e.step().unwrap() {
             StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
@@ -2475,7 +2605,10 @@ mod tests {
                 N::Call("b".into()),
                 N::Call("c".into()),
             ],
-            policy: JoinPolicy { shape: JoinShape::FirstK(2), fail: FailPolicy::CollectAll },
+            policy: JoinPolicy {
+                shape: JoinShape::FirstK(2),
+                fail: FailPolicy::CollectAll,
+            },
             reducer: "collect_all",
         };
         let mut e = build(ast);
@@ -2730,7 +2863,10 @@ mod tests {
         // histogram rather than being zeroed by Engine::new).
         let ast = N::Seq(vec![N::Par {
             children: vec![N::Call("l".into()), N::Call("r".into())],
-            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            policy: JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast,
+            },
             reducer: "all_ordered",
         }]);
         let mut e = build(ast);
@@ -2779,7 +2915,9 @@ mod tests {
         };
         let recorded = buf.lock().unwrap().drain();
         assert!(
-            recorded.iter().any(|e| matches!(e, Event::FrameEnter { .. })),
+            recorded
+                .iter()
+                .any(|e| matches!(e, Event::FrameEnter { .. })),
             "attached sink saw the walk-time FrameEnter"
         );
         assert!(
@@ -2807,7 +2945,11 @@ mod tests {
             })
             .collect();
         assert!(kinds.contains(&"resume"), "resume observed: {:?}", kinds);
-        assert!(kinds.contains(&"frame_leave"), "frame_leave observed: {:?}", kinds);
+        assert!(
+            kinds.contains(&"frame_leave"),
+            "frame_leave observed: {:?}",
+            kinds
+        );
     }
 
     #[test]
@@ -2827,7 +2969,10 @@ mod tests {
             _ => panic!(),
         };
         let after_first_step = buf.lock().unwrap().len();
-        assert!(after_first_step > 0, "sink accumulated events during first step");
+        assert!(
+            after_first_step > 0,
+            "sink accumulated events during first step"
+        );
         // Detach: subsequent activity must not accrue in the buffer.
         let previous = e.detach_sink();
         assert!(previous.is_some(), "detach returned the installed sink");
@@ -2873,7 +3018,10 @@ mod tests {
         assert_eq!(p1, p2, "consecutive reads must reuse the cached box");
         // Snapshot: root Seq has current child Pending (Call awaiting resolve).
         let before = format!("{:?}", e.frame_tree());
-        assert!(before.contains("Pending"), "pre-resolve tree must contain Pending frame");
+        assert!(
+            before.contains("Pending"),
+            "pre-resolve tree must contain Pending frame"
+        );
         // Resolve mutates → cache must be cleared → next read projects fresh.
         e.resolve(sid, Ok(V::S("X".into()))).unwrap();
         let after = format!("{:?}", e.frame_tree());
@@ -2934,13 +3082,19 @@ mod tests {
         assert_eq!(e.events().visit_pre, 0, "nothing spawned at halt");
         // Frame tree faithfully shows the not-yet-started root.
         let tree = format!("{:?}", e.frame_tree());
-        assert!(tree.contains("Node"), "bare root placeholder projected: {tree}");
+        assert!(
+            tree.contains("Node"),
+            "bare root placeholder projected: {tree}"
+        );
         // Resume: the halted spawn proceeds and the run reaches the Call.
         let out = e.step_with_breakpoints(&bps).unwrap();
         match out {
             StepOutcome::Blocked { newly_pending } => {
                 assert_eq!(newly_pending.len(), 1);
-                assert!(matches!(newly_pending[0].reason, SuspendReason::Call { .. }));
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
             }
             other => panic!("expected Blocked on the Call, got {other:?}"),
         }
@@ -2954,7 +3108,10 @@ mod tests {
         // the debugger sees.
         let ast = N::Seq(vec![N::Par {
             children: vec![N::Call("a".into()), N::Call("b".into())],
-            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            policy: JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast,
+            },
             reducer: "all_ordered",
         }]);
         let mut e = build(ast);
@@ -2997,7 +3154,10 @@ mod tests {
         // halt again on the second kid.
         let ast = N::Seq(vec![N::Par {
             children: vec![N::Call("a".into()), N::Call("b".into())],
-            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            policy: JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast,
+            },
             reducer: "all_ordered",
         }]);
         let mut e = build(ast);
@@ -3011,9 +3171,11 @@ mod tests {
         let out = e.step_with_breakpoints(&bps).unwrap();
         match out {
             StepOutcome::Blocked { newly_pending } => {
-                assert!(newly_pending
-                    .iter()
-                    .all(|p| matches!(p.reason, SuspendReason::Call { .. })));
+                assert!(
+                    newly_pending
+                        .iter()
+                        .all(|p| matches!(p.reason, SuspendReason::Call { .. }))
+                );
             }
             other => panic!("expected Blocked on Calls, got {other:?}"),
         }
@@ -3031,13 +3193,19 @@ mod tests {
         assert_eq!(bp_halt(&out), Some(NodeId(3)), "halted on scope body ctx");
         // Scope frame exists, body slot still empty.
         let tree = format!("{:?}", e.frame_tree());
-        assert!(tree.contains("Scope"), "scope projected while body pending: {tree}");
+        assert!(
+            tree.contains("Scope"),
+            "scope projected while body pending: {tree}"
+        );
         assert_eq!(e.events().frame_enter, 0, "the Call did not spawn yet");
         // Resume runs through to the Call suspension.
         let out = e.step_with_breakpoints(&bps).unwrap();
         match out {
             StepOutcome::Blocked { newly_pending } => {
-                assert!(matches!(newly_pending[0].reason, SuspendReason::Call { .. }));
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
@@ -3052,7 +3220,10 @@ mod tests {
         // spawned and never reported as a cancellation (it has no sid).
         let ast = N::Seq(vec![N::Par {
             children: vec![N::Call("a".into()), N::Call("b".into())],
-            policy: JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast },
+            policy: JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast,
+            },
             reducer: "all_ordered",
         }]);
         let mut e = build(ast);
@@ -3075,7 +3246,10 @@ mod tests {
             e.take_cancellations().is_empty(),
             "abandoned spawn is not a cancellation (no sid was ever issued)"
         );
-        assert!(e.pending().is_empty(), "synthetic BP and a's call both gone");
+        assert!(
+            e.pending().is_empty(),
+            "synthetic BP and a's call both gone"
+        );
         // Terminal: further stepping stays blocked with nothing new.
         match e.step_with_breakpoints(&bps).unwrap() {
             StepOutcome::Blocked { newly_pending } => assert!(newly_pending.is_empty()),
@@ -3096,7 +3270,10 @@ mod tests {
 
     impl EchoResolver {
         fn new() -> Self {
-            Self { resolved: Vec::new(), cancelled: Vec::new() }
+            Self {
+                resolved: Vec::new(),
+                cancelled: Vec::new(),
+            }
         }
 
         fn answer(&mut self, pending: &Pending) -> Result<V, EE> {
@@ -3194,7 +3371,10 @@ mod tests {
         let out = drive(&mut e, &mut r, &bps).unwrap();
         match out {
             DriveOutcome::Break { at } => {
-                assert!(at.iter().any(|p| matches!(p.reason, SuspendReason::Breakpoint)));
+                assert!(
+                    at.iter()
+                        .any(|p| matches!(p.reason, SuspendReason::Breakpoint))
+                );
             }
             other => panic!("expected Break, got {other:?}"),
         }
@@ -3236,7 +3416,10 @@ mod tests {
             N::Call("first".into()),
             N::Par {
                 children: vec![],
-                policy: JoinPolicy { shape: JoinShape::Any, fail: FailPolicy::FailFast },
+                policy: JoinPolicy {
+                    shape: JoinShape::Any,
+                    fail: FailPolicy::FailFast,
+                },
                 reducer: "all_ordered",
             },
         ]);

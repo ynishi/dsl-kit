@@ -264,9 +264,9 @@ fn compute_nullable(rules: &HashMap<&str, &Peg>) -> HashMap<String, bool> {
 
 fn is_nullable(peg: &Peg, nullable_rules: &HashMap<String, bool>) -> bool {
     match peg {
-        Peg::Rule { body, .. }
-        | Peg::Node { body, .. }
-        | Peg::Field { body, .. } => is_nullable(body, nullable_rules),
+        Peg::Rule { body, .. } | Peg::Node { body, .. } | Peg::Field { body, .. } => {
+            is_nullable(body, nullable_rules)
+        }
         Peg::Seq { items, .. } => items.iter().all(|i| is_nullable(i, nullable_rules)),
         Peg::Choice { alts, .. } => {
             alts.is_empty() || alts.iter().any(|a| is_nullable(a, nullable_rules))
@@ -289,8 +289,10 @@ fn compute_left_first(
     rules: &HashMap<&str, &Peg>,
     nullable: &HashMap<String, bool>,
 ) -> HashMap<String, HashSet<String>> {
-    let mut first: HashMap<String, HashSet<String>> =
-        rules.keys().map(|k| ((*k).to_string(), HashSet::new())).collect();
+    let mut first: HashMap<String, HashSet<String>> = rules
+        .keys()
+        .map(|k| ((*k).to_string(), HashSet::new()))
+        .collect();
     loop {
         let mut changed = false;
         for (name, rule) in rules {
@@ -432,15 +434,24 @@ mod tests {
             variants: vec![
                 VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 },
                 VariantSchema {
                     name: "Add".into(),
                     fields: vec![],
                     children: vec![
-                        ChildSchema { name: "lhs".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "rhs".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "lhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "rhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
             ],
@@ -469,8 +480,16 @@ mod tests {
     fn indirect_left_recursion_is_detected() {
         let ids = IdGen::new();
         // a <- b "x"; b <- a "y"
-        let a = rule(&ids, "a", seq(&ids, vec![rule_ref(&ids, "b"), token(&ids, "x")]));
-        let b = rule(&ids, "b", seq(&ids, vec![rule_ref(&ids, "a"), token(&ids, "y")]));
+        let a = rule(
+            &ids,
+            "a",
+            seq(&ids, vec![rule_ref(&ids, "b"), token(&ids, "x")]),
+        );
+        let b = rule(
+            &ids,
+            "b",
+            seq(&ids, vec![rule_ref(&ids, "a"), token(&ids, "y")]),
+        );
         let g = Grammar::new(vec![a, b], "a");
         let diags = check_left_recursion(&g);
         // Both rules should fire — each reaches itself via the other.
@@ -499,8 +518,9 @@ mod tests {
         let g = Grammar::new(vec![a, b], "a");
         let diags = check_left_recursion(&g);
         assert!(
-            diags.iter().any(|d| d.code == peg_codes::LEFT_RECURSION
-                && d.message.contains("`a`")),
+            diags
+                .iter()
+                .any(|d| d.code == peg_codes::LEFT_RECURSION && d.message.contains("`a`")),
             "expected `a` to be flagged, diags = {diags:?}"
         );
     }
@@ -509,7 +529,11 @@ mod tests {
     fn right_recursion_is_accepted() {
         let ids = IdGen::new();
         // a <- "x" a — legal PEG, consumes before recursing.
-        let a = rule(&ids, "a", seq(&ids, vec![token(&ids, "x"), rule_ref(&ids, "a")]));
+        let a = rule(
+            &ids,
+            "a",
+            seq(&ids, vec![token(&ids, "x"), rule_ref(&ids, "a")]),
+        );
         let g = Grammar::new(vec![a], "a");
         assert!(check_left_recursion(&g).is_empty());
     }
@@ -766,7 +790,10 @@ mod tests {
                 name: "Tiny".into(),
                 variants: vec![VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 }],
             }

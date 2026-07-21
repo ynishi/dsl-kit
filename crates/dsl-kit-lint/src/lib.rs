@@ -439,9 +439,7 @@ impl<A: Walk> Rule<A> for NoRedundantWrap {
                     Self::NAME,
                     Severity::Warn,
                     node.node_id(),
-                    format!(
-                        "{parent} wraps a single {child}; the outer wrap can be inlined"
-                    ),
+                    format!("{parent} wraps a single {child}; the outer wrap can be inlined"),
                 );
             }
         });
@@ -475,8 +473,7 @@ impl<A: Walk + DslSchema> Rule<A> for DeadVariants {
 
     fn check(&self, ast: &A, ctx: &mut LintContext) {
         let schema = A::schema();
-        let declared: HashSet<String> =
-            schema.variants.iter().map(|v| v.name.clone()).collect();
+        let declared: HashSet<String> = schema.variants.iter().map(|v| v.name.clone()).collect();
         let mut seen: HashSet<String> = HashSet::new();
         ast.walk(&mut |node, phase| {
             if phase != Phase::Pre {
@@ -551,11 +548,17 @@ mod tests {
     }
 
     fn leaf(n: u64) -> Tiny {
-        Tiny::Node { id: NodeId(n), kids: vec![] }
+        Tiny::Node {
+            id: NodeId(n),
+            kids: vec![],
+        }
     }
 
     fn node(n: u64, kids: Vec<Tiny>) -> Tiny {
-        Tiny::Node { id: NodeId(n), kids }
+        Tiny::Node {
+            id: NodeId(n),
+            kids,
+        }
     }
 
     #[test]
@@ -570,7 +573,10 @@ mod tests {
         let dup = NodeId(42);
         let ast = Tiny::Node {
             id: dup,
-            kids: vec![Tiny::Node { id: dup, kids: vec![] }],
+            kids: vec![Tiny::Node {
+                id: dup,
+                kids: vec![],
+            }],
         };
         let diags = Linter::<Tiny>::new().with_rule(UniqueNodeIds).lint(&ast);
         assert_eq!(diags.len(), 1);
@@ -634,7 +640,10 @@ mod tests {
             id: dup,
             kids: vec![Tiny::Node {
                 id: NodeId(10),
-                kids: vec![Tiny::Node { id: dup, kids: vec![] }],
+                kids: vec![Tiny::Node {
+                    id: dup,
+                    kids: vec![],
+                }],
             }],
         };
         let diags = Linter::<Tiny>::new()
@@ -696,9 +705,7 @@ mod tests {
         // node(1, [node(2, [leaf(3)])]) — outer has 1 child of same
         // "Node" variant → fires on id=1.
         let ast = node(1, vec![node(2, vec![leaf(3)])]);
-        let diags = Linter::<Tiny>::new()
-            .with_rule(NoRedundantWrap)
-            .lint(&ast);
+        let diags = Linter::<Tiny>::new().with_rule(NoRedundantWrap).lint(&ast);
         // Tiny only has one variant so every 1-child node fires. Both
         // id=1 (children=[node(2,..)]) and id=2 (children=[leaf(3)])
         // wrap a single Node.
@@ -712,9 +719,7 @@ mod tests {
         // 2 children → not a single-wrap → no fire on root. Kids are
         // leaves (0 children) → no fire on kids either.
         let ast = node(1, vec![leaf(2), leaf(3)]);
-        let diags = Linter::<Tiny>::new()
-            .with_rule(NoRedundantWrap)
-            .lint(&ast);
+        let diags = Linter::<Tiny>::new().with_rule(NoRedundantWrap).lint(&ast);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
@@ -731,9 +736,13 @@ mod tests {
     // never used — so we can exercise DeadVariants' positive path.
     #[derive(Debug)]
     enum TwoVar {
-        Alpha { id: NodeId },
+        Alpha {
+            id: NodeId,
+        },
         #[allow(dead_code)]
-        Beta { id: NodeId },
+        Beta {
+            id: NodeId,
+        },
     }
 
     impl DslNode for TwoVar {

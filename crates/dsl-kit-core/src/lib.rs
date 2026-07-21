@@ -118,7 +118,9 @@ pub struct IdGen {
 impl IdGen {
     /// Creates a fresh generator initialised at zero.
     pub const fn new() -> Self {
-        Self { next: AtomicU64::new(0) }
+        Self {
+            next: AtomicU64::new(0),
+        }
     }
 
     /// Allocates a fresh `NodeId`.
@@ -150,7 +152,13 @@ pub struct NodeContext {
 impl NodeContext {
     /// Builds a context for a node visited without any active frame.
     pub fn at(node: NodeId, path: Path) -> Self {
-        Self { node, path, frame: None, depth: 0, iteration: None }
+        Self {
+            node,
+            path,
+            frame: None,
+            depth: 0,
+            iteration: None,
+        }
     }
 }
 
@@ -385,7 +393,9 @@ impl BufferingSink {
     /// The buffer is still logically unbounded; `cap` is only a
     /// hint to avoid early re-allocations.
     pub fn with_capacity(cap: usize) -> Self {
-        Self { events: Vec::with_capacity(cap) }
+        Self {
+            events: Vec::with_capacity(cap),
+        }
     }
 
     /// Returns a slice view of the recorded events without draining.
@@ -436,7 +446,9 @@ pub enum EngineError {
     #[error("evaluation aborted at {at}: {reason}")]
     #[diagnostic(
         code(dsl_kit::eval::aborted),
-        help("The interpreter returned an `Aborted` outcome. Inspect the reason and the node context to locate the abort site.")
+        help(
+            "The interpreter returned an `Aborted` outcome. Inspect the reason and the node context to locate the abort site."
+        )
     )]
     Aborted {
         /// Where the abort happened.
@@ -449,7 +461,9 @@ pub enum EngineError {
     #[error("evaluator failed at {at}")]
     #[diagnostic(
         code(dsl_kit::eval::failed),
-        help("The interpreter returned an error while evaluating this node. The `#[source]` chain points at the underlying failure.")
+        help(
+            "The interpreter returned an error while evaluating this node. The `#[source]` chain points at the underlying failure."
+        )
     )]
     EvalFailed {
         /// Where the failure happened.
@@ -464,7 +478,9 @@ pub enum EngineError {
     #[error("malformed AST at {at}: {detail}")]
     #[diagnostic(
         code(dsl_kit::ast::malformed),
-        help("An AST invariant was violated. This usually means a hand-constructed tree omitted a required child.")
+        help(
+            "An AST invariant was violated. This usually means a hand-constructed tree omitted a required child."
+        )
     )]
     Malformed {
         /// Where the invariant violation was detected.
@@ -478,7 +494,9 @@ pub enum EngineError {
     #[error("stepper protocol violation at {at}: {detail}")]
     #[diagnostic(
         code(dsl_kit::stepper::protocol),
-        help("The stepper's suspend/resume contract was broken. Each `PendingEffect` leaf must be resolved exactly once before further steps observe its value.")
+        help(
+            "The stepper's suspend/resume contract was broken. Each `PendingEffect` leaf must be resolved exactly once before further steps observe its value."
+        )
     )]
     StepperProtocol {
         /// Where the protocol violation was detected.
@@ -495,7 +513,9 @@ pub enum EngineError {
     #[error("unknown suspension {id}")]
     #[diagnostic(
         code(dsl_kit::stepper::unknown_suspension),
-        help("The host called resolve() with a SuspensionId the engine does not know. This is the expected outcome for a late response arriving after the effect's branch was cancelled.")
+        help(
+            "The host called resolve() with a SuspensionId the engine does not know. This is the expected outcome for a late response arriving after the effect's branch was cancelled."
+        )
     )]
     UnknownSuspension {
         /// The unknown suspension id.
@@ -507,7 +527,9 @@ pub enum EngineError {
     #[error("unknown reducer {id:?}")]
     #[diagnostic(
         code(dsl_kit::reducer::unknown),
-        help("The ParFrame's reducer_id was not found in the ReducerRegistry. Register the reducer at Stepper build time or fix the AST to reference a known id.")
+        help(
+            "The ParFrame's reducer_id was not found in the ReducerRegistry. Register the reducer at Stepper build time or fix the AST to reference a known id."
+        )
     )]
     UnknownReducer {
         /// The unknown reducer id.
@@ -537,15 +559,28 @@ pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
     }
 
     let samples: Vec<EngineError> = vec![
-        EngineError::Aborted { at: ctx(), reason: String::new() },
+        EngineError::Aborted {
+            at: ctx(),
+            reason: String::new(),
+        },
         EngineError::EvalFailed {
             at: ctx(),
             source: Box::new(std::io::Error::other("")),
         },
-        EngineError::Malformed { at: ctx(), detail: String::new() },
-        EngineError::StepperProtocol { at: ctx(), detail: String::new() },
-        EngineError::UnknownSuspension { id: SuspensionId(0) },
-        EngineError::UnknownReducer { id: ReducerId(String::new()) },
+        EngineError::Malformed {
+            at: ctx(),
+            detail: String::new(),
+        },
+        EngineError::StepperProtocol {
+            at: ctx(),
+            detail: String::new(),
+        },
+        EngineError::UnknownSuspension {
+            id: SuspensionId(0),
+        },
+        EngineError::UnknownReducer {
+            id: ReducerId(String::new()),
+        },
     ];
 
     samples
@@ -634,9 +669,7 @@ pub trait Stepper {
     fn take_cancellations(&mut self) -> Vec<SuspensionId>;
 
     /// Root of the live frame tree. Debugger read.
-    fn frame_tree(
-        &self,
-    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError>;
+    fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError>;
 
     /// True when the root has produced a value.
     fn is_done(&self) -> bool;
@@ -1087,18 +1120,12 @@ impl BreakCondition {
         }
     }
 
-    /// Logical NOT.
-    pub fn not(self) -> Self {
-        Self::Not(Box::new(self))
-    }
-
     /// Evaluates the condition against a context.
     pub fn matches(&self, ctx: &NodeContext) -> bool {
         match self {
             Self::Node(id) => ctx.node == *id,
             Self::PathPrefix(prefix) => {
-                ctx.path.0.len() >= prefix.0.len()
-                    && ctx.path.0[..prefix.0.len()] == prefix.0[..]
+                ctx.path.0.len() >= prefix.0.len() && ctx.path.0[..prefix.0.len()] == prefix.0[..]
             }
             Self::PathExact(path) => ctx.path == *path,
             Self::DepthAtLeast(n) => ctx.depth >= *n,
@@ -1115,6 +1142,15 @@ impl BreakCondition {
     }
 }
 
+impl std::ops::Not for BreakCondition {
+    type Output = Self;
+
+    /// Logical NOT: `!cond` matches exactly when `cond` does not.
+    fn not(self) -> Self {
+        Self::Not(Box::new(self))
+    }
+}
+
 /// A registry of breakpoint conditions and their assigned IDs.
 #[derive(Debug, Default)]
 pub struct BreakpointSet {
@@ -1125,7 +1161,10 @@ pub struct BreakpointSet {
 impl BreakpointSet {
     /// Creates an empty set.
     pub fn new() -> Self {
-        Self { next: 1, entries: Vec::new() }
+        Self {
+            next: 1,
+            entries: Vec::new(),
+        }
     }
 
     /// Adds a condition and returns its assigned id.
@@ -1282,7 +1321,13 @@ mod tests {
     }
 
     fn ctx_at(node: NodeId, path: Path, depth: u32) -> NodeContext {
-        NodeContext { node, path, frame: None, depth, iteration: None }
+        NodeContext {
+            node,
+            path,
+            frame: None,
+            depth,
+            iteration: None,
+        }
     }
 
     #[test]
@@ -1314,7 +1359,10 @@ mod tests {
             reason: "user requested".into(),
         };
         use miette::Diagnostic;
-        assert_eq!(err.code().map(|c| c.to_string()).as_deref(), Some("dsl_kit::eval::aborted"));
+        assert_eq!(
+            err.code().map(|c| c.to_string()).as_deref(),
+            Some("dsl_kit::eval::aborted")
+        );
     }
 
     #[test]
@@ -1376,7 +1424,9 @@ mod tests {
 
         let ff = reg.resolve(&"first".into(), FailPolicy::FailFast).unwrap();
         assert!(matches!(ff, ReducerHandle::FailFast(_)));
-        let ca = reg.resolve(&"count_ok".into(), FailPolicy::CollectAll).unwrap();
+        let ca = reg
+            .resolve(&"count_ok".into(), FailPolicy::CollectAll)
+            .unwrap();
         assert!(matches!(ca, ReducerHandle::CollectAll(_)));
 
         let miss = reg.resolve(&"nope".into(), FailPolicy::FailFast);

@@ -46,9 +46,7 @@
 //! assert_eq!(tree.variant, "Add");
 //! ```
 
-use crate::{
-    BuildError, Diagnostic, ParseTree, RawValue, codes, nearest_candidates,
-};
+use crate::{BuildError, Diagnostic, ParseTree, RawValue, codes, nearest_candidates};
 use dsl_kit_schema::{Multiplicity, NodeSchema, VariantSchema};
 use serde_json::Value;
 
@@ -135,8 +133,7 @@ fn build_tree(
         None => {
             diags.push(Diagnostic::error(
                 serde_codes::TYPE_MISSING,
-                "object is missing the `type` tag (expected a variant name)"
-                    .to_string(),
+                "object is missing the `type` tag (expected a variant name)".to_string(),
             ));
             return None;
         }
@@ -155,10 +152,7 @@ fn build_tree(
         None => {
             let candidates = nearest_candidates(&variant_name, &schema.variants, 3);
             let msg = if candidates.is_empty() {
-                format!(
-                    "unknown variant `{}` for `{}`",
-                    variant_name, schema.name
-                )
+                format!("unknown variant `{}` for `{}`", variant_name, schema.name)
             } else {
                 format!(
                     "unknown variant `{}` for `{}` (did you mean: {})",
@@ -292,23 +286,41 @@ mod tests {
             variants: vec![
                 VariantSchema {
                     name: "Lit".into(),
-                    fields: vec![FieldSchema { name: "value".into(), ty: "i64".into() }],
+                    fields: vec![FieldSchema {
+                        name: "value".into(),
+                        ty: "i64".into(),
+                    }],
                     children: vec![],
                 },
                 VariantSchema {
                     name: "Add".into(),
                     fields: vec![],
                     children: vec![
-                        ChildSchema { name: "lhs".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "rhs".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "lhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "rhs".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
                 VariantSchema {
                     name: "Let".into(),
-                    fields: vec![FieldSchema { name: "name".into(), ty: "String".into() }],
+                    fields: vec![FieldSchema {
+                        name: "name".into(),
+                        ty: "String".into(),
+                    }],
                     children: vec![
-                        ChildSchema { name: "value".into(), multiplicity: Multiplicity::One },
-                        ChildSchema { name: "body".into(), multiplicity: Multiplicity::One },
+                        ChildSchema {
+                            name: "value".into(),
+                            multiplicity: Multiplicity::One,
+                        },
+                        ChildSchema {
+                            name: "body".into(),
+                            multiplicity: Multiplicity::One,
+                        },
                     ],
                 },
                 VariantSchema {
@@ -390,8 +402,7 @@ mod tests {
 
     #[test]
     fn unknown_variant_lists_candidates() {
-        let err =
-            from_json_value(&json!({ "type": "Ad" }), &schema()).unwrap_err();
+        let err = from_json_value(&json!({ "type": "Ad" }), &schema()).unwrap_err();
         assert_eq!(err.diagnostics.len(), 1);
         assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_VARIANT);
         assert!(err.diagnostics[0].message.contains("Add"));
@@ -422,7 +433,11 @@ mod tests {
             "items": { "type": "Lit", "value": 1 },
         });
         let err = from_json_value(&value, &schema()).unwrap_err();
-        assert!(err.diagnostics.iter().any(|d| d.code == serde_codes::CHILD_SHAPE));
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == serde_codes::CHILD_SHAPE)
+        );
     }
 
     #[test]
@@ -456,8 +471,16 @@ mod tests {
         });
         let err = from_json_value(&value, &schema()).unwrap_err();
         // Expect: one UNKNOWN_FIELD (bogus) + one UNKNOWN_VARIANT (Nope).
-        assert!(err.diagnostics.iter().any(|d| d.code == codes::UNKNOWN_FIELD));
-        assert!(err.diagnostics.iter().any(|d| d.code == codes::UNKNOWN_VARIANT));
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::UNKNOWN_FIELD)
+        );
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::UNKNOWN_VARIANT)
+        );
     }
 
     #[test]

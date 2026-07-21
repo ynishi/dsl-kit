@@ -29,7 +29,9 @@ async fn call_state(h: &DslMcpHandler) -> Value {
 }
 
 async fn call_step(h: &DslMcpHandler, mode: &str) -> Value {
-    let body = dsl_kit_mcp::handler::StepParams { mode: Some(mode.into()) };
+    let body = dsl_kit_mcp::handler::StepParams {
+        mode: Some(mode.into()),
+    };
     parse(&h.dsl_kit_step(Parameters(body)).await.expect("step ok"))
 }
 
@@ -37,7 +39,11 @@ async fn call_resolve(h: &DslMcpHandler, result: Option<&str>) -> Value {
     let body = dsl_kit_mcp::handler::ResolveParams {
         result: result.map(str::to_owned),
     };
-    parse(&h.dsl_kit_resolve(Parameters(body)).await.expect("resolve ok"))
+    parse(
+        &h.dsl_kit_resolve(Parameters(body))
+            .await
+            .expect("resolve ok"),
+    )
 }
 
 async fn call_bp_add(h: &DslMcpHandler, node: u64) -> Value {
@@ -49,7 +55,11 @@ async fn call_bp_add(h: &DslMcpHandler, node: u64) -> Value {
         at_iteration: None,
         under_path: None,
     };
-    parse(&h.dsl_kit_breakpoint_add(Parameters(body)).await.expect("bp add ok"))
+    parse(
+        &h.dsl_kit_breakpoint_add(Parameters(body))
+            .await
+            .expect("bp add ok"),
+    )
 }
 
 async fn call_bp_list(h: &DslMcpHandler) -> Value {
@@ -85,12 +95,7 @@ async fn call_resolve_by_id_ok(h: &DslMcpHandler, id: u64, ok: &str) -> Value {
     )
 }
 
-async fn call_resolve_by_id_err(
-    h: &DslMcpHandler,
-    id: u64,
-    code: &str,
-    message: &str,
-) -> Value {
+async fn call_resolve_by_id_err(h: &DslMcpHandler, id: u64, code: &str, message: &str) -> Value {
     let body = dsl_kit_mcp::handler::ResolveByIdParams {
         id,
         ok: None,
@@ -260,8 +265,14 @@ async fn resources_default_includes_kit_and_dsl_layers() {
     let entries = handler.all_resources().await;
     let uris: Vec<&str> = entries.iter().map(|e| e.uri.as_str()).collect();
     assert!(uris.contains(&"dsl-kit://kit/intro"), "missing kit intro");
-    assert!(uris.contains(&"dsl-kit://kit/error-catalog"), "missing kit error-catalog");
-    assert!(uris.contains(&"dsl-kit://dsl/flow/grammar"), "missing flow grammar");
+    assert!(
+        uris.contains(&"dsl-kit://kit/error-catalog"),
+        "missing kit error-catalog"
+    );
+    assert!(
+        uris.contains(&"dsl-kit://dsl/flow/grammar"),
+        "missing flow grammar"
+    );
     assert!(
         uris.contains(&"dsl-kit://dsl/flow/samples/research-pipeline"),
         "missing flow sample"
@@ -270,8 +281,8 @@ async fn resources_default_includes_kit_and_dsl_layers() {
 
 #[tokio::test]
 async fn without_kit_resources_drops_kit_layer_only() {
-    let handler = DslMcpHandler::new(Box::new(FlowHost::new_with_default_program()))
-        .without_kit_resources();
+    let handler =
+        DslMcpHandler::new(Box::new(FlowHost::new_with_default_program())).without_kit_resources();
     let entries = handler.all_resources().await;
     for entry in &entries {
         assert!(
@@ -384,7 +395,9 @@ async fn resolve_by_id_err_triggers_failfast_and_cancels_siblings() {
     let _ = call_resolve_by_id_err(&handler, ids[1], "timeout", "gh timed out").await;
 
     // Next step must report an error via the underlying handler.
-    let body = dsl_kit_mcp::handler::StepParams { mode: Some("one".into()) };
+    let body = dsl_kit_mcp::handler::StepParams {
+        mode: Some("one".into()),
+    };
     let err = handler
         .dsl_kit_step(Parameters(body))
         .await

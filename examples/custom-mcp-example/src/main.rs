@@ -107,7 +107,10 @@ async fn main() -> anyhow::Result<()> {
             "Echoes the supplied message back and reports its length.",
             |args: EchoArgs, _ctx: ToolCtx| async move {
                 let length = args.message.chars().count();
-                Ok::<_, String>(EchoOut { echoed: args.message, length })
+                Ok::<_, String>(EchoOut {
+                    echoed: args.message,
+                    length,
+                })
             },
         )
         .tool(
@@ -115,7 +118,10 @@ async fn main() -> anyhow::Result<()> {
             "Sums a list of integers, optionally offset by `start`.",
             |args: SumArgs, _ctx: ToolCtx| async move {
                 let sum: i64 = args.numbers.iter().sum::<i64>() + args.start;
-                Ok::<_, String>(SumOut { sum, count: args.numbers.len() })
+                Ok::<_, String>(SumOut {
+                    sum,
+                    count: args.numbers.len(),
+                })
             },
         )
         .tool_from_host(

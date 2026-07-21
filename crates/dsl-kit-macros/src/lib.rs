@@ -1,5 +1,12 @@
 //! Derive macros for `dsl-kit`.
 //!
+//! ## Design
+//!
+//! One input shape, three derives. Every macro accepts the same enum
+//! form (named-field variants, one `id: NodeId` each), so a DSL opts
+//! into traversal, schema reflection, and parse-tree building by adding
+//! derives — never by restating its shape.
+//!
 //! `#[derive(DslNode)]` accepts an `enum` whose every variant uses named
 //! fields, exactly one of which is called `id` and typed `NodeId`. The
 //! macro generates three impls in one shot:
@@ -60,7 +67,7 @@ enum Recursion {
 }
 
 /// Returns the last path segment of a `Type::Path`, if that's what `ty` is.
-fn last_segment<'a>(ty: &'a Type) -> Option<&'a syn::PathSegment> {
+fn last_segment(ty: &Type) -> Option<&syn::PathSegment> {
     let Type::Path(TypePath { path, .. }) = ty else {
         return None;
     };
@@ -150,12 +157,9 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let Data::Enum(data) = &input.data else {
-        return syn::Error::new_spanned(
-            &input,
-            "#[derive(DslNode)] currently supports enums only",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new_spanned(&input, "#[derive(DslNode)] currently supports enums only")
+            .to_compile_error()
+            .into();
     };
 
     let mut node_arms = Vec::new();
@@ -177,11 +181,10 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
         };
 
         // Locate the `id` field.
-        let has_id = fields.named.iter().any(|f| {
-            f.ident
-                .as_ref()
-                .is_some_and(|ident| ident == "id")
-        });
+        let has_id = fields
+            .named
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|ident| ident == "id"));
         if !has_id {
             return syn::Error::new_spanned(
                 variant,
@@ -396,15 +399,15 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 }
 
 /// Derives `dsl_kit_parse::DslBuild` for the same enum shape accepted
-/// by [`DslNode`] and [`DslSchema`]. The generated `from_parse_tree`
+/// by `DslNode` and `DslSchema`. The generated `from_parse_tree`
 /// method:
 ///
-/// 1. Runs a level-scoped [`check_conformance`] against
+/// 1. Runs a level-scoped `check_conformance` against
 ///    `Self::schema()` and returns any diagnostics before proceeding.
 ///    Types deriving `DslBuild` must therefore also derive `DslSchema`.
-/// 2. Dispatches on the [`ParseTree`]'s `variant` name against the
+/// 2. Dispatches on the `ParseTree`'s `variant` name against the
 ///    enum's variants.
-/// 3. For each named field, calls [`build_field`] — the field's
+/// 3. For each named field, calls `dsl_kit_parse::build_field` — the field's
 ///    Rust type must implement both `serde::de::DeserializeOwned` and
 ///    `FromStr`. `RawValue::Json` payloads dispatch through serde;
 ///    `RawValue::Text` payloads (the PEG front-end's natural output)
@@ -419,18 +422,13 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 ///    payload fields only; annotating a recursive child field is a
 ///    compile error.
 /// 4. For each recursive child field, calls the appropriate helper
-///    ([`build_child_one`] / `_optional` / `_many`) and re-wraps the
+///    (`build_child_one` / `_optional` / `_many`) and re-wraps the
 ///    result in `Box` where the source field is boxed.
-/// 5. Constructs the variant with a fresh [`NodeId`] from the
+/// 5. Constructs the variant with a fresh `NodeId` from the
 ///    caller-supplied `IdGen`.
 ///
-/// [`check_conformance`]: dsl_kit_parse::check_conformance
-/// [`build_field`]: dsl_kit_parse::build_field
-/// [`build_child_one`]: dsl_kit_parse::build_child_one
-/// [`DslNode`]: dsl_kit_core::DslNode
-/// [`DslSchema`]: dsl_kit_schema::DslSchema
-/// [`ParseTree`]: dsl_kit_parse::ParseTree
-/// [`NodeId`]: dsl_kit_core::NodeId
+/// (The named helpers live in `dsl_kit_parse`; this proc-macro crate
+/// cannot intra-doc-link across crates it does not depend on.)
 #[proc_macro_derive(DslBuild, attributes(dsl_build))]
 pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -461,9 +459,10 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
             .into();
         };
 
-        let has_id = fields.named.iter().any(|f| {
-            f.ident.as_ref().is_some_and(|ident| ident == "id")
-        });
+        let has_id = fields
+            .named
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|ident| ident == "id"));
         if !has_id {
             return syn::Error::new_spanned(
                 variant,

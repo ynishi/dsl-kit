@@ -178,7 +178,8 @@ impl DslMcpBuilder {
         Out: Serialize + Send + 'static,
     {
         let schema = schemars::schema_for!(Args);
-        let schema_value = serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(Default::default()));
+        let schema_value =
+            serde_json::to_value(schema).unwrap_or_else(|_| Value::Object(Default::default()));
         let schema_obj = match schema_value {
             Value::Object(map) => map,
             _ => Default::default(),
@@ -189,11 +190,19 @@ impl DslMcpBuilder {
             let handler = handler.clone();
             Box::pin(async move {
                 let args: Args = if args_value.is_null() {
-                    serde_json::from_value(Value::Object(Default::default()))
-                        .map_err(|e| format!("failed to parse empty args as {}: {e}", std::any::type_name::<Args>()))?
+                    serde_json::from_value(Value::Object(Default::default())).map_err(|e| {
+                        format!(
+                            "failed to parse empty args as {}: {e}",
+                            std::any::type_name::<Args>()
+                        )
+                    })?
                 } else {
-                    serde_json::from_value(args_value)
-                        .map_err(|e| format!("failed to parse args as {}: {e}", std::any::type_name::<Args>()))?
+                    serde_json::from_value(args_value).map_err(|e| {
+                        format!(
+                            "failed to parse args as {}: {e}",
+                            std::any::type_name::<Args>()
+                        )
+                    })?
                 };
                 let out = (handler)(args, ctx).await?;
                 serde_json::to_value(out).map_err(|e| format!("failed to serialize output: {e}"))
@@ -341,10 +350,7 @@ impl ServerHandler for DslMcpServer {
             .iter()
             .find(|e| e.uri == request.uri)
             .ok_or_else(|| {
-                McpError::resource_not_found(
-                    format!("unknown resource uri: {}", request.uri),
-                    None,
-                )
+                McpError::resource_not_found(format!("unknown resource uri: {}", request.uri), None)
             })?;
         let body = entry
             .read()
@@ -359,8 +365,16 @@ impl ServerHandler for DslMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let tools: Vec<Tool> = self.tools.iter().map(RegisteredTool::to_rmcp_tool).collect();
-        Ok(ListToolsResult { tools, meta: None, next_cursor: None })
+        let tools: Vec<Tool> = self
+            .tools
+            .iter()
+            .map(RegisteredTool::to_rmcp_tool)
+            .collect();
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
     }
 
     async fn call_tool(
@@ -372,12 +386,11 @@ impl ServerHandler for DslMcpServer {
             .tools
             .iter()
             .find(|t| t.name == request.name)
-            .ok_or_else(|| McpError::invalid_params(format!("unknown tool {:?}", request.name), None))?;
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("unknown tool {:?}", request.name), None)
+            })?;
 
-        let args_value = request
-            .arguments
-            .map(Value::Object)
-            .unwrap_or(Value::Null);
+        let args_value = request.arguments.map(Value::Object).unwrap_or(Value::Null);
 
         match (tool.handler)(args_value, ToolCtx).await {
             Ok(output) => {
@@ -408,22 +421,36 @@ mod tests {
     async fn builder_registers_tools_and_lists_them() {
         let server = DslMcpBuilder::new()
             .instructions("test server")
-            .tool("echo", "echo the message", |args: EchoArgs, _ctx| async move {
-                Ok::<_, String>(EchoOut { echoed: args.message })
-            })
+            .tool(
+                "echo",
+                "echo the message",
+                |args: EchoArgs, _ctx| async move {
+                    Ok::<_, String>(EchoOut {
+                        echoed: args.message,
+                    })
+                },
+            )
             .build();
 
         assert_eq!(server.tools.len(), 1);
         assert_eq!(server.tools[0].name.as_ref(), "echo");
-        assert_eq!(server.tools[0].description.as_ref().map(|c| c.as_ref()), Some("echo the message"));
-        assert_eq!(server.get_info().instructions.as_deref(), Some("test server"));
+        assert_eq!(
+            server.tools[0].description.as_ref().map(|c| c.as_ref()),
+            Some("echo the message")
+        );
+        assert_eq!(
+            server.get_info().instructions.as_deref(),
+            Some("test server")
+        );
     }
 
     #[tokio::test]
     async fn tool_dispatch_deserializes_and_invokes_handler() {
         let server = DslMcpBuilder::new()
             .tool("echo", "echo", |args: EchoArgs, _ctx| async move {
-                Ok::<_, String>(EchoOut { echoed: format!("hi, {}", args.message) })
+                Ok::<_, String>(EchoOut {
+                    echoed: format!("hi, {}", args.message),
+                })
             })
             .build();
 
@@ -472,13 +499,18 @@ mod tests {
     async fn tool_dispatch_returns_error_on_missing_field() {
         let server = DslMcpBuilder::new()
             .tool("echo", "echo", |args: EchoArgs, _ctx| async move {
-                Ok::<_, String>(EchoOut { echoed: args.message })
+                Ok::<_, String>(EchoOut {
+                    echoed: args.message,
+                })
             })
             .build();
 
         let tool = &server.tools[0];
         let bad = serde_json::json!({});
-        let err = (tool.handler)(bad, ToolCtx).await.err().expect("expected err");
+        let err = (tool.handler)(bad, ToolCtx)
+            .await
+            .err()
+            .expect("expected err");
         assert!(err.contains("failed to parse args"));
     }
 }

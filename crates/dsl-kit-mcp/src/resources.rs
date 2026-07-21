@@ -87,10 +87,8 @@ impl ResourceEntry {
 // ---------- Kit-layer entries -------------------------------------------
 
 const KIT_INTRO: &str = include_str!("./resources_data/kit/intro.md");
-const KIT_DSL_HOST_AUTHORING: &str =
-    include_str!("./resources_data/kit/dsl-host-authoring.md");
-const KIT_MCP_TOOL_REFERENCE: &str =
-    include_str!("./resources_data/kit/mcp-tool-reference.md");
+const KIT_DSL_HOST_AUTHORING: &str = include_str!("./resources_data/kit/dsl-host-authoring.md");
+const KIT_MCP_TOOL_REFERENCE: &str = include_str!("./resources_data/kit/mcp-tool-reference.md");
 
 /// URI prefix reserved for kit-layer resources.
 pub const KIT_URI_PREFIX: &str = "dsl-kit://kit/";
@@ -158,7 +156,9 @@ mod tests {
     #[test]
     fn every_kit_body_is_non_empty() {
         for entry in kit_resources() {
-            let body = entry.read().unwrap_or_else(|e| panic!("{}: {e}", entry.uri));
+            let body = entry
+                .read()
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.uri));
             assert!(!body.is_empty(), "empty body for {}", entry.uri);
         }
     }

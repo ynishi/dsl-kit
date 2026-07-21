@@ -37,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use dsl_kit::{
     AsyncEffectResolver, BreakCondition, BreakpointId, BreakpointSet, DriveOutcome, DslNode,
-    EffectResolver, Engine, IdGen, NodeContext, NodeId, Path, Pending, Phase, StepOutcome,
-    Stepper, SuspendReason, SuspensionId, Walk, drive, drive_async,
+    EffectResolver, Engine, IdGen, NodeContext, NodeId, Path, Pending, Phase, StepOutcome, Stepper,
+    SuspendReason, SuspensionId, Walk, drive, drive_async,
 };
 use dsl_kit_schema::DslSchema;
 use flow_dsl::{
@@ -104,10 +104,11 @@ fn find_call_node(flow: &Flow, target: &str) -> Option<NodeId> {
         if phase != Phase::Pre {
             return;
         }
-        if let Flow::Call { id, label } = node {
-            if label == target && found.is_none() {
-                found = Some(*id);
-            }
+        if let Flow::Call { id, label } = node
+            && label == target
+            && found.is_none()
+        {
+            found = Some(*id);
         }
     });
     found
@@ -138,8 +139,13 @@ fn demonstrate_breakpoints(program: &Flow) {
         set: &BreakpointSet,
         hits: &mut Vec<(NodeId, Vec<BreakpointId>)>,
     ) {
-        let ctx =
-            NodeContext { node: node.node_id(), path: path.clone(), frame: None, depth, iteration: None };
+        let ctx = NodeContext {
+            node: node.node_id(),
+            path: path.clone(),
+            frame: None,
+            depth,
+            iteration: None,
+        };
         let m = set.matches(&ctx);
         if !m.is_empty() {
             hits.push((node.node_id(), m));
@@ -199,9 +205,7 @@ async fn run_flow_async_fanout(
                     .pending()
                     .iter()
                     .filter_map(|p| match &p.reason {
-                        dsl_kit::SuspendReason::Call { spec } => {
-                            Some((p.id, spec.label.clone()))
-                        }
+                        dsl_kit::SuspendReason::Call { spec } => Some((p.id, spec.label.clone())),
                         _ => None,
                     })
                     .collect();
@@ -273,8 +277,14 @@ fn demonstrate_text_round_trip() {
         &flow_syntax_overrides(),
     )
     .expect("overridden Flow schema generates a clean grammar");
-    println!("  {} rules generated with flow_syntax_overrides()", grammar.rules.len());
-    println!("  text: {}", text.lines().map(str::trim).collect::<Vec<_>>().join(" "));
+    println!(
+        "  {} rules generated with flow_syntax_overrides()",
+        grammar.rules.len()
+    );
+    println!(
+        "  text: {}",
+        text.lines().map(str::trim).collect::<Vec<_>>().join(" ")
+    );
 
     let tree = grammar.parse(text).expect("canonical Flow text parses");
     let flow = Flow::from_parse_tree(&tree, &IdGen::new()).expect("typed build");
@@ -293,9 +303,18 @@ fn par_three_searches(ids: &IdGen) -> Flow {
     Flow::Par {
         id: ids.node(),
         children: vec![
-            Flow::Call { id: ids.node(), label: "search_arxiv".into() },
-            Flow::Call { id: ids.node(), label: "search_github".into() },
-            Flow::Call { id: ids.node(), label: "search_web".into() },
+            Flow::Call {
+                id: ids.node(),
+                label: "search_arxiv".into(),
+            },
+            Flow::Call {
+                id: ids.node(),
+                label: "search_github".into(),
+            },
+            Flow::Call {
+                id: ids.node(),
+                label: "search_web".into(),
+            },
         ],
         policy: None,
         reducer_id: None,
@@ -395,7 +414,10 @@ async fn main() -> miette::Result<()> {
     println!("\n=== Async run via drive_async (sequential sans-io driver) ===");
     let mut engine = Engine::new(FlowAst::new(&program), Arc::new(flow_default_registry()))
         .map_err(miette::Report::new)?;
-    let mut resolver = SlowCannedResolver { latency: Duration::from_millis(20), resolved: 0 };
+    let mut resolver = SlowCannedResolver {
+        latency: Duration::from_millis(20),
+        resolved: 0,
+    };
     let seq_start = Instant::now();
     match drive_async(&mut engine, &mut resolver, &BreakpointSet::new())
         .await
@@ -476,8 +498,14 @@ async fn main() -> miette::Result<()> {
     let broken = Flow::Seq {
         id: NodeId(100),
         children: vec![
-            Flow::Call { id: NodeId(101), label: "one".into() },
-            Flow::Call { id: NodeId(101), label: "two".into() },
+            Flow::Call {
+                id: NodeId(101),
+                label: "one".into(),
+            },
+            Flow::Call {
+                id: NodeId(101),
+                label: "two".into(),
+            },
         ],
     };
     if let Err(err) = check_unique_ids(&broken) {

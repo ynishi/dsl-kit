@@ -50,7 +50,9 @@ fn canonical_text_round_trips_to_a_typed_ast_and_evaluates() {
 #[test]
 fn parse_error_carries_expected_set_diagnostic() {
     let grammar = generated_grammar();
-    let err = grammar.parse("Add(lhs: Lit(value: 1) rhs: Lit(value: 2))").unwrap_err();
+    let err = grammar
+        .parse("Add(lhs: Lit(value: 1) rhs: Lit(value: 2))")
+        .unwrap_err();
     assert!(
         !err.diagnostics.is_empty(),
         "missing comma surfaces as a diagnostic"

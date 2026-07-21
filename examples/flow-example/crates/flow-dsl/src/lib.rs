@@ -31,16 +31,14 @@ use std::sync::Arc;
 use dsl_kit::{
     Ast, BreakpointSet, CountingSink, DslNode, Engine, EngineError, EngineResult, ExecError,
     FailPolicy, FrameTree, IdGen, JoinPolicy, JoinShape, NodeContext, NodeId, NodeKind, Path,
-    Phase, Pending, Reducer, ReducerCollectAll, ReducerId, ReducerRegistry, StepOutcome, Stepper,
+    Pending, Phase, Reducer, ReducerCollectAll, ReducerId, ReducerRegistry, StepOutcome, Stepper,
     SuspendReason, SuspensionId, Walk,
 };
 
 // ---------- AST ---------------------------------------------------------
 
 /// AST of the flow DSL.
-#[derive(
-    Debug, dsl_kit_macros::DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild,
-)]
+#[derive(Debug, dsl_kit_macros::DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild)]
 pub enum Flow {
     /// Runs its children in order.
     Seq {
@@ -118,9 +116,27 @@ use dsl_kit_parse::{BuildError, Diagnostic, ParseTree, field_text};
 /// Fixed spellings for `Par`'s `policy` argument, one per supported
 /// [`JoinPolicy`] combination (plus `none` for the default).
 const POLICY_SPELLINGS: &[(&str, JoinPolicy)] = &[
-    ("all_failfast", JoinPolicy { shape: JoinShape::All, fail: FailPolicy::FailFast }),
-    ("all_collect", JoinPolicy { shape: JoinShape::All, fail: FailPolicy::CollectAll }),
-    ("any_failfast", JoinPolicy { shape: JoinShape::Any, fail: FailPolicy::FailFast }),
+    (
+        "all_failfast",
+        JoinPolicy {
+            shape: JoinShape::All,
+            fail: FailPolicy::FailFast,
+        },
+    ),
+    (
+        "all_collect",
+        JoinPolicy {
+            shape: JoinShape::All,
+            fail: FailPolicy::CollectAll,
+        },
+    ),
+    (
+        "any_failfast",
+        JoinPolicy {
+            shape: JoinShape::Any,
+            fail: FailPolicy::FailFast,
+        },
+    ),
 ];
 
 /// [`SyntaxOverrides`] making `Flow::schema()` generatable by
@@ -177,7 +193,11 @@ pub fn parse_policy(tree: &ParseTree, name: &str) -> Result<Option<JoinPolicy>, 
 /// `reducer_id` production in [`flow_syntax_overrides`].
 pub fn parse_reducer_id(tree: &ParseTree, name: &str) -> Result<Option<String>, BuildError> {
     let text = field_text(tree, name)?;
-    Ok(if text == "none" { None } else { Some(text.to_string()) })
+    Ok(if text == "none" {
+        None
+    } else {
+        Some(text.to_string())
+    })
 }
 
 /// Renders a `Flow` as an indented text tree using the derived
@@ -245,22 +265,37 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
     Flow::Seq {
         id: ids.node(),
         children: vec![
-            Flow::Call { id: ids.node(), label: "fetch_query".into() },
+            Flow::Call {
+                id: ids.node(),
+                label: "fetch_query".into(),
+            },
             Flow::Scope {
                 id: ids.node(),
                 label: "web_research".into(),
                 body: Box::new(Flow::Par {
                     id: ids.node(),
                     children: vec![
-                        Flow::Call { id: ids.node(), label: "search_arxiv".into() },
-                        Flow::Call { id: ids.node(), label: "search_github".into() },
-                        Flow::Call { id: ids.node(), label: "search_web".into() },
+                        Flow::Call {
+                            id: ids.node(),
+                            label: "search_arxiv".into(),
+                        },
+                        Flow::Call {
+                            id: ids.node(),
+                            label: "search_github".into(),
+                        },
+                        Flow::Call {
+                            id: ids.node(),
+                            label: "search_web".into(),
+                        },
                     ],
                     policy: None,
                     reducer_id: None,
                 }),
             },
-            Flow::Call { id: ids.node(), label: "synthesise".into() },
+            Flow::Call {
+                id: ids.node(),
+                label: "synthesise".into(),
+            },
             Flow::Maybe {
                 id: ids.node(),
                 body: Some(Box::new(Flow::Call {
@@ -268,7 +303,10 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
                     label: "citation_check".into(),
                 })),
             },
-            Flow::Call { id: ids.node(), label: "write_report".into() },
+            Flow::Call {
+                id: ids.node(),
+                label: "write_report".into(),
+            },
         ],
     }
 }
@@ -339,7 +377,9 @@ impl<'a> Ast for FlowAst<'a> {
                     fail: FailPolicy::FailFast,
                 });
                 let reducer_id = ReducerId::from(
-                    reducer_id.clone().unwrap_or_else(|| "reduce_all_ordered".into()),
+                    reducer_id
+                        .clone()
+                        .unwrap_or_else(|| "reduce_all_ordered".into()),
                 );
                 NodeKind::Par {
                     children: children.iter().map(|c| c.node_id()).collect(),
@@ -456,8 +496,7 @@ impl<'a> FlowStepper<'a> {
         root: &'a Flow,
         registry: Arc<ReducerRegistry<FlowValue, (), FlowEffectErr>>,
     ) -> Self {
-        let engine = Engine::new(FlowAst::new(root), registry)
-            .expect("root Ast validation");
+        let engine = Engine::new(FlowAst::new(root), registry).expect("root Ast validation");
         Self {
             engine,
             results: HashMap::new(),
@@ -475,7 +514,9 @@ impl<'a> FlowStepper<'a> {
         &mut self,
         bps: &BreakpointSet,
     ) -> Result<StepOutcome<FlowValue>, FlowError> {
-        self.engine.step_with_breakpoints(bps).map_err(FlowError::from)
+        self.engine
+            .step_with_breakpoints(bps)
+            .map_err(FlowError::from)
     }
 
     /// Loops [`Self::step_with_breakpoints`] until it returns anything
@@ -559,10 +600,10 @@ impl<'a> Stepper for FlowStepper<'a> {
         // Debugger-view bookkeeping: record the successful text into
         // `results` BEFORE delegating so the engine's Pending → Value
         // transition can consume the value verbatim.
-        if let Ok(v) = &result {
-            if let Some(p) = self.engine.pending().iter().find(|p| p.id == id) {
-                self.results.insert(p.at.node, flow_value_to_text(v));
-            }
+        if let Ok(v) = &result
+            && let Some(p) = self.engine.pending().iter().find(|p| p.id == id)
+        {
+            self.results.insert(p.at.node, flow_value_to_text(v));
         }
         self.engine.resolve(id, result).map_err(FlowError::from)
     }
@@ -575,9 +616,7 @@ impl<'a> Stepper for FlowStepper<'a> {
         self.engine.take_cancellations()
     }
 
-    fn frame_tree(
-        &self,
-    ) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
+    fn frame_tree(&self) -> &FrameTree<Self::Value, Self::Cursor, Self::Delta, Self::EffectError> {
         self.engine.frame_tree()
     }
 
@@ -671,10 +710,10 @@ impl ReducerCollectAll<FlowValue, (), FlowEffectErr> for FlowReduceAnyFirstOrAll
         _deltas: &[Option<()>],
         winners: &[dsl_kit::ChildIndex],
     ) -> Result<(FlowValue, ()), EngineError> {
-        if let Some(&w) = winners.first() {
-            if let Some(Some(Ok(v))) = slots.get(w) {
-                return Ok((v.clone(), ()));
-            }
+        if let Some(&w) = winners.first()
+            && let Some(Some(Ok(v))) = slots.get(w)
+        {
+            return Ok((v.clone(), ()));
         }
         Err(EngineError::Aborted {
             at: NodeContext::at(NodeId(0), Path::root()),
@@ -713,10 +752,7 @@ pub fn flow_default_registry() -> ReducerRegistry<FlowValue, (), FlowEffectErr> 
         "reduce_any_first_winner",
         Arc::new(FlowReduceAnyFirstWinner),
     );
-    reg.register_fail_fast(
-        "reduce_first_k_ordered",
-        Arc::new(FlowReduceFirstKOrdered),
-    );
+    reg.register_fail_fast("reduce_first_k_ordered", Arc::new(FlowReduceFirstKOrdered));
     reg.register_collect_all(
         "reduce_collect_all_results",
         Arc::new(FlowReduceCollectAllResults),
@@ -802,7 +838,10 @@ mod tests {
         let dup = NodeId(101);
         let program = Flow::Seq {
             id: dup,
-            children: vec![Flow::Call { id: dup, label: "x".into() }],
+            children: vec![Flow::Call {
+                id: dup,
+                label: "x".into(),
+            }],
         };
         let err = check_unique_ids(&program).unwrap_err();
         assert!(matches!(err, EngineError::Malformed { .. }));
@@ -827,9 +866,18 @@ mod tests {
         let program = Flow::Par {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "a".into() },
-                Flow::Call { id: ids.node(), label: "b".into() },
-                Flow::Call { id: ids.node(), label: "c".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "a".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "b".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "c".into(),
+                },
             ],
             policy: None,
             reducer_id: None,
@@ -855,9 +903,7 @@ mod tests {
 
         // Next step: Par not yet joined, returns Blocked{empty}.
         let out2 = stepper.step().expect("still waiting");
-        assert!(
-            matches!(out2, StepOutcome::Blocked { newly_pending } if newly_pending.is_empty())
-        );
+        assert!(matches!(out2, StepOutcome::Blocked { newly_pending } if newly_pending.is_empty()));
 
         stepper
             .resolve(sids[0], Ok(FlowValue::Text("a-resp".into())))
@@ -883,9 +929,18 @@ mod tests {
         let program = Flow::Par {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "x".into() },
-                Flow::Call { id: ids.node(), label: "y".into() },
-                Flow::Call { id: ids.node(), label: "z".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "x".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "y".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "z".into(),
+                },
             ],
             policy: None,
             reducer_id: None,
@@ -922,7 +977,11 @@ mod tests {
     fn default_registry_carries_six_reducers() {
         let reg = flow_default_registry();
         // FailFast side.
-        for id in ["reduce_all_ordered", "reduce_any_first_winner", "reduce_first_k_ordered"] {
+        for id in [
+            "reduce_all_ordered",
+            "reduce_any_first_winner",
+            "reduce_first_k_ordered",
+        ] {
             let h = reg
                 .resolve(&ReducerId::from(id), FailPolicy::FailFast)
                 .unwrap_or_else(|_| panic!("missing fail-fast reducer {id}"));
@@ -950,9 +1009,18 @@ mod tests {
         let program = Flow::Par {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "model_a".into() },
-                Flow::Call { id: ids.node(), label: "model_b".into() },
-                Flow::Call { id: ids.node(), label: "model_c".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "model_a".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "model_b".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "model_c".into(),
+                },
             ],
             policy: Some(JoinPolicy {
                 shape: JoinShape::FirstK(2),
@@ -970,7 +1038,10 @@ mod tests {
         stepper
             .resolve(
                 sids[1],
-                Err(FlowEffectErr { code: "timeout".into(), message: "b".into() }),
+                Err(FlowEffectErr {
+                    code: "timeout".into(),
+                    message: "b".into(),
+                }),
             )
             .expect("resolve b failure");
         stepper
@@ -997,8 +1068,14 @@ mod tests {
         let program = Flow::Par {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "x".into() },
-                Flow::Call { id: ids.node(), label: "y".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "x".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "y".into(),
+                },
             ],
             policy: Some(JoinPolicy {
                 shape: JoinShape::Any,
@@ -1014,13 +1091,19 @@ mod tests {
         stepper
             .resolve(
                 sids[0],
-                Err(FlowEffectErr { code: "boom-x".into(), message: "x".into() }),
+                Err(FlowEffectErr {
+                    code: "boom-x".into(),
+                    message: "x".into(),
+                }),
             )
             .expect("resolve x failure");
         stepper
             .resolve(
                 sids[1],
-                Err(FlowEffectErr { code: "boom-y".into(), message: "y".into() }),
+                Err(FlowEffectErr {
+                    code: "boom-y".into(),
+                    message: "y".into(),
+                }),
             )
             .expect("resolve y failure");
 
@@ -1044,15 +1127,27 @@ mod tests {
         let seq_a = Flow::Seq {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "a1".into() },
-                Flow::Call { id: ids.node(), label: "a2".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "a1".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "a2".into(),
+                },
             ],
         };
         let seq_b = Flow::Seq {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "b1".into() },
-                Flow::Call { id: ids.node(), label: "b2".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "b1".into(),
+                },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "b2".into(),
+                },
             ],
         };
         let program = Flow::Par {
@@ -1087,8 +1182,7 @@ mod tests {
         assert!(labels_first.contains(&"a1".to_string()));
         assert!(labels_first.contains(&"b1".to_string()));
 
-        let first_sids: Vec<SuspensionId> =
-            stepper.pending().iter().map(|p| p.id).collect();
+        let first_sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
         for sid in &first_sids {
             stepper
                 .resolve(*sid, Ok(FlowValue::Text("ok".into())))
@@ -1100,7 +1194,11 @@ mod tests {
             }
             let _ = stepper.step().expect("step to second yield");
         }
-        assert_eq!(stepper.pending().len(), 2, "expected 2 concurrent second-wave pending");
+        assert_eq!(
+            stepper.pending().len(),
+            2,
+            "expected 2 concurrent second-wave pending"
+        );
         let labels_second: Vec<String> = stepper
             .pending()
             .iter()
@@ -1112,8 +1210,7 @@ mod tests {
         assert!(labels_second.contains(&"a2".to_string()));
         assert!(labels_second.contains(&"b2".to_string()));
 
-        let second_sids: Vec<SuspensionId> =
-            stepper.pending().iter().map(|p| p.id).collect();
+        let second_sids: Vec<SuspensionId> = stepper.pending().iter().map(|p| p.id).collect();
         for sid in second_sids {
             stepper
                 .resolve(sid, Ok(FlowValue::Text("ok".into())))
@@ -1134,7 +1231,10 @@ mod tests {
         let scope = |label: &str| Flow::Scope {
             id: ids.node(),
             label: label.into(),
-            body: Box::new(Flow::Call { id: ids.node(), label: label.into() }),
+            body: Box::new(Flow::Call {
+                id: ids.node(),
+                label: label.into(),
+            }),
         };
         let program = Flow::Par {
             id: ids.node(),
@@ -1188,7 +1288,10 @@ mod tests {
         let scope = |label: &str| Flow::Scope {
             id: ids.node(),
             label: label.into(),
-            body: Box::new(Flow::Call { id: ids.node(), label: label.into() }),
+            body: Box::new(Flow::Call {
+                id: ids.node(),
+                label: label.into(),
+            }),
         };
         let program = Flow::Par {
             id: ids.node(),
@@ -1233,19 +1336,27 @@ mod tests {
             FlowError::Engine(_) => panic!("expected FlowError::Effect"),
         }
         let cancels = stepper.take_cancellations();
-        assert!(cancels.contains(&alive_sid), "alive sid should be cancelled");
+        assert!(
+            cancels.contains(&alive_sid),
+            "alive sid should be cancelled"
+        );
     }
 
     #[test]
     fn stepper_flow_yields_and_resolves() {
         let ids = IdGen::new();
-        let program = Flow::Call { id: ids.node(), label: "one".into() };
+        let program = Flow::Call {
+            id: ids.node(),
+            label: "one".into(),
+        };
         let mut stepper = FlowStepper::new(&program);
         let out1 = stepper.step().expect("step");
         assert!(matches!(out1, StepOutcome::Blocked { .. }));
         assert_eq!(stepper.pending().len(), 1);
         let sid = stepper.pending()[0].id;
-        stepper.resolve(sid, Ok(FlowValue::Text("resp".into()))).expect("resolve");
+        stepper
+            .resolve(sid, Ok(FlowValue::Text("resp".into())))
+            .expect("resolve");
         for _ in 0..20 {
             if let StepOutcome::Done(FlowValue::Text(s)) = stepper.step().expect("step") {
                 assert_eq!(s, "resp");
@@ -1266,8 +1377,14 @@ mod tests {
         let program = Flow::Seq {
             id: root_id,
             children: vec![
-                Flow::Call { id: first_call_id, label: "one".into() },
-                Flow::Call { id: second_call_id, label: "two".into() },
+                Flow::Call {
+                    id: first_call_id,
+                    label: "one".into(),
+                },
+                Flow::Call {
+                    id: second_call_id,
+                    label: "two".into(),
+                },
             ],
         };
         let mut stepper = FlowStepper::new(&program);
@@ -1292,7 +1409,10 @@ mod tests {
         match out2 {
             StepOutcome::Blocked { newly_pending } => {
                 assert_eq!(newly_pending.len(), 1);
-                assert!(matches!(newly_pending[0].reason, SuspendReason::Call { .. }));
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
                 assert_eq!(newly_pending[0].at.node, first_call_id);
             }
             other => panic!("expected Blocked{{Call}}, got {other:?}"),
@@ -1417,7 +1537,10 @@ mod tests {
         let ids = IdGen::new();
         let program = research_pipeline(&ids);
         let diags = Linter::<Flow>::with_defaults().lint(&program);
-        assert!(diags.is_empty(), "reference program should lint clean, got {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "reference program should lint clean, got {diags:?}"
+        );
     }
 
     #[test]
@@ -1427,9 +1550,14 @@ mod tests {
         let dup = NodeId(101);
         let program = Flow::Seq {
             id: dup,
-            children: vec![Flow::Call { id: dup, label: "x".into() }],
+            children: vec![Flow::Call {
+                id: dup,
+                label: "x".into(),
+            }],
         };
-        let diags = Linter::<Flow>::new().with_rule(UniqueNodeIds).lint(&program);
+        let diags = Linter::<Flow>::new()
+            .with_rule(UniqueNodeIds)
+            .lint(&program);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, "unique-node-ids");
         assert_eq!(diags[0].severity, Severity::Error);
@@ -1449,7 +1577,10 @@ mod tests {
                 label: format!("c{i}"),
             })
             .collect();
-        let program = Flow::Seq { id: root_id, children };
+        let program = Flow::Seq {
+            id: root_id,
+            children,
+        };
 
         let diags = Linter::<Flow>::new()
             .with_rule(MaxFanOut::new(4))
@@ -1470,17 +1601,28 @@ mod tests {
         let program = Flow::Seq {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: good_id, label: "ok".into() },
-                Flow::Call { id: bad_id, label: String::new() },
+                Flow::Call {
+                    id: good_id,
+                    label: "ok".into(),
+                },
+                Flow::Call {
+                    id: bad_id,
+                    label: String::new(),
+                },
                 Flow::Scope {
                     id: ids.node(),
                     label: String::new(),
-                    body: Box::new(Flow::Call { id: ids.node(), label: "inner".into() }),
+                    body: Box::new(Flow::Call {
+                        id: ids.node(),
+                        label: "inner".into(),
+                    }),
                 },
             ],
         };
 
-        let diags = Linter::<Flow>::new().with_rule(NoEmptyLabels).lint(&program);
+        let diags = Linter::<Flow>::new()
+            .with_rule(NoEmptyLabels)
+            .lint(&program);
         // Two empty labels: the Call and the Scope.
         assert_eq!(diags.len(), 2, "diags = {diags:?}");
         assert!(diags.iter().all(|d| d.rule == NoEmptyLabels::NAME));
@@ -1495,7 +1637,10 @@ mod tests {
         let ids = IdGen::new();
         let program = Flow::Seq {
             id: ids.node(),
-            children: vec![Flow::Call { id: ids.node(), label: String::new() }],
+            children: vec![Flow::Call {
+                id: ids.node(),
+                label: String::new(),
+            }],
         };
         let diags = Linter::<Flow>::with_defaults()
             .with_rule(NoEmptyLabels)
@@ -1510,20 +1655,32 @@ mod tests {
     #[test]
     fn variant_name_returns_source_ident_for_every_variant() {
         let ids = IdGen::new();
-        let seq = Flow::Seq { id: ids.node(), children: vec![] };
+        let seq = Flow::Seq {
+            id: ids.node(),
+            children: vec![],
+        };
         let par = Flow::Par {
             id: ids.node(),
             children: vec![],
             policy: None,
             reducer_id: None,
         };
-        let call = Flow::Call { id: ids.node(), label: "x".into() };
+        let call = Flow::Call {
+            id: ids.node(),
+            label: "x".into(),
+        };
         let scope = Flow::Scope {
             id: ids.node(),
             label: "s".into(),
-            body: Box::new(Flow::Call { id: ids.node(), label: "y".into() }),
+            body: Box::new(Flow::Call {
+                id: ids.node(),
+                label: "y".into(),
+            }),
         };
-        let maybe = Flow::Maybe { id: ids.node(), body: None };
+        let maybe = Flow::Maybe {
+            id: ids.node(),
+            body: None,
+        };
 
         assert_eq!(seq.variant_name(), "Seq");
         assert_eq!(par.variant_name(), "Par");
@@ -1544,7 +1701,10 @@ mod tests {
         let program = Flow::Seq {
             id: ids.node(),
             children: vec![
-                Flow::Seq { id: empty_seq_id, children: vec![] },
+                Flow::Seq {
+                    id: empty_seq_id,
+                    children: vec![],
+                },
                 Flow::Par {
                     id: empty_par_id,
                     children: vec![],
@@ -1576,13 +1736,22 @@ mod tests {
         let program = Flow::Seq {
             id: ids.node(),
             children: vec![
-                Flow::Call { id: ids.node(), label: "leaf-call".into() },
+                Flow::Call {
+                    id: ids.node(),
+                    label: "leaf-call".into(),
+                },
                 Flow::Scope {
                     id: ids.node(),
                     label: "scoped".into(),
-                    body: Box::new(Flow::Call { id: ids.node(), label: "inner".into() }),
+                    body: Box::new(Flow::Call {
+                        id: ids.node(),
+                        label: "inner".into(),
+                    }),
                 },
-                Flow::Maybe { id: ids.node(), body: None },
+                Flow::Maybe {
+                    id: ids.node(),
+                    body: None,
+                },
             ],
         };
         let diags = Linter::<Flow>::new()
@@ -1599,15 +1768,19 @@ mod tests {
         let empty_seq_id = ids.node();
         let program = Flow::Seq {
             id: ids.node(),
-            children: vec![Flow::Seq { id: empty_seq_id, children: vec![] }],
+            children: vec![Flow::Seq {
+                id: empty_seq_id,
+                children: vec![],
+            }],
         };
         let diags = Linter::<Flow>::with_defaults().lint(&program);
         // NoEmptyManyChildren fires on the empty inner Seq.
         // NoRedundantWrap (R-24) also fires on the outer Seq (single
         // Seq child of same variant). Both are expected under defaults.
         assert!(
-            diags.iter().any(|d| d.rule == "no-empty-many-children"
-                && d.node == empty_seq_id),
+            diags
+                .iter()
+                .any(|d| d.rule == "no-empty-many-children" && d.node == empty_seq_id),
             "expected no-empty-many-children on empty inner Seq, diags = {diags:?}",
         );
     }
@@ -1625,8 +1798,14 @@ mod tests {
             children: vec![Flow::Seq {
                 id: ids.node(),
                 children: vec![
-                    Flow::Call { id: ids.node(), label: "a".into() },
-                    Flow::Call { id: ids.node(), label: "b".into() },
+                    Flow::Call {
+                        id: ids.node(),
+                        label: "a".into(),
+                    },
+                    Flow::Call {
+                        id: ids.node(),
+                        label: "b".into(),
+                    },
                 ],
             }],
         };
@@ -1654,17 +1833,18 @@ mod tests {
     #[test]
     fn dead_variants_reports_unused_flow_variants() {
         // Program uses only Seq + Call → Par, Scope, Maybe are dead.
-        use dsl_kit_lint::{Linter, DeadVariants, Severity};
+        use dsl_kit_lint::{DeadVariants, Linter, Severity};
 
         let ids = IdGen::new();
         let root_id = ids.node();
         let program = Flow::Seq {
             id: root_id,
-            children: vec![Flow::Call { id: ids.node(), label: "only".into() }],
+            children: vec![Flow::Call {
+                id: ids.node(),
+                label: "only".into(),
+            }],
         };
-        let diags = Linter::<Flow>::new()
-            .with_rule(DeadVariants)
-            .lint(&program);
+        let diags = Linter::<Flow>::new().with_rule(DeadVariants).lint(&program);
         assert_eq!(diags.len(), 3, "diags = {diags:?}");
         assert!(diags.iter().all(|d| d.rule == "dead-variants"));
         assert!(diags.iter().all(|d| d.severity == Severity::Info));
@@ -1672,10 +1852,15 @@ mod tests {
         let dead_names: Vec<&str> = diags
             .iter()
             .map(|d| {
-                if d.message.contains("Par") { "Par" }
-                else if d.message.contains("Scope") { "Scope" }
-                else if d.message.contains("Maybe") { "Maybe" }
-                else { "?" }
+                if d.message.contains("Par") {
+                    "Par"
+                } else if d.message.contains("Scope") {
+                    "Scope"
+                } else if d.message.contains("Maybe") {
+                    "Maybe"
+                } else {
+                    "?"
+                }
             })
             .collect();
         assert!(dead_names.contains(&"Par"));
@@ -1688,7 +1873,10 @@ mod tests {
         use dsl_kit_lint::Linter;
 
         let ids = IdGen::new();
-        let program = Flow::Call { id: ids.node(), label: "only".into() };
+        let program = Flow::Call {
+            id: ids.node(),
+            label: "only".into(),
+        };
         let diags = Linter::<Flow>::with_defaults().lint(&program);
         // Should not include any dead-variants entries even though 4
         // variants are unused; DeadVariants is opt-in only.

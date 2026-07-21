@@ -46,10 +46,7 @@ fn expr_grammar() -> Grammar {
     // multiple times.
     let start_body = rule_ref(&g, "expr");
 
-    let expr_body = choice(
-        &g,
-        vec![rule_ref(&g, "let_expr"), rule_ref(&g, "add_expr")],
-    );
+    let expr_body = choice(&g, vec![rule_ref(&g, "let_expr"), rule_ref(&g, "add_expr")]);
 
     let let_body = node(
         &g,
@@ -116,11 +113,7 @@ fn expr_grammar() -> Grammar {
 
     let paren_body = seq(
         &g,
-        vec![
-            token(&g, "("),
-            rule_ref(&g, "expr"),
-            token(&g, ")"),
-        ],
+        vec![token(&g, "("), rule_ref(&g, "expr"), token(&g, ")")],
     );
 
     Grammar::new(
@@ -220,7 +213,10 @@ fn rejection_reports_farthest_failure_position() {
     let msg = &err.diagnostics[0].message;
     // The farthest we got in a valid alternative: after `3 `, pos 10
     // where "in" is expected. The `%kw:in` token is what we asked for.
-    assert!(msg.contains("%kw:in"), "message did not mention expected keyword: {msg}");
+    assert!(
+        msg.contains("%kw:in"),
+        "message did not mention expected keyword: {msg}"
+    );
 }
 
 #[test]
@@ -231,12 +227,18 @@ fn rejection_at_trailing_junk_is_flagged() {
     // Either the trailing-input check or the farthest-failure branch
     // should call it out; both are correct — assert we got *some* error
     // and the diagnostic points past the last valid consumption.
-    assert_eq!(err.diagnostics[0].code, dsl_kit_parse::peg::codes::UNEXPECTED);
+    assert_eq!(
+        err.diagnostics[0].code,
+        dsl_kit_parse::peg::codes::UNEXPECTED
+    );
 }
 
 #[test]
 fn empty_input_is_rejected_with_start_expected() {
     let g = expr_grammar();
     let err = g.parse("").unwrap_err();
-    assert_eq!(err.diagnostics[0].code, dsl_kit_parse::peg::codes::UNEXPECTED);
+    assert_eq!(
+        err.diagnostics[0].code,
+        dsl_kit_parse::peg::codes::UNEXPECTED
+    );
 }
