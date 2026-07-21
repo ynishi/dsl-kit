@@ -1,0 +1,126 @@
+# dsl-kit
+
+An engine kit for building small, AI-native DSLs in Rust.
+
+Write your AST as a Rust enum and derive the rest: from two or three
+derives, the kit supplies a schema, a text parser, a JSON front-end, a
+typed builder, lints, a debugger-grade interpreter engine, and an MCP
+surface an AI can drive. The Rust type is the single source of truth —
+everything user-facing (grammar, examples, diagnostics, tool schemas)
+is generated from it, so none of it can drift.
+
+```rust
+use dsl_kit::{IdGen, NodeId};
+use dsl_kit_macros::{DslBuild, DslNode, DslSchema};
+
+#[derive(Debug, DslNode, DslSchema, DslBuild)]
+enum Expr {
+    Lit { id: NodeId, value: i64 },
+    Add { id: NodeId, lhs: Box<Expr>, rhs: Box<Expr> },
+    Neg { id: NodeId, body: Option<Box<Expr>> },
+}
+```
+
+That single declaration already gives you:
+
+```rust
+use dsl_kit_parse::{DslBuild as _, schema_gen};
+use dsl_kit_schema::DslSchema as _;
+
+// A grammar for a canonical text syntax, generated from the schema —
+// left-recursion-free by construction and verified by static checks.
+let grammar = schema_gen::checked_grammar_from_schema(&Expr::schema(), &IdGen::new())?;
+
+// Parse canonical text, then build the typed AST back out of it.
+let tree = grammar.parse("Add(lhs: Lit(value: 40), rhs: Lit(value: 2))")?;
+let expr = Expr::from_parse_tree(&tree, &IdGen::new())?;
+
+// Machine-derived examples that parse by construction — few-shot
+// material for an AI writing your DSL.
+let examples = dsl_kit_parse::example_gen::examples_from_grammar(&grammar)?;
+```
+
+A JSON front-end (`{"type": "Add", "lhs": ...}`) targets the same
+`ParseTree`, so both surfaces share one conformance check and one typed
+builder. Payload types the canonical syntax cannot spell get per-field
+hooks on both sides: `schema_gen::SyntaxOverrides` for the grammar,
+`#[dsl_build(with = ...)]` for the builder.
+
+## The engine
+
+`dsl-kit-core` interprets effect-oriented programs — `Seq` / `Par` /
+`Call` / `Scope` / `Maybe` — with the runtime mechanics a real host
+needs:
+
+- **Structured fan-out**: `Par` with join policies (`All` / `Any` /
+  `FirstK`, fail-fast or collect-all) folded by pluggable reducers.
+- **Suspend / resume**: every `Call` yields a suspension the host
+  resolves with `Ok(value)` or `Err(effect_error)`; cancellation is
+  cooperative and observable.
+- **Debugger-grade breakpoints**: every spawn passes through one
+  schedule, so a breakpoint halts *before* the matched frame spawns —
+  at any depth, including mid-`Par`-cascade — and the frame tree
+  faithfully exposes the partially spawned state.
+- **Sans-io drive layer**: `drive` (sync) and `drive_async` (any
+  executor; the core has zero runtime dependencies) run the
+  resolve loop for you when you don't want to hand-roll it.
+
+## MCP: let an AI debug your DSL
+
+`dsl-kit-mcp` wraps any `DslHost` in a stdio MCP server with a
+debugger-style tool surface: `load`, `ast`, `step` (one / to-yield /
+to-done), `breakpoint add/list/remove`, `state`, `pending`, `resolve`,
+`schema`, `lint`, `explain`. The `custom-mcp-example` shows how to ship
+your own DSL as its own MCP server binary.
+
+## Crates
+
+| crate | role |
+|---|---|
+| `dsl-kit` | facade — re-exports the kit surface |
+| `dsl-kit-core` | engine: frames, fan-out, cancellation, events, breakpoints, drive |
+| `dsl-kit-macros` | `#[derive(DslNode)]` / `#[derive(DslSchema)]` / `#[derive(DslBuild)]` |
+| `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients |
+| `dsl-kit-parse` | `ParseTree`, conformance, JSON bridge, PEG interpreter, grammar generation, example synthesis |
+| `dsl-kit-lint` | walk-driven, schema-aware, author-extensible lints |
+| `dsl-kit-mcp` | stdio MCP framework over any `DslHost` |
+
+## Examples
+
+```sh
+cargo run -p expr-example   # expression DSL: text + JSON round trips, schema-generated grammar
+cargo run -p flow-example   # orchestration DSL: fan-out, breakpoints, drive layer, text round trip
+```
+
+The examples double as reference implementations: `flow-dsl` shows the
+per-field hooks on a DSL with exotic payload types, `expr-dsl` shows
+the plain derive-only path end to end.
+
+## Documentation
+
+API documentation is the source of truth and is written to be read:
+
+```sh
+cargo doc --open
+```
+
+## Status
+
+`0.1.0` — the kit is young and the API is still moving. The engine
+semantics (fan-out, cancellation, halt-before-spawn breakpoints) and
+the derive contracts are test-pinned; surface ergonomics may change
+between minor versions.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any
+additional terms or conditions.
