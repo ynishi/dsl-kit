@@ -2,10 +2,10 @@
 //!
 //! ## Design
 //!
-//! One input shape, three derives. Every macro accepts the same enum
+//! One input shape, four derives. Every macro accepts the same enum
 //! form (named-field variants, one `id: NodeId` each), so a DSL opts
-//! into traversal, schema reflection, and parse-tree building by adding
-//! derives — never by restating its shape.
+//! into traversal, schema reflection, parse-tree building, and engine
+//! execution by adding derives — never by restating its shape.
 //!
 //! `#[derive(DslNode)]` accepts an `enum` whose every variant uses named
 //! fields, exactly one of which is called `id` and typed `NodeId`. The
@@ -33,6 +33,16 @@
 //! the orphan rule bars downstream crates from implementing) opt out of
 //! `build_field` with `#[dsl_build(with = path)]` — the named function
 //! converts the field itself. See [`derive_dsl_build`].
+//!
+//! `#[derive(DslExec)]` accepts the same shape and emits an
+//! `impl DslExec` — the mechanical half of an engine `Ast`. Every
+//! variant names its engine `NodeKind` through a `#[dsl_exec(...)]`
+//! annotation (`value` / `read(field)` / `apply = "op"` / `bind(field)`
+//! / `branch` / `repeat` / `seq` / `scope(field)` / `maybe` /
+//! `call(field)`); recursive child fields are picked up in declaration
+//! order. Pair the impl with a `DslSemantics` implementation via
+//! `dsl_kit_core::DerivedAst` to obtain a runnable `Ast`. See
+//! [`derive_dsl_exec`].
 //!
 //! Variants may carry additional fields of unrelated types (payload); those
 //! fields are ignored by the traversal.
@@ -572,6 +582,451 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                         other,
                     ),
                 }
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Per-variant classification parsed from `#[dsl_exec(...)]`.
+enum ExecSpec {
+    /// `#[dsl_exec(value)]` — literal leaf; the single payload field is
+    /// the value.
+    Value,
+    /// `#[dsl_exec(read(FIELD))]` — env read named by `FIELD`.
+    Read { name_field: Ident },
+    /// `#[dsl_exec(apply = "OP")]` — op fold over the recursive fields.
+    Apply { op: String },
+    /// `#[dsl_exec(bind(FIELD))]` — binding named by `FIELD`; the two
+    /// recursive fields are the value and the body, in order.
+    Bind { name_field: Ident },
+    /// `#[dsl_exec(branch)]` — the recursive fields are cond / then /
+    /// optional else, in order.
+    Branch,
+    /// `#[dsl_exec(repeat)]` — loop over the single recursive field.
+    Repeat,
+    /// `#[dsl_exec(seq)]` — sequential children.
+    Seq,
+    /// `#[dsl_exec(scope(FIELD))]` — labelled wrapper around the single
+    /// recursive field.
+    Scope { label_field: Ident },
+    /// `#[dsl_exec(maybe)]` — optional body.
+    Maybe,
+    /// `#[dsl_exec(call(FIELD))]` — effect leaf labelled by `FIELD`.
+    Call { label_field: Ident },
+}
+
+/// Parses the variant's `#[dsl_exec(...)]` annotation. Errors when the
+/// attribute is missing or carries an unknown form.
+fn dsl_exec_attr(variant: &syn::Variant) -> syn::Result<ExecSpec> {
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("dsl_exec") {
+            continue;
+        }
+        let mut spec: Option<ExecSpec> = None;
+        let field_of = |meta: &syn::meta::ParseNestedMeta| -> syn::Result<Ident> {
+            let mut field: Option<Ident> = None;
+            meta.parse_nested_meta(|inner| match inner.path.get_ident() {
+                Some(ident) if field.is_none() => {
+                    field = Some(ident.clone());
+                    Ok(())
+                }
+                _ => Err(inner.error("expected a single field name")),
+            })?;
+            field.ok_or_else(|| meta.error("expected a field name argument"))
+        };
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("value") {
+                spec = Some(ExecSpec::Value);
+            } else if meta.path.is_ident("read") {
+                spec = Some(ExecSpec::Read {
+                    name_field: field_of(&meta)?,
+                });
+            } else if meta.path.is_ident("apply") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                spec = Some(ExecSpec::Apply { op: lit.value() });
+            } else if meta.path.is_ident("bind") {
+                spec = Some(ExecSpec::Bind {
+                    name_field: field_of(&meta)?,
+                });
+            } else if meta.path.is_ident("branch") {
+                spec = Some(ExecSpec::Branch);
+            } else if meta.path.is_ident("repeat") {
+                spec = Some(ExecSpec::Repeat);
+            } else if meta.path.is_ident("seq") {
+                spec = Some(ExecSpec::Seq);
+            } else if meta.path.is_ident("scope") {
+                spec = Some(ExecSpec::Scope {
+                    label_field: field_of(&meta)?,
+                });
+            } else if meta.path.is_ident("maybe") {
+                spec = Some(ExecSpec::Maybe);
+            } else if meta.path.is_ident("call") {
+                spec = Some(ExecSpec::Call {
+                    label_field: field_of(&meta)?,
+                });
+            } else {
+                return Err(meta.error(
+                    "unknown #[dsl_exec(...)] form; expected one of value / read(field) / \
+                     apply = \"op\" / bind(field) / branch / repeat / seq / scope(field) / \
+                     maybe / call(field)",
+                ));
+            }
+            Ok(())
+        })?;
+        return spec
+            .ok_or_else(|| syn::Error::new_spanned(attr, "#[dsl_exec(...)] requires a form"));
+    }
+    Err(syn::Error::new_spanned(
+        variant,
+        "#[derive(DslExec)] requires a #[dsl_exec(...)] annotation on every variant \
+         (or implement Ast by hand for advanced shapes)",
+    ))
+}
+
+/// Emits the NodeId expression for a single-node recursive field
+/// (`T` or `Box<T>`); errors on optional / repeated multiplicity.
+fn single_child_id(
+    field: &(Ident, Recursion),
+    variant: &syn::Variant,
+    role: &str,
+) -> syn::Result<TokenStream2> {
+    let (ident, kind) = field;
+    match kind {
+        Recursion::Direct => Ok(quote! { ::dsl_kit_core::DslNode::node_id(#ident) }),
+        Recursion::Boxed => Ok(quote! { ::dsl_kit_core::DslNode::node_id(&**#ident) }),
+        _ => Err(syn::Error::new_spanned(
+            variant,
+            format!("#[dsl_exec] {role} field `{ident}` must be `Self` or `Box<Self>`"),
+        )),
+    }
+}
+
+/// Derives `dsl_kit_core::DslExec`: the mechanical half of an engine
+/// `Ast`. Every variant carries a `#[dsl_exec(...)]` form naming its
+/// engine `NodeKind`; recursive child fields are picked up in
+/// declaration order exactly like `#[derive(DslNode)]` does. Pair the
+/// generated impl with a `DslSemantics` implementation via
+/// `dsl_kit_core::DerivedAst` to obtain a runnable `Ast`.
+#[proc_macro_derive(DslExec, attributes(dsl_exec))]
+pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(&input, "#[derive(DslExec)] currently supports enums only")
+            .to_compile_error()
+            .into();
+    };
+
+    let mut kind_arms = Vec::new();
+    let mut literal_arms = Vec::new();
+    let mut lit_ty: Option<(String, Type)> = None;
+
+    for variant in &data.variants {
+        let variant_ident = &variant.ident;
+
+        let Fields::Named(fields) = &variant.fields else {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslExec)] requires every variant to use named fields",
+            )
+            .to_compile_error()
+            .into();
+        };
+
+        let spec = match dsl_exec_attr(variant) {
+            Ok(s) => s,
+            Err(e) => return e.to_compile_error().into(),
+        };
+
+        // Recursive fields in declaration order, payload fields besides.
+        let mut recursive: Vec<(Ident, Recursion)> = Vec::new();
+        let mut payload: Vec<(Ident, Type)> = Vec::new();
+        for f in &fields.named {
+            let Some(ident) = &f.ident else { continue };
+            if ident == "id" {
+                continue;
+            }
+            if let Some(kind) = detect_recursion(&f.ty, &name) {
+                recursive.push((ident.clone(), kind));
+            } else {
+                payload.push((ident.clone(), f.ty.clone()));
+            }
+        }
+
+        let err = |msg: String| {
+            syn::Error::new_spanned(variant, msg)
+                .to_compile_error()
+                .into()
+        };
+
+        // `children`-style collection over every recursive field.
+        let collect_children = |recursive: &[(Ident, Recursion)]| {
+            let push_stmts = recursive.iter().map(|(ident, kind)| match kind {
+                Recursion::Direct => quote! {
+                    _children.push(::dsl_kit_core::DslNode::node_id(#ident));
+                },
+                Recursion::Boxed => quote! {
+                    _children.push(::dsl_kit_core::DslNode::node_id(&**#ident));
+                },
+                Recursion::Optional => quote! {
+                    if let ::std::option::Option::Some(inner) = #ident.as_ref() {
+                        _children.push(::dsl_kit_core::DslNode::node_id(inner));
+                    }
+                },
+                Recursion::OptionalBoxed => quote! {
+                    if let ::std::option::Option::Some(inner) = #ident.as_deref() {
+                        _children.push(::dsl_kit_core::DslNode::node_id(inner));
+                    }
+                },
+                Recursion::Many => quote! {
+                    _children.extend(#ident.iter().map(::dsl_kit_core::DslNode::node_id));
+                },
+                Recursion::ManyBoxed => quote! {
+                    _children.extend(
+                        #ident.iter().map(|c| ::dsl_kit_core::DslNode::node_id(c.as_ref())),
+                    );
+                },
+            });
+            quote! {
+                let mut _children: ::std::vec::Vec<::dsl_kit_core::NodeId> =
+                    ::std::vec::Vec::new();
+                #(#push_stmts)*
+            }
+        };
+
+        let binds = recursive.iter().map(|(id, _)| quote!(#id));
+        let binds = quote! { #(#binds,)* };
+
+        match spec {
+            ExecSpec::Value => {
+                if !recursive.is_empty() {
+                    return err("#[dsl_exec(value)] variants must have no child fields".into());
+                }
+                let [(field, ty)] = payload.as_slice() else {
+                    return err(
+                        "#[dsl_exec(value)] variants must have exactly one payload field".into(),
+                    );
+                };
+                let ty_str = ty.to_token_stream().to_string();
+                match &lit_ty {
+                    None => lit_ty = Some((ty_str, ty.clone())),
+                    Some((seen, _)) if *seen == ty_str => {}
+                    Some((seen, _)) => {
+                        return err(format!(
+                            "#[dsl_exec(value)] fields must share one type; \
+                             saw `{seen}` and `{ty_str}`"
+                        ));
+                    }
+                }
+                kind_arms.push(quote! {
+                    Self::#variant_ident { .. } => ::dsl_kit_core::NodeKind::Lit,
+                });
+                literal_arms.push(quote! {
+                    Self::#variant_ident { #field, .. } =>
+                        ::std::option::Option::Some(#field.clone()),
+                });
+            }
+            ExecSpec::Read { name_field } => {
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #name_field, .. } =>
+                        ::dsl_kit_core::NodeKind::Read { name: #name_field.clone() },
+                });
+            }
+            ExecSpec::Apply { op } => {
+                let collect = collect_children(&recursive);
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #binds .. } => {
+                        #collect
+                        ::dsl_kit_core::NodeKind::Apply {
+                            op_id: ::dsl_kit_core::OpId::from(#op),
+                            children: _children,
+                        }
+                    }
+                });
+            }
+            ExecSpec::Bind { name_field } => {
+                let [value, body] = recursive.as_slice() else {
+                    return err(
+                        "#[dsl_exec(bind(..))] variants must have exactly two child fields \
+                         (value, then body)"
+                            .into(),
+                    );
+                };
+                let value_id = match single_child_id(value, variant, "value") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                let body_id = match single_child_id(body, variant, "body") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #name_field, #binds .. } =>
+                        ::dsl_kit_core::NodeKind::Bind {
+                            name: #name_field.clone(),
+                            value: #value_id,
+                            body: #body_id,
+                        },
+                });
+            }
+            ExecSpec::Branch => {
+                if recursive.len() < 2 || recursive.len() > 3 {
+                    return err(
+                        "#[dsl_exec(branch)] variants must have two or three child fields \
+                         (cond, then, optional else)"
+                            .into(),
+                    );
+                }
+                let cond_id = match single_child_id(&recursive[0], variant, "cond") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                let then_id = match single_child_id(&recursive[1], variant, "then") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                let else_expr = match recursive.get(2) {
+                    None => quote! { ::std::option::Option::None },
+                    Some((ident, Recursion::Direct)) => quote! {
+                        ::std::option::Option::Some(::dsl_kit_core::DslNode::node_id(#ident))
+                    },
+                    Some((ident, Recursion::Boxed)) => quote! {
+                        ::std::option::Option::Some(::dsl_kit_core::DslNode::node_id(&**#ident))
+                    },
+                    Some((ident, Recursion::Optional)) => quote! {
+                        #ident.as_ref().map(::dsl_kit_core::DslNode::node_id)
+                    },
+                    Some((ident, Recursion::OptionalBoxed)) => quote! {
+                        #ident.as_deref().map(::dsl_kit_core::DslNode::node_id)
+                    },
+                    Some(_) => {
+                        return err(
+                            "#[dsl_exec(branch)] else field must be a single or optional child"
+                                .into(),
+                        );
+                    }
+                };
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #binds .. } =>
+                        ::dsl_kit_core::NodeKind::Branch {
+                            cond: #cond_id,
+                            then_branch: #then_id,
+                            else_branch: #else_expr,
+                        },
+                });
+            }
+            ExecSpec::Repeat => {
+                let [body] = recursive.as_slice() else {
+                    return err(
+                        "#[dsl_exec(repeat)] variants must have exactly one child field".into(),
+                    );
+                };
+                let body_id = match single_child_id(body, variant, "body") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #binds .. } =>
+                        ::dsl_kit_core::NodeKind::Loop { body: #body_id },
+                });
+            }
+            ExecSpec::Seq => {
+                let collect = collect_children(&recursive);
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #binds .. } => {
+                        #collect
+                        ::dsl_kit_core::NodeKind::Seq { children: _children }
+                    }
+                });
+            }
+            ExecSpec::Scope { label_field } => {
+                let [body] = recursive.as_slice() else {
+                    return err(
+                        "#[dsl_exec(scope(..))] variants must have exactly one child field".into(),
+                    );
+                };
+                let body_id = match single_child_id(body, variant, "body") {
+                    Ok(t) => t,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #label_field, #binds .. } =>
+                        ::dsl_kit_core::NodeKind::Scope {
+                            label: #label_field.clone(),
+                            body: #body_id,
+                        },
+                });
+            }
+            ExecSpec::Maybe => {
+                let [(ident, kind)] = recursive.as_slice() else {
+                    return err(
+                        "#[dsl_exec(maybe)] variants must have exactly one child field".into(),
+                    );
+                };
+                let body_expr = match kind {
+                    Recursion::Optional => quote! {
+                        #ident.as_ref().map(::dsl_kit_core::DslNode::node_id)
+                    },
+                    Recursion::OptionalBoxed => quote! {
+                        #ident.as_deref().map(::dsl_kit_core::DslNode::node_id)
+                    },
+                    _ => {
+                        return err("#[dsl_exec(maybe)] child field must be `Option<Self>` or \
+                             `Option<Box<Self>>`"
+                            .into());
+                    }
+                };
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #binds .. } =>
+                        ::dsl_kit_core::NodeKind::Maybe { body: #body_expr },
+                });
+            }
+            ExecSpec::Call { label_field } => {
+                if !recursive.is_empty() {
+                    return err("#[dsl_exec(call(..))] variants must have no child fields".into());
+                }
+                kind_arms.push(quote! {
+                    Self::#variant_ident { #label_field, .. } =>
+                        ::dsl_kit_core::NodeKind::Call {
+                            label: #label_field.clone(),
+                            payload: ::dsl_kit_core::serde_json::Value::Null,
+                        },
+                });
+            }
+        }
+    }
+
+    let lit_ty_tokens = match &lit_ty {
+        Some((_, ty)) => quote!(#ty),
+        None => quote!(()),
+    };
+    let literal_body = if literal_arms.is_empty() {
+        quote! { ::std::option::Option::None }
+    } else {
+        quote! {
+            match self {
+                #(#literal_arms)*
+                _ => ::std::option::Option::None,
+            }
+        }
+    };
+
+    let expanded: TokenStream2 = quote! {
+        impl #impl_generics ::dsl_kit_core::DslExec for #name #ty_generics #where_clause {
+            type LitValue = #lit_ty_tokens;
+
+            fn exec_kind(&self) -> ::dsl_kit_core::NodeKind {
+                match self {
+                    #(#kind_arms)*
+                }
+            }
+
+            fn exec_literal(&self) -> ::std::option::Option<Self::LitValue> {
+                #literal_body
             }
         }
     };

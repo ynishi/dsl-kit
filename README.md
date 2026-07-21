@@ -2,22 +2,26 @@
 
 An engine kit for building small, AI-native DSLs in Rust.
 
-Write your AST as a Rust enum and derive the rest: from two or three
-derives, the kit supplies a schema, a text parser, a JSON front-end, a
-typed builder, lints, a debugger-grade interpreter engine, and an MCP
-surface an AI can drive. The Rust type is the single source of truth —
-everything user-facing (grammar, examples, diagnostics, tool schemas)
-is generated from it, so none of it can drift.
+Write your AST as a Rust enum and derive the rest: from a few derives,
+the kit supplies a schema, a text parser, a JSON front-end, a typed
+builder, lints, a debugger-grade interpreter that executes the enum
+directly, and an MCP surface an AI can drive. The Rust type is the
+single source of truth — everything user-facing (grammar, examples,
+diagnostics, tool schemas, execution) is generated from it, so none of
+it can drift.
 
 ```rust
 use dsl_kit::{IdGen, NodeId};
-use dsl_kit_macros::{DslBuild, DslNode, DslSchema};
+use dsl_kit_macros::{DslBuild, DslExec, DslNode, DslSchema};
 
-#[derive(Debug, DslNode, DslSchema, DslBuild)]
+#[derive(Debug, DslNode, DslSchema, DslBuild, DslExec)]
 enum Expr {
+    #[dsl_exec(value)]
     Lit { id: NodeId, value: i64 },
+    #[dsl_exec(apply = "add")]
     Add { id: NodeId, lhs: Box<Expr>, rhs: Box<Expr> },
-    Neg { id: NodeId, body: Option<Box<Expr>> },
+    #[dsl_exec(branch)]
+    If { id: NodeId, cond: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
 }
 ```
 
@@ -48,9 +52,10 @@ hooks on both sides: `schema_gen::SyntaxOverrides` for the grammar,
 
 ## The engine
 
-`dsl-kit-core` interprets effect-oriented programs — `Seq` / `Par` /
-`Call` / `Scope` / `Maybe` — with the runtime mechanics a real host
-needs:
+`dsl-kit-core` interprets effect-oriented, value-bearing programs —
+`Seq` / `Par` / `Call` / `Scope` / `Maybe` for orchestration, `Apply` /
+`Branch` / `Bind` / `Read` / `Loop` / `Lit` for computation — with the
+runtime mechanics a real host needs:
 
 - **Structured fan-out**: `Par` with join policies (`All` / `Any` /
   `FirstK`, fail-fast or collect-all) folded by pluggable reducers.
@@ -64,6 +69,15 @@ needs:
 - **Sans-io drive layer**: `drive` (sync) and `drive_async` (any
   executor; the core has zero runtime dependencies) run the
   resolve loop for you when you don't want to hand-roll it.
+- **Value semantics, interpreted**: `Apply` folds evaluated children
+  through a registered op, `Branch` selects on a value (the untaken
+  side never spawns), `Bind` / `Read` carry a lexical env chain,
+  `Loop` respawns its body per iteration — all inside the same frame
+  machinery, so breakpoints halt on branch selection and on every
+  loop iteration, and an unbound `Read` suspends like any other
+  effect. You register what `"add"` *means*; the engine does the
+  rest. No hand-written eval loop — `expr-example` runs entirely on
+  the engine.
 
 ## MCP: let an AI debug your DSL
 
@@ -79,7 +93,7 @@ your own DSL as its own MCP server binary.
 |---|---|
 | `dsl-kit` | facade — re-exports the kit surface |
 | `dsl-kit-core` | engine: frames, fan-out, cancellation, events, breakpoints, drive |
-| `dsl-kit-macros` | `#[derive(DslNode)]` / `#[derive(DslSchema)]` / `#[derive(DslBuild)]` |
+| `dsl-kit-macros` | `#[derive(DslNode)]` / `#[derive(DslSchema)]` / `#[derive(DslBuild)]` / `#[derive(DslExec)]` |
 | `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients |
 | `dsl-kit-parse` | `ParseTree`, conformance, JSON bridge, PEG interpreter, grammar generation, example synthesis |
 | `dsl-kit-lint` | walk-driven, schema-aware, author-extensible lints |
@@ -89,7 +103,7 @@ your own DSL as its own MCP server binary.
 
 ```sh
 cargo run -p expr-example   # expression DSL: text + JSON round trips, schema-generated grammar
-cargo run -p flow-example   # orchestration DSL: fan-out, breakpoints, drive layer, text round trip
+cargo run -p flow-example   # orchestration DSL: fan-out, value-gated Branch, breakpoints, drive layer, text round trip
 ```
 
 The examples double as reference implementations: `flow-dsl` shows the

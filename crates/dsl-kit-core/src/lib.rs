@@ -25,6 +25,11 @@
 
 #![warn(missing_docs)]
 
+// Re-exported for `#[derive(DslExec)]`-generated code (`Call` payload
+// construction); not part of the public API surface.
+#[doc(hidden)]
+pub use serde_json;
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
@@ -34,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod drive;
 mod engine;
 pub use drive::{AsyncEffectResolver, DriveOutcome, EffectResolver, drive, drive_async};
-pub use engine::{Ast, Engine, ExecError, NodeKind};
+pub use engine::{Ast, Engine, ExecError, LoopDecision, NodeKind};
 
 // ---------- Observation primitives --------------------------------------
 
@@ -535,6 +540,20 @@ pub enum EngineError {
         /// The unknown reducer id.
         id: ReducerId,
     },
+
+    /// An `Apply` node referenced an [`OpId`] that is not registered in
+    /// the active [`OpRegistry`].
+    #[error("unknown op {id:?}")]
+    #[diagnostic(
+        code(dsl_kit::op::unknown),
+        help(
+            "The Apply node's op_id was not found in the OpRegistry. Register the op at Stepper build time (Engine::new_with_ops) or fix the AST to reference a known id."
+        )
+    )]
+    UnknownOp {
+        /// The unknown op id.
+        id: OpId,
+    },
 }
 
 /// Result alias for engine and evaluator operations.
@@ -580,6 +599,9 @@ pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
         },
         EngineError::UnknownReducer {
             id: ReducerId(String::new()),
+        },
+        EngineError::UnknownOp {
+            id: OpId(String::new()),
         },
     ];
 
@@ -949,6 +971,229 @@ impl<V, D, EE> ReducerRegistry<V, D, EE> {
                 .map(ReducerHandle::CollectAll)
                 .ok_or_else(|| EngineError::UnknownReducer { id: id.clone() }),
         }
+    }
+}
+
+// ---------- Op trait + registry -----------------------------------------
+
+/// Serialisable name for a registered op.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpId(pub String);
+
+impl fmt::Display for OpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for OpId {
+    fn from(s: &str) -> Self {
+        OpId(s.to_string())
+    }
+}
+
+impl From<String> for OpId {
+    fn from(s: String) -> Self {
+        OpId(s)
+    }
+}
+
+/// A pure value fold applied by an `Apply` node once every child
+/// argument has produced a value.
+///
+/// Ops never suspend: effects belong in `Call` children, whose values
+/// arrive here as ordinary `args` entries. Domain failures (division by
+/// zero, type mismatch on a dynamic value) are reported as
+/// [`EngineError::EvalFailed`] with the node context supplied by the
+/// engine at the call site.
+pub trait Op<V>: Send + Sync {
+    /// Fold the evaluated child values into the node's value.
+    ///
+    /// `args` holds one entry per `Apply` child, in declaration order.
+    /// Zero-child `Apply` nodes invoke the op with an empty slice.
+    fn apply(&self, node: NodeId, args: &[V]) -> Result<V, EngineError>;
+}
+
+/// Runtime handle for the resolved op of an `Apply` frame.
+pub type OpHandle<V> = Arc<dyn Op<V>>;
+
+/// Runtime lookup table for [`Op`]s, the `Apply` counterpart of
+/// [`ReducerRegistry`].
+///
+/// Constructed by the host at Stepper build time; a DSL typically ships
+/// a helper that registers its standard ops under canonical ids
+/// (`"add"`, `"mul"`, ...). Passed to [`Engine::new_with_ops`]; DSLs
+/// with no `Apply` nodes can stay on [`Engine::new`], which uses an
+/// empty registry.
+///
+/// [`Engine::new`]: crate::Engine::new
+/// [`Engine::new_with_ops`]: crate::Engine::new_with_ops
+pub struct OpRegistry<V> {
+    ops: HashMap<OpId, OpHandle<V>>,
+}
+
+impl<V> Default for OpRegistry<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> OpRegistry<V> {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self {
+            ops: HashMap::new(),
+        }
+    }
+
+    /// Registers an op under `id`.
+    pub fn register(&mut self, id: impl Into<OpId>, op: OpHandle<V>) {
+        self.ops.insert(id.into(), op);
+    }
+
+    /// Resolves the op for an `Apply` frame at spawn / validation time.
+    /// Returns [`EngineError::UnknownOp`] on miss.
+    pub fn resolve(&self, id: &OpId) -> Result<OpHandle<V>, EngineError> {
+        self.ops
+            .get(id)
+            .cloned()
+            .ok_or_else(|| EngineError::UnknownOp { id: id.clone() })
+    }
+}
+
+// ---------- Derived execution (DslExec / DslSemantics / DerivedAst) ----
+
+/// Mechanical node classification, normally supplied by
+/// `#[derive(DslExec)]` from `dsl-kit-macros`.
+///
+/// This is the derivable half of an [`Ast`]: which engine [`NodeKind`]
+/// each variant maps to, and the payload of `value`-marked literal
+/// variants. The semantic half (value type, truthiness, bindings)
+/// lives in [`DslSemantics`]; [`DerivedAst`] zips the two into an
+/// engine-ready [`Ast`].
+pub trait DslExec: Walk {
+    /// Payload type of `#[dsl_exec(value)]` variants. `()` when the
+    /// enum has no value variants.
+    type LitValue: Clone + fmt::Debug;
+
+    /// Engine classification of this node.
+    fn exec_kind(&self) -> NodeKind;
+
+    /// Payload of a value variant; `None` for every other variant.
+    fn exec_literal(&self) -> Option<Self::LitValue>;
+}
+
+/// The semantic half an author writes next to `#[derive(DslExec)]`:
+/// the runtime value type and the hooks whose meaning the kit cannot
+/// derive. Every hook mirrors its [`Ast`] counterpart and keeps the
+/// same default, so a DSL only implements what its node kinds use.
+pub trait DslSemantics {
+    /// Runtime value type produced by the DSL.
+    type Value: Clone + fmt::Debug;
+    /// Per-child state delta accumulated across a `Par` and extended
+    /// by `Bind`.
+    type Delta: Clone + Default + fmt::Debug;
+    /// Effect-side failure the host reports through `resolve`.
+    type EffectError: std::error::Error + Clone + Send + Sync + 'static;
+    /// Per-frame cursor surfaced through the projected frame tree.
+    type Cursor: Clone + fmt::Debug + Default;
+
+    /// See [`Ast::unit_value`].
+    fn unit_value(&self) -> Self::Value;
+
+    /// See [`Ast::truthy`].
+    fn truthy(&self, _value: &Self::Value) -> Option<bool> {
+        None
+    }
+
+    /// See [`Ast::continue_loop`].
+    fn continue_loop(&self, _node: NodeId, _last: &Self::Value, _iteration: usize) -> LoopDecision {
+        LoopDecision::Break
+    }
+
+    /// See [`Ast::bind_delta`].
+    fn bind_delta(&self, _name: &str, _value: &Self::Value) -> Option<Self::Delta> {
+        None
+    }
+
+    /// See [`Ast::lookup`].
+    fn lookup(&self, _delta: &Self::Delta, _name: &str) -> Option<Self::Value> {
+        None
+    }
+}
+
+/// Engine-ready [`Ast`] assembled from a `#[derive(DslExec)]` node
+/// type plus a [`DslSemantics`] implementation.
+///
+/// Construction walks the tree once to build the `NodeId -> node`
+/// lookup; `node_kind` / `literal` then delegate to the derived
+/// classification and every semantic hook to `S`.
+pub struct DerivedAst<'a, N, S> {
+    root: &'a N,
+    by_id: HashMap<NodeId, &'a N>,
+    sem: S,
+}
+
+impl<'a, N: DslExec, S> DerivedAst<'a, N, S> {
+    /// Builds the lookup for `root` and attaches the semantics.
+    pub fn new(root: &'a N, sem: S) -> Self {
+        fn collect<'a, N: Walk>(node: &'a N, map: &mut HashMap<NodeId, &'a N>) {
+            map.insert(node.node_id(), node);
+            for child in node.children() {
+                collect(child, map);
+            }
+        }
+        let mut by_id = HashMap::new();
+        collect(root, &mut by_id);
+        Self { root, by_id, sem }
+    }
+
+    fn node(&self, id: NodeId) -> &'a N {
+        self.by_id.get(&id).copied().expect("unknown NodeId")
+    }
+}
+
+impl<N, S> Ast for DerivedAst<'_, N, S>
+where
+    N: DslExec,
+    S: DslSemantics,
+    S::Value: From<N::LitValue>,
+{
+    type Value = S::Value;
+    type Delta = S::Delta;
+    type EffectError = S::EffectError;
+    type Cursor = S::Cursor;
+
+    fn root(&self) -> NodeId {
+        self.root.node_id()
+    }
+
+    fn node_kind(&self, id: NodeId) -> NodeKind {
+        self.node(id).exec_kind()
+    }
+
+    fn unit_value(&self) -> Self::Value {
+        self.sem.unit_value()
+    }
+
+    fn truthy(&self, value: &Self::Value) -> Option<bool> {
+        self.sem.truthy(value)
+    }
+
+    fn continue_loop(&self, node: NodeId, last: &Self::Value, iteration: usize) -> LoopDecision {
+        self.sem.continue_loop(node, last, iteration)
+    }
+
+    fn bind_delta(&self, name: &str, value: &Self::Value) -> Option<Self::Delta> {
+        self.sem.bind_delta(name, value)
+    }
+
+    fn lookup(&self, delta: &Self::Delta, name: &str) -> Option<Self::Value> {
+        self.sem.lookup(delta, name)
+    }
+
+    fn literal(&self, node: NodeId) -> Option<Self::Value> {
+        self.node(node).exec_literal().map(S::Value::from)
     }
 }
 

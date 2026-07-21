@@ -398,8 +398,8 @@ mod tests {
             serde_json::from_str(&text).expect("schema_json must be valid JSON");
         assert_eq!(value["name"], "Flow");
         let variants = value["variants"].as_array().expect("variants array");
-        // Flow has 5 variants: Seq / Par / Call / Scope / Maybe.
-        assert_eq!(variants.len(), 5);
+        // Flow has 6 variants: Seq / Par / Call / Scope / Maybe / Branch.
+        assert_eq!(variants.len(), 6);
         // Spot-check: Maybe's body child is Optional.
         let maybe = variants
             .iter()

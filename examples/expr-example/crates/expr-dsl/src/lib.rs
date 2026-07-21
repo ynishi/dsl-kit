@@ -1,27 +1,40 @@
 //! A tiny arithmetic expression DSL.
 //!
 //! `Expr` is a second reference DSL for `dsl-kit`: it exercises the
-//! kit's traversal, breakpoint, and MCP host contracts against a shape
-//! very different from `flow-dsl`. Where `Flow` models an orchestration
-//! graph with `AwaitEffect` suspensions on `Call` nodes, `Expr` models
-//! a pure evaluator whose only reason to yield is an unbound variable:
-//! the host is asked to supply its value, and evaluation continues.
+//! kit's value-bearing node kinds (`Lit` / `Read` / `Apply` / `Bind` /
+//! `Branch`) against a shape very different from `flow-dsl`. Where
+//! `Flow` models an orchestration graph suspending on `Call` nodes,
+//! `Expr` is an arithmetic language whose only reason to yield is an
+//! unbound variable — which the engine surfaces as an ordinary
+//! Call-shaped suspension the host answers through `resolve`.
 //!
-//! This crate carries the AST + the pure evaluator; the `DslHost`
-//! adapter lives in the sibling `expr-host` crate, and the MCP binary
-//! in `expr-mcp`.
+//! This crate carries the AST + its [`Ast`] adapter (the engine does
+//! the evaluating); the `DslHost` adapter lives in the sibling
+//! `expr-host` crate, and the MCP binary in `expr-mcp`.
 
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
-use dsl_kit::{DslNode, EngineError, IdGen, NodeContext, NodeId, Path, Phase, Walk};
+use dsl_kit::{
+    DerivedAst, DslNode, DslSemantics, Engine, EngineError, ExecError, IdGen, NodeContext, NodeId,
+    Op, OpRegistry, Path, Phase, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
+    SuspensionId, Walk,
+};
 
 /// AST of the arithmetic DSL.
-#[derive(Debug, DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild)]
+///
+/// The `#[dsl_exec(...)]` annotations are the whole evaluation story:
+/// `DslExec` derives the engine classification of every variant, and
+/// [`ExprSemantics`] supplies the handful of judgments the kit cannot
+/// derive (what "unit" is, what counts as true, how bindings store).
+#[derive(
+    Debug, DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild, dsl_kit_macros::DslExec,
+)]
 pub enum Expr {
     /// Integer literal.
+    #[dsl_exec(value)]
     Lit {
         /// Stable node id.
         id: NodeId,
@@ -29,6 +42,7 @@ pub enum Expr {
         value: i64,
     },
     /// Variable reference. Suspends the host when unbound.
+    #[dsl_exec(read(name))]
     Var {
         /// Stable node id.
         id: NodeId,
@@ -36,6 +50,7 @@ pub enum Expr {
         name: String,
     },
     /// Addition.
+    #[dsl_exec(apply = "add")]
     Add {
         /// Stable node id.
         id: NodeId,
@@ -45,6 +60,7 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     /// Multiplication.
+    #[dsl_exec(apply = "mul")]
     Mul {
         /// Stable node id.
         id: NodeId,
@@ -54,6 +70,7 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     /// Let-binding: evaluates `value`, binds it as `name` in `body`.
+    #[dsl_exec(bind(name))]
     Let {
         /// Stable node id.
         id: NodeId,
@@ -65,6 +82,7 @@ pub enum Expr {
         body: Box<Expr>,
     },
     /// Conditional: non-zero `cond` picks `then_branch`, else `else_branch`.
+    #[dsl_exec(branch)]
     If {
         /// Stable node id.
         id: NodeId,
@@ -144,72 +162,104 @@ pub fn count_nodes(expr: &Expr) -> usize {
     count
 }
 
-/// A binding stack; `Let` shadows outer bindings for `Var` lookups.
-pub type Env = Vec<(String, i64)>;
+/// Env delta introduced by one `Let`: a single binding level.
+pub type Binding = Vec<(String, i64)>;
 
-fn lookup(env: &Env, name: &str) -> Option<i64> {
-    env.iter().rev().find(|(n, _)| n == name).map(|(_, v)| *v)
-}
-
-/// Error surfaced when evaluation hits a variable that neither the
-/// program's `Let` bindings nor the host's `resolved` map has a value
-/// for.
+/// Effect-side error for `Expr` — what a host reports when it answers
+/// an unbound-variable suspension with `Err(_)`.
 #[derive(Debug, Clone)]
-pub struct UnboundVar {
-    /// Node id of the unbound `Var`.
-    pub node: NodeId,
-    /// Name that failed to resolve.
-    pub name: String,
+pub struct ExprEffectError {
+    /// Human-readable description supplied by the host.
+    pub message: String,
 }
 
-/// Pure evaluator over `Expr`.
-///
-/// External bindings (typically supplied by the host through `resolve`)
-/// are consulted after the syntactic `Let` stack.
-pub fn eval(
-    expr: &Expr,
-    env: &mut Env,
-    resolved: &HashMap<String, i64>,
-) -> Result<i64, UnboundVar> {
-    match expr {
-        Expr::Lit { value, .. } => Ok(*value),
-        Expr::Var { id, name } => {
-            if let Some(v) = lookup(env, name) {
-                return Ok(v);
-            }
-            if let Some(v) = resolved.get(name) {
-                return Ok(*v);
-            }
-            Err(UnboundVar {
-                node: *id,
-                name: name.clone(),
-            })
-        }
-        Expr::Add { lhs, rhs, .. } => Ok(eval(lhs, env, resolved)? + eval(rhs, env, resolved)?),
-        Expr::Mul { lhs, rhs, .. } => Ok(eval(lhs, env, resolved)? * eval(rhs, env, resolved)?),
-        Expr::Let {
-            name, value, body, ..
-        } => {
-            let v = eval(value, env, resolved)?;
-            env.push((name.clone(), v));
-            let result = eval(body, env, resolved);
-            env.pop();
-            result
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            let c = eval(cond, env, resolved)?;
-            if c != 0 {
-                eval(then_branch, env, resolved)
-            } else {
-                eval(else_branch, env, resolved)
-            }
+impl std::fmt::Display for ExprEffectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExprEffectError {}
+
+/// The semantic half of the DSL — the judgments `#[derive(DslExec)]`
+/// cannot make for you: what "unit" is, what counts as true, and how
+/// `Let` bindings store and resolve. Everything mechanical (variant →
+/// `NodeKind`, node lookup, literal extraction) is derived.
+pub struct ExprSemantics;
+
+impl DslSemantics for ExprSemantics {
+    type Value = i64;
+    type Delta = Binding;
+    type EffectError = ExprEffectError;
+    type Cursor = ();
+
+    fn unit_value(&self) -> i64 {
+        0
+    }
+
+    fn truthy(&self, value: &i64) -> Option<bool> {
+        Some(*value != 0)
+    }
+
+    fn bind_delta(&self, name: &str, value: &i64) -> Option<Binding> {
+        Some(vec![(name.to_string(), *value)])
+    }
+
+    fn lookup(&self, delta: &Binding, name: &str) -> Option<i64> {
+        delta.iter().rev().find(|(n, _)| n == name).map(|(_, v)| *v)
+    }
+}
+
+/// Engine-ready [`Ast`] over `Expr`: derived classification zipped
+/// with [`ExprSemantics`].
+pub type ExprAst<'a> = DerivedAst<'a, Expr, ExprSemantics>;
+
+/// A binary arithmetic op with strict arity.
+struct BinOp {
+    name: &'static str,
+    f: fn(i64, i64) -> i64,
+}
+
+impl Op<i64> for BinOp {
+    fn apply(&self, node: NodeId, args: &[i64]) -> Result<i64, EngineError> {
+        match args {
+            [lhs, rhs] => Ok((self.f)(*lhs, *rhs)),
+            _ => Err(EngineError::EvalFailed {
+                at: NodeContext::at(node, Path::root().push(node)),
+                source: format!("op {:?} expects 2 args, got {}", self.name, args.len()).into(),
+            }),
         }
     }
+}
+
+/// The op table for the arithmetic surface — the only place the DSL
+/// author states what `Add` and `Mul` *mean*.
+pub fn expr_ops() -> Arc<OpRegistry<i64>> {
+    let mut ops: OpRegistry<i64> = OpRegistry::new();
+    ops.register(
+        "add",
+        Arc::new(BinOp {
+            name: "add",
+            f: |a, b| a.wrapping_add(b),
+        }),
+    );
+    ops.register(
+        "mul",
+        Arc::new(BinOp {
+            name: "mul",
+            f: |a, b| a.wrapping_mul(b),
+        }),
+    );
+    Arc::new(ops)
+}
+
+/// Builds a fresh engine over `expr` with the standard op table.
+pub fn expr_engine(expr: &Expr) -> Result<Engine<ExprAst<'_>>, EngineError> {
+    Engine::new_with_ops(
+        DerivedAst::new(expr, ExprSemantics),
+        Arc::new(ReducerRegistry::new()),
+        expr_ops(),
+    )
 }
 
 /// Builds the demo program:
@@ -254,31 +304,65 @@ pub fn demo_program(ids: &IdGen) -> Expr {
     }
 }
 
-/// Runs the evaluator to completion using an explicit resolver.
+/// Runs `expr` to completion on the engine, supplying unbound
+/// variables through `resolver`.
 ///
 /// Returns `EngineError::Malformed` when an unbound variable is not
-/// covered by the resolver — this is the "pure eval" mode used by the
-/// example binary's synchronous demo.
+/// covered by the resolver — this is the "plain run" mode used by the
+/// example binary's synchronous demo. The whole reduction (dispatch,
+/// bindings, branching) happens inside the engine; this function only
+/// answers the suspensions the engine yields.
 pub fn evaluate_all<F>(expr: &Expr, mut resolver: F) -> Result<i64, EngineError>
 where
     F: FnMut(&str) -> Option<i64>,
 {
-    let mut resolved: HashMap<String, i64> = HashMap::new();
-    let mut env: Env = Vec::new();
+    let mut engine = expr_engine(expr)?;
     loop {
-        match eval(expr, &mut env, &resolved) {
-            Ok(v) => return Ok(v),
-            Err(UnboundVar { node, name }) => match resolver(&name) {
-                Some(v) => {
-                    resolved.insert(name, v);
-                }
-                None => {
+        match engine.step() {
+            Ok(StepOutcome::Done(v)) => return Ok(v),
+            Ok(StepOutcome::Ready) => continue,
+            Ok(StepOutcome::Blocked { .. }) => {
+                let outstanding: Vec<(SuspensionId, NodeId, String)> = engine
+                    .pending()
+                    .iter()
+                    .filter_map(|p| match &p.reason {
+                        SuspendReason::Call { spec } => Some((p.id, p.at.node, spec.label.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if outstanding.is_empty() {
                     return Err(EngineError::Malformed {
-                        at: NodeContext::at(node, Path::root().push(node)),
-                        detail: format!("unbound variable {name:?}"),
+                        at: NodeContext::at(expr.node_id(), Path::root().push(expr.node_id())),
+                        detail: "engine blocked without a resolvable suspension".into(),
                     });
                 }
-            },
+                for (sid, node, name) in outstanding {
+                    match resolver(&name) {
+                        Some(v) => {
+                            engine.resolve(sid, Ok(v)).map_err(|e| match e {
+                                ExecError::Engine(e) => e,
+                                ExecError::Effect(e) => EngineError::EvalFailed {
+                                    at: NodeContext::at(node, Path::root().push(node)),
+                                    source: Box::new(e),
+                                },
+                            })?;
+                        }
+                        None => {
+                            return Err(EngineError::Malformed {
+                                at: NodeContext::at(node, Path::root().push(node)),
+                                detail: format!("unbound variable {name:?}"),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(ExecError::Engine(e)) => return Err(e),
+            Err(ExecError::Effect(e)) => {
+                return Err(EngineError::EvalFailed {
+                    at: NodeContext::at(expr.node_id(), Path::root().push(expr.node_id())),
+                    source: Box::new(e),
+                });
+            }
         }
     }
 }

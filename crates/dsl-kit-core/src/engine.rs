@@ -45,9 +45,9 @@ use smallvec::SmallVec;
 
 use crate::{
     BreakpointSet, CallFrameId, CancelReason, ChildIndex, CountingSink, EngineError, EnvRef, Event,
-    EventSink, FailPolicy, Frame, FrameTree, JoinPolicy, JoinShape, NodeContext, NodeId, ParFrame,
-    Path, Pending, ReducerHandle, ReducerId, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
-    SuspensionId,
+    EventSink, FailPolicy, Frame, FrameTree, JoinPolicy, JoinShape, NodeContext, NodeId, OpHandle,
+    OpId, OpRegistry, ParFrame, Path, Pending, ReducerHandle, ReducerId, ReducerRegistry,
+    StepOutcome, Stepper, SuspendReason, SuspensionId,
 };
 
 /// Composite error returned by the [`Engine`] via [`Stepper::Error`].
@@ -120,17 +120,88 @@ pub trait Ast {
     fn node_kind(&self, id: NodeId) -> NodeKind;
 
     /// Value produced by an empty control-flow branch — an empty `Seq`,
-    /// a `Maybe(None)`, or a `Scope` whose body evaluates to nothing.
+    /// a `Maybe(None)`, a `Branch` whose condition is false with no
+    /// `else_branch`, or a `Scope` whose body evaluates to nothing.
     /// The engine also uses this to fill a non-Call `Par` child's slot
     /// when the child's subtree drains without an explicit value.
     fn unit_value(&self) -> Self::Value;
+
+    /// Interpret a value as a `Branch` condition.
+    ///
+    /// Called once per `Branch` after its condition subtree completes.
+    /// Return `Some(true)` / `Some(false)` to select the branch, or
+    /// `None` when the value has no boolean interpretation — the engine
+    /// surfaces `None` as [`EngineError::EvalFailed`] at the `Branch`
+    /// node. The default implementation returns `None`, so DSLs without
+    /// `Branch` nodes need not implement this.
+    fn truthy(&self, _value: &Self::Value) -> Option<bool> {
+        None
+    }
+
+    /// Decide whether a `Loop` runs another iteration.
+    ///
+    /// Called once per completed `Loop` body with the body's value and
+    /// the just-finished iteration index (0-based). `Continue` respawns
+    /// the body with fresh frames; `Break` completes the `Loop` with
+    /// `last`. Termination is the DSL's responsibility — the engine
+    /// imposes no iteration ceiling. The default implementation breaks
+    /// immediately, so DSLs without `Loop` nodes need not implement
+    /// this.
+    fn continue_loop(&self, _node: NodeId, _last: &Self::Value, _iteration: usize) -> LoopDecision {
+        LoopDecision::Break
+    }
+
+    /// Create the environment delta a `Bind` introduces.
+    ///
+    /// Called once per `Bind` after its value subtree completes; the
+    /// returned delta becomes the head of the env chain the body sees.
+    /// Return `None` when the DSL does not support bindings — the
+    /// engine surfaces that as [`EngineError::EvalFailed`] at the
+    /// `Bind` node. The default implementation returns `None`.
+    fn bind_delta(&self, _name: &str, _value: &Self::Value) -> Option<Self::Delta> {
+        None
+    }
+
+    /// Look `name` up in one level of the env chain.
+    ///
+    /// Called by `Read` at spawn, innermost delta first. Return
+    /// `Some(value)` on a hit; `None` falls through to the next level.
+    /// When every level misses, the `Read` suspends as a Call-shaped
+    /// [`Pending`] labelled with the name — the host supplies the value
+    /// through the ordinary `resolve` path. The default implementation
+    /// returns `None`, so DSLs without `Read` nodes need not implement
+    /// this (and a `Read` under the default always asks the host).
+    fn lookup(&self, _delta: &Self::Delta, _name: &str) -> Option<Self::Value> {
+        None
+    }
+
+    /// Supply the value of a `Lit` node.
+    ///
+    /// Called once when a `Lit` leaf spawns. Returning `None` for a
+    /// node classified as `Lit` is a contract violation and surfaces
+    /// as [`EngineError::Malformed`]. The default implementation
+    /// returns `None`, so DSLs without `Lit` nodes need not implement
+    /// this.
+    fn literal(&self, _node: NodeId) -> Option<Self::Value> {
+        None
+    }
+}
+
+/// Verdict returned by [`Ast::continue_loop`] after each `Loop`
+/// iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopDecision {
+    /// Run another iteration: the body respawns with fresh frames.
+    Continue,
+    /// Stop: the `Loop` completes with the last body value.
+    Break,
 }
 
 /// A node's structural classification.
 ///
-/// The engine handles all five kinds natively. `Call` is the only leaf
-/// that yields a [`Pending`]; the other four are control-flow shapes
-/// whose progress is derived from their children's values.
+/// The engine handles every kind natively. `Call` is the only leaf
+/// that yields a [`Pending`]; the other kinds are control-flow / value
+/// shapes whose progress is derived from their children's values.
 #[derive(Debug, Clone)]
 pub enum NodeKind {
     /// Evaluate children left-to-right, propagating the last value.
@@ -160,6 +231,69 @@ pub enum NodeKind {
         /// The inner body when present.
         body: Option<NodeId>,
     },
+    /// Evaluate children left-to-right, then fold their values via an
+    /// op looked up in the [`OpRegistry`] at spawn.
+    ///
+    /// Children are arbitrary subtrees: a `Call` (or a whole `Par`
+    /// cascade) anywhere below contributes its resolved value as an
+    /// ordinary argument, so effects compose into value positions. The
+    /// op itself is pure and never suspends. A zero-child `Apply`
+    /// invokes the op with no arguments (constant ops).
+    Apply {
+        /// Op identifier looked up in the [`OpRegistry`] at `Apply`
+        /// entry (and validated eagerly at engine construction).
+        op_id: OpId,
+        /// Argument nodes, in declaration order.
+        children: Vec<NodeId>,
+    },
+    /// Evaluate `cond`, ask [`Ast::truthy`] which side to take, and
+    /// spawn **only** the selected branch — the untaken side never
+    /// enters the arena (and a breakpoint on it never fires).
+    ///
+    /// With `else_branch` absent and a false condition, the `Branch`
+    /// completes with [`Ast::unit_value`].
+    Branch {
+        /// Condition subtree, evaluated first (may suspend).
+        cond: NodeId,
+        /// Subtree taken when the condition is truthy.
+        then_branch: NodeId,
+        /// Subtree taken when the condition is falsy, if any.
+        else_branch: Option<NodeId>,
+    },
+    /// Evaluate `value` in the current env, extend the env chain with
+    /// the delta [`Ast::bind_delta`] creates for `name`, and evaluate
+    /// `body` under the extended chain. The binding is lexical: it is
+    /// visible to `body`'s whole subtree and nowhere else.
+    Bind {
+        /// Binding name, passed verbatim to [`Ast::bind_delta`] and
+        /// matched by `Read` nodes below `body`.
+        name: String,
+        /// Subtree producing the bound value (may suspend).
+        value: NodeId,
+        /// Subtree evaluated under the extended env.
+        body: NodeId,
+    },
+    /// Look `name` up in the env chain via [`Ast::lookup`], innermost
+    /// delta first. A miss at every level suspends as a Call-shaped
+    /// [`Pending`] labelled `name` (payload `{"kind": "read"}`), so the
+    /// host supplies unbound values through the ordinary `resolve`
+    /// path — free variables are effects.
+    Read {
+        /// Name to resolve against the env chain.
+        name: String,
+    },
+    /// A literal leaf whose value the DSL supplies through
+    /// [`Ast::literal`]. Completes immediately with that value.
+    Lit,
+    /// Evaluate `body`, then ask [`Ast::continue_loop`] whether to run
+    /// it again. Every iteration respawns the body as fresh frames
+    /// through the single spawn schedule, so a breakpoint on the body
+    /// halts before **each** iteration's spawn and the frame tree shows
+    /// the current iteration only.
+    Loop {
+        /// Body subtree, respawned once per iteration.
+        body: NodeId,
+    },
     /// A leaf that suspends the interpretation until the host resolves
     /// the matching [`SuspensionId`].
     Call {
@@ -187,10 +321,13 @@ struct FrameHandle(usize);
 /// pushed in reverse preserves the original recursive DFS pre-order,
 /// while giving the breakpoint peek a uniform halt point before *any*
 /// spawn — `Par` kids, `Scope` / `Maybe` bodies, and the root itself.
-struct SpawnEntry {
+struct SpawnEntry<A: Ast> {
     node: NodeId,
     path: Path,
     parent: SpawnParent,
+    /// Env chain the frame evaluates under (lexical inheritance:
+    /// `Bind` pushes an extended chain for its body entry).
+    env: EnvRef<A::Delta>,
 }
 
 /// Where a popped [`SpawnEntry`] wires its freshly-allocated frame.
@@ -204,6 +341,16 @@ enum SpawnParent {
     ScopeBody(FrameHandle),
     /// Fill the parent `Maybe`'s `body` slot.
     MaybeBody(FrameHandle),
+    /// Fill the parent `Branch`'s `cond` slot.
+    BranchCond(FrameHandle),
+    /// Fill the parent `Branch`'s `body` slot (the selected side).
+    BranchBody(FrameHandle),
+    /// Fill the parent `Loop`'s `body` slot (one iteration).
+    LoopBody(FrameHandle),
+    /// Fill the parent `Bind`'s `value` slot.
+    BindValue(FrameHandle),
+    /// Fill the parent `Bind`'s `body` slot.
+    BindBody(FrameHandle),
 }
 
 /// A single node in the engine's arena. Each variant corresponds to one
@@ -216,6 +363,7 @@ enum InternalFrame<A: Ast> {
     Seq {
         node: NodeId,
         path: Path,
+        env: EnvRef<A::Delta>,
         children: Vec<NodeId>,
         next_child: usize,
         current: Option<FrameHandle>,
@@ -253,6 +401,69 @@ enum InternalFrame<A: Ast> {
         body: Option<FrameHandle>,
         body_value: Option<A::Value>,
     },
+    /// A `Loop` node in progress. `body` holds the current iteration's
+    /// frame (`None` while its spawn is queued); `iteration` counts
+    /// completed spawns, 0-based.
+    Loop {
+        node: NodeId,
+        path: Path,
+        env: EnvRef<A::Delta>,
+        body_id: NodeId,
+        body: Option<FrameHandle>,
+        iteration: usize,
+    },
+    /// A `Bind` node in progress. `value` evaluates under the inherited
+    /// `env`; once bound, `body` evaluates under the extended chain.
+    Bind {
+        node: NodeId,
+        path: Path,
+        name: String,
+        body_id: NodeId,
+        env: EnvRef<A::Delta>,
+        value: Option<FrameHandle>,
+        bound: bool,
+        body: Option<FrameHandle>,
+    },
+    /// A `Read` whose name resolved against the env chain at spawn.
+    /// (A miss spawns a `Pending` leaf instead.) Promoted to `Value`
+    /// by the next advance pass so `Par` slot notification runs on the
+    /// ordinary path.
+    Read {
+        node: NodeId,
+        path: Path,
+        value: A::Value,
+    },
+    /// A `Branch` node in progress. `cond` runs first; once it produces
+    /// a value, [`Ast::truthy`] decides which side to schedule (the
+    /// untaken side never spawns). `decided` guards the window between
+    /// scheduling the selected side on the spawn stack and its frame
+    /// landing in `body`.
+    Branch {
+        node: NodeId,
+        path: Path,
+        env: EnvRef<A::Delta>,
+        then_branch: NodeId,
+        else_branch: Option<NodeId>,
+        cond: Option<FrameHandle>,
+        decided: bool,
+        body: Option<FrameHandle>,
+    },
+    /// An `Apply` node in progress. Children evaluate sequentially
+    /// (the Seq machinery pattern); each completed child's value is
+    /// consumed into `args`. When `next_child` runs past `children`,
+    /// the op folds `args` and the frame promotes to `Value`.
+    Apply {
+        node: NodeId,
+        path: Path,
+        env: EnvRef<A::Delta>,
+        #[allow(dead_code)]
+        op_id: OpId,
+        op: OpHandle<A::Value>,
+        children: Vec<NodeId>,
+        next_child: usize,
+        current: Option<FrameHandle>,
+        args: Vec<A::Value>,
+    },
     /// A `Call` leaf awaiting a `resolve` from the host.
     Pending {
         node: NodeId,
@@ -286,6 +497,11 @@ impl<A: Ast> InternalFrame<A> {
             | InternalFrame::Par { node, .. }
             | InternalFrame::Scope { node, .. }
             | InternalFrame::Maybe { node, .. }
+            | InternalFrame::Branch { node, .. }
+            | InternalFrame::Loop { node, .. }
+            | InternalFrame::Bind { node, .. }
+            | InternalFrame::Read { node, .. }
+            | InternalFrame::Apply { node, .. }
             | InternalFrame::Pending { node, .. }
             | InternalFrame::Value { node, .. }
             | InternalFrame::Failed { node, .. }
@@ -316,6 +532,7 @@ type FrameTreeCache<A> = std::sync::OnceLock<
 pub struct Engine<A: Ast> {
     ast: A,
     registry: Arc<ReducerRegistry<A::Value, A::Delta, A::EffectError>>,
+    ops: Arc<OpRegistry<A::Value>>,
 
     frames: Vec<Option<InternalFrame<A>>>,
     /// Root frame handle. `None` until the first `step` pops the root's
@@ -330,7 +547,7 @@ pub struct Engine<A: Ast> {
     /// except while halted on a breakpoint, where the remaining spawns
     /// stay queued and the frame tree faithfully shows the partially
     /// spawned state.
-    spawn_stack: Vec<SpawnEntry>,
+    spawn_stack: Vec<SpawnEntry<A>>,
 
     pending: Vec<Pending>,
     /// Pending created since the last `step()` return. Drained per
@@ -392,12 +609,30 @@ impl<A: Ast> Engine<A> {
         ast: A,
         registry: Arc<ReducerRegistry<A::Value, A::Delta, A::EffectError>>,
     ) -> Result<Self, EngineError> {
-        Self::validate_ast(&ast, &registry)?;
+        Self::new_with_ops(ast, registry, Arc::new(OpRegistry::new()))
+    }
+
+    /// Same as [`Engine::new`], with an [`OpRegistry`] for DSLs whose
+    /// AST contains `Apply` nodes. Op ids are resolved eagerly during
+    /// the construction-time validation walk, so an unknown op anywhere
+    /// in the tree fails here (as [`EngineError::UnknownOp`]) rather
+    /// than at the step that would have spawned it.
+    pub fn new_with_ops(
+        ast: A,
+        registry: Arc<ReducerRegistry<A::Value, A::Delta, A::EffectError>>,
+        ops: Arc<OpRegistry<A::Value>>,
+    ) -> Result<Self, EngineError> {
+        Self::validate_ast(&ast, &registry, &ops)?;
         let root_id = ast.root();
         let root_path = Path::root().push(root_id);
+        let root_env = EnvRef(Arc::new(crate::Env {
+            delta: A::Delta::default(),
+            parent: None,
+        }));
         Ok(Self {
             ast,
             registry,
+            ops,
             frames: Vec::new(),
             root: None,
             parent: HashMap::new(),
@@ -405,6 +640,7 @@ impl<A: Ast> Engine<A> {
                 node: root_id,
                 path: root_path,
                 parent: SpawnParent::Root,
+                env: root_env,
             }],
             pending: Vec::new(),
             newly_pending: Vec::new(),
@@ -428,6 +664,7 @@ impl<A: Ast> Engine<A> {
     fn validate_ast(
         ast: &A,
         registry: &ReducerRegistry<A::Value, A::Delta, A::EffectError>,
+        ops: &OpRegistry<A::Value>,
     ) -> Result<(), EngineError> {
         let mut stack = vec![ast.root()];
         let mut seen = std::collections::HashSet::new();
@@ -452,6 +689,28 @@ impl<A: Ast> Engine<A> {
                         stack.push(b);
                     }
                 }
+                NodeKind::Apply { op_id, children } => {
+                    ops.resolve(&op_id)?;
+                    stack.extend(children);
+                }
+                NodeKind::Branch {
+                    cond,
+                    then_branch,
+                    else_branch,
+                } => {
+                    stack.push(cond);
+                    stack.push(then_branch);
+                    if let Some(e) = else_branch {
+                        stack.push(e);
+                    }
+                }
+                NodeKind::Loop { body } => stack.push(body),
+                NodeKind::Bind { value, body, .. } => {
+                    stack.push(value);
+                    stack.push(body);
+                }
+                NodeKind::Read { .. } => {}
+                NodeKind::Lit => {}
                 NodeKind::Call { .. } => {}
             }
         }
@@ -760,10 +1019,49 @@ impl<A: Ast> Engine<A> {
                     })
                 }
             }
+            InternalFrame::Apply {
+                current,
+                children,
+                next_child,
+                path,
+                ..
+            } => {
+                if let Some(c) = current {
+                    match self.get(*c) {
+                        InternalFrame::Value { .. } => {
+                            // Apply about to advance — peek at next arg.
+                            children.get(*next_child).map(|next_id| {
+                                let child_path = path.push(*next_id);
+                                Self::synthetic_ctx(*next_id, child_path)
+                            })
+                        }
+                        InternalFrame::Cancelled { .. } | InternalFrame::Failed { .. } => None,
+                        _ => self.peek_at(*c),
+                    }
+                } else {
+                    children.get(*next_child).map(|next_id| {
+                        let child_path = path.push(*next_id);
+                        Self::synthetic_ctx(*next_id, child_path)
+                    })
+                }
+            }
             InternalFrame::Par { children, .. } => children.iter().find_map(|c| self.peek_at(*c)),
             InternalFrame::Scope { body: Some(b), .. } => self.peek_at(*b),
             InternalFrame::Maybe { body: Some(b), .. } => self.peek_at(*b),
+            InternalFrame::Branch { cond, body, .. } => {
+                // Cond / selected-side spawns ride the spawn stack (the
+                // caller checks that first); here only descend into
+                // whichever side is live.
+                cond.or(*body).and_then(|f| self.peek_at(f))
+            }
+            InternalFrame::Loop { body, .. } => body.and_then(|b| self.peek_at(b)),
+            InternalFrame::Bind { value, body, .. } => {
+                // Value / body spawns ride the spawn stack; descend into
+                // whichever side is live.
+                value.or(*body).and_then(|f| self.peek_at(f))
+            }
             InternalFrame::Pending { .. }
+            | InternalFrame::Read { .. }
             | InternalFrame::Value { .. }
             | InternalFrame::Failed { .. }
             | InternalFrame::Cancelled { .. }
@@ -808,8 +1106,8 @@ impl<A: Ast> Engine<A> {
     /// Pop one entry off the spawn stack, spawn its frame, and wire it
     /// to its parent slot. One call per `step_once` pass — this is the
     /// uniform halt granularity the breakpoint peek rides on.
-    fn drain_spawn(&mut self, entry: SpawnEntry) -> Result<(), EngineError> {
-        let h = self.spawn_one(entry.node, entry.path)?;
+    fn drain_spawn(&mut self, entry: SpawnEntry<A>) -> Result<(), EngineError> {
+        let h = self.spawn_one(entry.node, entry.path, entry.env)?;
         match entry.parent {
             SpawnParent::Root => {
                 self.root = Some(h);
@@ -832,6 +1130,36 @@ impl<A: Ast> Engine<A> {
                     *body = Some(h);
                 }
             }
+            SpawnParent::BranchCond(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Branch { cond, .. } = self.get_mut(p) {
+                    *cond = Some(h);
+                }
+            }
+            SpawnParent::BranchBody(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Branch { body, .. } = self.get_mut(p) {
+                    *body = Some(h);
+                }
+            }
+            SpawnParent::LoopBody(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Loop { body, .. } = self.get_mut(p) {
+                    *body = Some(h);
+                }
+            }
+            SpawnParent::BindValue(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Bind { value, .. } = self.get_mut(p) {
+                    *value = Some(h);
+                }
+            }
+            SpawnParent::BindBody(p) => {
+                self.set_parent(h, p);
+                if let InternalFrame::Bind { body, .. } = self.get_mut(p) {
+                    *body = Some(h);
+                }
+            }
         }
         Ok(())
     }
@@ -840,7 +1168,12 @@ impl<A: Ast> Engine<A> {
     /// cascade: their children / bodies are pushed onto the spawn stack
     /// (in reverse, preserving DFS pre-order across pops) and enter the
     /// arena on subsequent passes. Validates `Par` shape.
-    fn spawn_one(&mut self, node_id: NodeId, path: Path) -> Result<FrameHandle, EngineError> {
+    fn spawn_one(
+        &mut self,
+        node_id: NodeId,
+        path: Path,
+        env: EnvRef<A::Delta>,
+    ) -> Result<FrameHandle, EngineError> {
         self.emit_event(&Event::VisitPre {
             at: Self::synthetic_ctx(node_id, path.clone()),
         });
@@ -849,6 +1182,7 @@ impl<A: Ast> Engine<A> {
                 let frame = InternalFrame::Seq {
                     node: node_id,
                     path,
+                    env,
                     children,
                     next_child: 0,
                     current: None,
@@ -885,6 +1219,7 @@ impl<A: Ast> Engine<A> {
                         node: child_id,
                         path: path.push(child_id),
                         parent: SpawnParent::ParChild(par_handle),
+                        env: env.clone(),
                     });
                 }
                 Ok(par_handle)
@@ -901,6 +1236,7 @@ impl<A: Ast> Engine<A> {
                     node: body,
                     path: path.push(body),
                     parent: SpawnParent::ScopeBody(scope_handle),
+                    env,
                 });
                 Ok(scope_handle)
             }
@@ -916,6 +1252,7 @@ impl<A: Ast> Engine<A> {
                         node: body_id,
                         path: path.push(body_id),
                         parent: SpawnParent::MaybeBody(maybe_handle),
+                        env,
                     });
                     Ok(maybe_handle)
                 }
@@ -930,46 +1267,173 @@ impl<A: Ast> Engine<A> {
                     Ok(maybe_handle)
                 }
             },
-            NodeKind::Call { label, payload: _ } => {
-                let sid = SuspensionId(self.next_sid);
-                self.next_sid += 1;
-                let call_frame = CallFrameId(self.next_call_frame);
-                self.next_call_frame += 1;
-                let ctx = NodeContext {
+            NodeKind::Loop { body } => {
+                let loop_handle = self.allocate(InternalFrame::Loop {
                     node: node_id,
                     path: path.clone(),
-                    frame: Some(call_frame),
-                    depth: path.depth() as u32,
-                    iteration: None,
-                };
-                let spec = crate::CallSpec {
-                    label: label.clone(),
-                    payload: serde_json::Value::Null,
-                };
-                self.emit_event(&Event::FrameEnter { at: ctx.clone() });
-                self.emit_event(&Event::Suspend {
-                    at: ctx.clone(),
-                    reason: SuspendReason::Call { spec: spec.clone() },
+                    env: env.clone(),
+                    body_id: body,
+                    body: None,
+                    iteration: 0,
                 });
-                let pending = Pending {
-                    id: sid,
-                    reason: SuspendReason::Call { spec },
-                    at: ctx,
-                };
-                self.pending.push(pending.clone());
-                self.newly_pending.push(pending);
-                let frame = InternalFrame::Pending {
+                self.spawn_stack.push(SpawnEntry {
+                    node: body,
+                    path: path.push(body),
+                    parent: SpawnParent::LoopBody(loop_handle),
+                    env,
+                });
+                Ok(loop_handle)
+            }
+            NodeKind::Branch {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let branch_handle = self.allocate(InternalFrame::Branch {
+                    node: node_id,
+                    path: path.clone(),
+                    env: env.clone(),
+                    then_branch,
+                    else_branch,
+                    cond: None,
+                    decided: false,
+                    body: None,
+                });
+                self.spawn_stack.push(SpawnEntry {
+                    node: cond,
+                    path: path.push(cond),
+                    parent: SpawnParent::BranchCond(branch_handle),
+                    env,
+                });
+                Ok(branch_handle)
+            }
+            NodeKind::Bind { name, value, body } => {
+                let bind_handle = self.allocate(InternalFrame::Bind {
+                    node: node_id,
+                    path: path.clone(),
+                    name,
+                    body_id: body,
+                    env: env.clone(),
+                    value: None,
+                    bound: false,
+                    body: None,
+                });
+                // The value subtree evaluates under the *inherited*
+                // chain; the body spawns later, under the extended one.
+                self.spawn_stack.push(SpawnEntry {
+                    node: value,
+                    path: path.push(value),
+                    parent: SpawnParent::BindValue(bind_handle),
+                    env,
+                });
+                Ok(bind_handle)
+            }
+            NodeKind::Read { name } => {
+                // Walk the env chain, innermost delta first.
+                let mut level = Some(env.0.clone());
+                while let Some(e) = level {
+                    if let Some(v) = self.ast.lookup(&e.delta, &name) {
+                        let frame = InternalFrame::Read {
+                            node: node_id,
+                            path,
+                            value: v,
+                        };
+                        return Ok(self.allocate(frame));
+                    }
+                    level = e.parent.clone();
+                }
+                // Unbound: suspend as a Call-shaped pending labelled
+                // with the name — free variables are effects the host
+                // answers through the ordinary resolve path.
+                Ok(self.spawn_pending_leaf(
+                    node_id,
+                    path,
+                    name,
+                    serde_json::json!({ "kind": "read" }),
+                ))
+            }
+            NodeKind::Lit => match self.ast.literal(node_id) {
+                Some(v) => Ok(self.allocate(InternalFrame::Read {
                     node: node_id,
                     path,
-                    sid,
-                    label,
-                    frame: call_frame,
+                    value: v,
+                })),
+                None => Err(EngineError::Malformed {
+                    at: NodeContext::at(node_id, path),
+                    detail: "node classified as Lit but Ast::literal returned None".into(),
+                }),
+            },
+            NodeKind::Apply { op_id, children } => {
+                // Mirrors Seq: children spawn lazily one at a time via
+                // `try_apply_next`, so the breakpoint peek sees each
+                // argument spawn. The op resolves here so a registry
+                // drift after validation still fails loudly.
+                let op = self.ops.resolve(&op_id)?;
+                let frame = InternalFrame::Apply {
+                    node: node_id,
+                    path,
+                    env,
+                    op_id,
+                    op,
+                    children,
+                    next_child: 0,
+                    current: None,
+                    args: Vec::new(),
                 };
-                let h = self.allocate(frame);
-                self.sid_to_frame.insert(sid, h);
-                Ok(h)
+                Ok(self.allocate(frame))
+            }
+            NodeKind::Call { label, payload: _ } => {
+                Ok(self.spawn_pending_leaf(node_id, path, label, serde_json::Value::Null))
             }
         }
+    }
+
+    /// Allocate a suspended leaf: a Call-shaped [`Pending`] plus its
+    /// arena frame. Shared by `Call` nodes and unbound `Read`s.
+    fn spawn_pending_leaf(
+        &mut self,
+        node_id: NodeId,
+        path: Path,
+        label: String,
+        payload: serde_json::Value,
+    ) -> FrameHandle {
+        let sid = SuspensionId(self.next_sid);
+        self.next_sid += 1;
+        let call_frame = CallFrameId(self.next_call_frame);
+        self.next_call_frame += 1;
+        let ctx = NodeContext {
+            node: node_id,
+            path: path.clone(),
+            frame: Some(call_frame),
+            depth: path.depth() as u32,
+            iteration: None,
+        };
+        let spec = crate::CallSpec {
+            label: label.clone(),
+            payload,
+        };
+        self.emit_event(&Event::FrameEnter { at: ctx.clone() });
+        self.emit_event(&Event::Suspend {
+            at: ctx.clone(),
+            reason: SuspendReason::Call { spec: spec.clone() },
+        });
+        let pending = Pending {
+            id: sid,
+            reason: SuspendReason::Call { spec },
+            at: ctx,
+        };
+        self.pending.push(pending.clone());
+        self.newly_pending.push(pending);
+        let frame = InternalFrame::Pending {
+            node: node_id,
+            path,
+            sid,
+            label,
+            frame: call_frame,
+        };
+        let h = self.allocate(frame);
+        self.sid_to_frame.insert(sid, h);
+        h
     }
 
     fn validate_par(
@@ -1062,6 +1526,11 @@ impl<A: Ast> Engine<A> {
             | InternalFrame::Failed { .. }
             | InternalFrame::Pending { .. } => Ok(false),
             InternalFrame::Seq { .. } => self.advance_seq(h),
+            InternalFrame::Apply { .. } => self.advance_apply(h),
+            InternalFrame::Branch { .. } => self.advance_branch(h),
+            InternalFrame::Loop { .. } => self.advance_loop(h),
+            InternalFrame::Bind { .. } => self.advance_bind(h),
+            InternalFrame::Read { .. } => self.promote_read(h),
             InternalFrame::Par { children, .. } => {
                 let children = children.clone();
                 for c in children {
@@ -1125,18 +1594,26 @@ impl<A: Ast> Engine<A> {
     /// If there is a next child, spawn it. Otherwise promote the Seq to
     /// a Value (last child's value, or unit).
     fn try_seq_next(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
-        let (node, path, next_child, children_len, next_id) = {
+        let (node, path, env, next_child, children_len, next_id) = {
             let f = self.get(h);
             if let InternalFrame::Seq {
                 node,
                 path,
+                env,
                 children,
                 next_child,
                 ..
             } = f
             {
                 let id = children.get(*next_child).copied();
-                (*node, path.clone(), *next_child, children.len(), id)
+                (
+                    *node,
+                    path.clone(),
+                    env.clone(),
+                    *next_child,
+                    children.len(),
+                    id,
+                )
             } else {
                 unreachable!()
             }
@@ -1148,7 +1625,7 @@ impl<A: Ast> Engine<A> {
             self.emit_event(&Event::IterationTick {
                 at: Self::synthetic_ctx(node, path.clone()),
             });
-            let child = self.spawn_one(next_id, child_path)?;
+            let child = self.spawn_one(next_id, child_path, env)?;
             self.set_parent(child, h);
             if let InternalFrame::Seq {
                 current,
@@ -1182,6 +1659,379 @@ impl<A: Ast> Engine<A> {
             });
             self.notify_par_slot(h, value);
             let _ = (next_child, children_len);
+            Ok(true)
+        }
+    }
+
+    /// Promote a resolved `Read` leaf to a Value (ordinary promotion
+    /// path, so `Par` slot notification runs).
+    fn promote_read(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        let (node, path, value) = if let InternalFrame::Read { node, path, value } = self.get(h) {
+            (*node, path.clone(), value.clone())
+        } else {
+            unreachable!()
+        };
+        *self.get_mut(h) = InternalFrame::Value {
+            node,
+            value: value.clone(),
+        };
+        self.emit_event(&Event::VisitPost {
+            at: Self::synthetic_ctx(node, path),
+        });
+        self.notify_par_slot(h, value);
+        Ok(true)
+    }
+
+    fn advance_bind(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        let (node, path, name, body_id, env, value, bound, body) = if let InternalFrame::Bind {
+            node,
+            path,
+            name,
+            body_id,
+            env,
+            value,
+            bound,
+            body,
+        } = self.get(h)
+        {
+            (
+                *node,
+                path.clone(),
+                name.clone(),
+                *body_id,
+                env.clone(),
+                *value,
+                *bound,
+                *body,
+            )
+        } else {
+            unreachable!()
+        };
+
+        if !bound {
+            let Some(v) = value else {
+                // Value spawn still queued on the spawn stack.
+                return Ok(false);
+            };
+            if self.advance_completed(v)? {
+                return Ok(true);
+            }
+            if let InternalFrame::Value { value: val, .. } = self.get(v) {
+                let val = val.clone();
+                let delta =
+                    self.ast
+                        .bind_delta(&name, &val)
+                        .ok_or_else(|| EngineError::EvalFailed {
+                            at: NodeContext::at(node, path.clone()),
+                            source: Box::new(std::io::Error::other(
+                                "Bind is unsupported by this DSL (Ast::bind_delta returned None)",
+                            )),
+                        })?;
+                self.vacate(v);
+                if let InternalFrame::Bind { value, bound, .. } = self.get_mut(h) {
+                    *value = None;
+                    *bound = true;
+                }
+                // Body evaluates under the extended chain.
+                let extended = EnvRef(Arc::new(crate::Env {
+                    delta,
+                    parent: Some(env.0.clone()),
+                }));
+                self.spawn_stack.push(SpawnEntry {
+                    node: body_id,
+                    path: path.push(body_id),
+                    parent: SpawnParent::BindBody(h),
+                    env: extended,
+                });
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        // Bound: wait for the body, then forward its value.
+        let Some(b) = body else {
+            return Ok(false);
+        };
+        if self.advance_completed(b)? {
+            return Ok(true);
+        }
+        if let InternalFrame::Value { value: val, .. } = self.get(b) {
+            let val = val.clone();
+            self.vacate(b);
+            *self.get_mut(h) = InternalFrame::Value {
+                node,
+                value: val.clone(),
+            };
+            self.emit_event(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
+            self.notify_par_slot(h, val);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn advance_loop(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        let (node, path, env, body_id, body, iteration) = if let InternalFrame::Loop {
+            node,
+            path,
+            env,
+            body_id,
+            body,
+            iteration,
+        } = self.get(h)
+        {
+            (
+                *node,
+                path.clone(),
+                env.clone(),
+                *body_id,
+                *body,
+                *iteration,
+            )
+        } else {
+            unreachable!()
+        };
+        let Some(b) = body else {
+            // Body spawn still queued on the spawn stack.
+            return Ok(false);
+        };
+        if self.advance_completed(b)? {
+            return Ok(true);
+        }
+        if let InternalFrame::Value { value, .. } = self.get(b) {
+            let value = value.clone();
+            self.vacate(b);
+            match self.ast.continue_loop(node, &value, iteration) {
+                LoopDecision::Continue => {
+                    // Respawn the body as fresh frames through the
+                    // spawn stack, so the breakpoint peek precedes
+                    // every iteration.
+                    self.emit_event(&Event::IterationTick {
+                        at: Self::synthetic_ctx(node, path.clone()),
+                    });
+                    if let InternalFrame::Loop {
+                        body, iteration, ..
+                    } = self.get_mut(h)
+                    {
+                        *body = None;
+                        *iteration += 1;
+                    }
+                    self.spawn_stack.push(SpawnEntry {
+                        node: body_id,
+                        path: path.push(body_id),
+                        parent: SpawnParent::LoopBody(h),
+                        env,
+                    });
+                }
+                LoopDecision::Break => {
+                    *self.get_mut(h) = InternalFrame::Value {
+                        node,
+                        value: value.clone(),
+                    };
+                    self.emit_event(&Event::VisitPost {
+                        at: Self::synthetic_ctx(node, path),
+                    });
+                    self.notify_par_slot(h, value);
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn advance_branch(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        let (node, path, env, cond, decided, body, then_branch, else_branch) =
+            if let InternalFrame::Branch {
+                node,
+                path,
+                env,
+                cond,
+                decided,
+                body,
+                then_branch,
+                else_branch,
+            } = self.get(h)
+            {
+                (
+                    *node,
+                    path.clone(),
+                    env.clone(),
+                    *cond,
+                    *decided,
+                    *body,
+                    *then_branch,
+                    *else_branch,
+                )
+            } else {
+                unreachable!()
+            };
+
+        if !decided {
+            let Some(c) = cond else {
+                // Cond spawn still queued on the spawn stack.
+                return Ok(false);
+            };
+            if self.advance_completed(c)? {
+                return Ok(true);
+            }
+            // Condition produced a value — decide which side to take.
+            if let InternalFrame::Value { value, .. } = self.get(c) {
+                let take_then = self
+                    .ast
+                    .truthy(value)
+                    .ok_or_else(|| EngineError::EvalFailed {
+                        at: NodeContext::at(node, path.clone()),
+                        source: Box::new(std::io::Error::other(
+                            "Branch condition value has no boolean interpretation \
+                             (Ast::truthy returned None)",
+                        )),
+                    })?;
+                self.vacate(c);
+                if let InternalFrame::Branch { cond, decided, .. } = self.get_mut(h) {
+                    *cond = None;
+                    *decided = true;
+                }
+                let selected = if take_then {
+                    Some(then_branch)
+                } else {
+                    else_branch
+                };
+                match selected {
+                    Some(sel) => {
+                        // Schedule the selected side on the spawn stack:
+                        // the uniform schedule keeps the breakpoint peek
+                        // ahead of the spawn.
+                        self.spawn_stack.push(SpawnEntry {
+                            node: sel,
+                            path: path.push(sel),
+                            parent: SpawnParent::BranchBody(h),
+                            env: env.clone(),
+                        });
+                    }
+                    None => {
+                        // False with no else — complete with unit.
+                        let unit = self.ast.unit_value();
+                        *self.get_mut(h) = InternalFrame::Value {
+                            node,
+                            value: unit.clone(),
+                        };
+                        self.emit_event(&Event::VisitPost {
+                            at: Self::synthetic_ctx(node, path),
+                        });
+                        self.notify_par_slot(h, unit);
+                    }
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        // Decided: wait for the selected side, then forward its value.
+        let Some(b) = body else {
+            // Body spawn still queued on the spawn stack.
+            return Ok(false);
+        };
+        if self.advance_completed(b)? {
+            return Ok(true);
+        }
+        if let InternalFrame::Value { value, .. } = self.get(b) {
+            let value = value.clone();
+            self.vacate(b);
+            *self.get_mut(h) = InternalFrame::Value {
+                node,
+                value: value.clone(),
+            };
+            self.emit_event(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
+            self.notify_par_slot(h, value);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn advance_apply(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        // Descend into the current argument first.
+        let current = if let InternalFrame::Apply { current, .. } = self.get(h) {
+            *current
+        } else {
+            unreachable!()
+        };
+        if let Some(c) = current {
+            if self.advance_completed(c)? {
+                return Ok(true);
+            }
+            // Current argument produced a value — consume it into args.
+            if let InternalFrame::Value { value, .. } = self.get(c) {
+                let value = value.clone();
+                if let InternalFrame::Apply { current, args, .. } = self.get_mut(h) {
+                    *current = None;
+                    args.push(value);
+                }
+                self.vacate(c);
+                return self.try_apply_next(h);
+            }
+            return Ok(false);
+        }
+        // No current argument — spawn the next one, or fold.
+        self.try_apply_next(h)
+    }
+
+    /// If there is a next argument, spawn it. Otherwise fold `args`
+    /// through the op and promote the `Apply` to a Value.
+    fn try_apply_next(&mut self, h: FrameHandle) -> Result<bool, EngineError> {
+        let (node, path, env, next_id) = {
+            let f = self.get(h);
+            if let InternalFrame::Apply {
+                node,
+                path,
+                env,
+                children,
+                next_child,
+                ..
+            } = f
+            {
+                (
+                    *node,
+                    path.clone(),
+                    env.clone(),
+                    children.get(*next_child).copied(),
+                )
+            } else {
+                unreachable!()
+            }
+        };
+        if let Some(next_id) = next_id {
+            let child_path = path.push(next_id);
+            let child = self.spawn_one(next_id, child_path, env)?;
+            self.set_parent(child, h);
+            if let InternalFrame::Apply {
+                current,
+                next_child,
+                ..
+            } = self.get_mut(h)
+            {
+                *current = Some(child);
+                *next_child += 1;
+            }
+            Ok(true)
+        } else {
+            // All arguments evaluated — fold through the op.
+            let (op, args) = if let InternalFrame::Apply { op, args, .. } = self.get(h) {
+                (op.clone(), args.clone())
+            } else {
+                unreachable!()
+            };
+            let value = op.apply(node, &args)?;
+            *self.get_mut(h) = InternalFrame::Value {
+                node,
+                value: value.clone(),
+            };
+            self.emit_event(&Event::VisitPost {
+                at: Self::synthetic_ctx(node, path),
+            });
+            self.notify_par_slot(h, value);
             Ok(true)
         }
     }
@@ -1291,6 +2141,14 @@ impl<A: Ast> Engine<A> {
                 None
             }
             InternalFrame::Seq { current, .. } => current.and_then(|c| self.find_fireable_par(c)),
+            InternalFrame::Apply { current, .. } => current.and_then(|c| self.find_fireable_par(c)),
+            InternalFrame::Branch { cond, body, .. } => {
+                cond.or(*body).and_then(|f| self.find_fireable_par(f))
+            }
+            InternalFrame::Loop { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
+            InternalFrame::Bind { value, body, .. } => {
+                value.or(*body).and_then(|f| self.find_fireable_par(f))
+            }
             InternalFrame::Scope { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             InternalFrame::Maybe { body, .. } => body.and_then(|b| self.find_fireable_par(b)),
             _ => None,
@@ -1438,6 +2296,14 @@ impl<A: Ast> Engine<A> {
         match self.get(h) {
             InternalFrame::Failed { .. } => Some(h),
             InternalFrame::Seq { current, .. } => current.and_then(|c| self.find_failed_leaf(c)),
+            InternalFrame::Apply { current, .. } => current.and_then(|c| self.find_failed_leaf(c)),
+            InternalFrame::Branch { cond, body, .. } => {
+                cond.or(*body).and_then(|f| self.find_failed_leaf(f))
+            }
+            InternalFrame::Loop { body, .. } => body.and_then(|b| self.find_failed_leaf(b)),
+            InternalFrame::Bind { value, body, .. } => {
+                value.or(*body).and_then(|f| self.find_failed_leaf(f))
+            }
             InternalFrame::Par {
                 children, policy, ..
             } => {
@@ -1529,6 +2395,15 @@ impl<A: Ast> Engine<A> {
                 return;
             }
             InternalFrame::Seq { current, .. } => current.iter().copied().collect::<Vec<_>>(),
+            InternalFrame::Apply { current, .. } => current.iter().copied().collect(),
+            InternalFrame::Branch { cond, body, .. } => {
+                cond.iter().chain(body.iter()).copied().collect()
+            }
+            InternalFrame::Loop { body, .. } => body.iter().copied().collect(),
+            InternalFrame::Bind { value, body, .. } => {
+                value.iter().chain(body.iter()).copied().collect()
+            }
+            InternalFrame::Read { .. } => Vec::new(),
             InternalFrame::Par { children, .. } => children.clone(),
             InternalFrame::Scope { body, .. } => body.iter().copied().collect(),
             InternalFrame::Maybe { body, .. } => body.iter().copied().collect(),
@@ -1592,6 +2467,84 @@ impl<A: Ast> Engine<A> {
                     kids.push(self.project_tree(*c));
                 }
                 let _ = (children, path);
+                FrameTree {
+                    root: Frame::Node {
+                        node: *node,
+                        env: EnvRef(Arc::new(crate::Env {
+                            delta: A::Delta::default(),
+                            parent: None,
+                        })),
+                        cursor: A::Cursor::default(),
+                    },
+                    kids,
+                }
+            }
+            InternalFrame::Loop {
+                node, body, env, ..
+            } => {
+                // Only the current iteration's frames are live; prior
+                // iterations were consumed by `continue_loop`.
+                let kids = body.iter().map(|b| self.project_tree(*b)).collect();
+                FrameTree {
+                    root: Frame::Node {
+                        node: *node,
+                        env: env.clone(),
+                        cursor: A::Cursor::default(),
+                    },
+                    kids,
+                }
+            }
+            InternalFrame::Bind {
+                node,
+                value,
+                body,
+                env,
+                ..
+            } => {
+                let kids = value
+                    .iter()
+                    .chain(body.iter())
+                    .map(|f| self.project_tree(*f))
+                    .collect();
+                FrameTree {
+                    root: Frame::Node {
+                        node: *node,
+                        env: env.clone(),
+                        cursor: A::Cursor::default(),
+                    },
+                    kids,
+                }
+            }
+            InternalFrame::Read { value, .. } => FrameTree {
+                root: Frame::Value(value.clone()),
+                kids: vec![],
+            },
+            InternalFrame::Branch {
+                node, cond, body, ..
+            } => {
+                // Whichever side is live projects as the single kid; the
+                // untaken side never spawned, so it never appears.
+                let kids = cond
+                    .iter()
+                    .chain(body.iter())
+                    .map(|f| self.project_tree(*f))
+                    .collect();
+                FrameTree {
+                    root: Frame::Node {
+                        node: *node,
+                        env: EnvRef(Arc::new(crate::Env {
+                            delta: A::Delta::default(),
+                            parent: None,
+                        })),
+                        cursor: A::Cursor::default(),
+                    },
+                    kids,
+                }
+            }
+            InternalFrame::Apply { node, current, .. } => {
+                // Like Seq: only the in-flight argument is live; already
+                // consumed arguments sit in `args`, not the tree.
+                let kids = current.iter().map(|c| self.project_tree(*c)).collect();
                 FrameTree {
                     root: Frame::Node {
                         node: *node,
@@ -1878,7 +2831,7 @@ impl<A: Ast> Stepper for Engine<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BreakCondition, BufferingSink, Reducer, ReducerCollectAll};
+    use crate::{BreakCondition, BufferingSink, Op, Reducer, ReducerCollectAll};
 
     // ---- A minimal in-core test DSL --------------------------------
 
@@ -1893,6 +2846,9 @@ mod tests {
     #[error("test-err: {0}")]
     struct EE(String);
 
+    /// Test delta: a flat list of bindings (innermost level last).
+    type TDelta = Vec<(String, V)>;
+
     #[derive(Debug, Clone)]
     enum N {
         Seq(Vec<N>),
@@ -1904,6 +2860,12 @@ mod tests {
         Scope(String, Box<N>),
         Maybe(Option<Box<N>>),
         Call(String),
+        Apply(&'static str, Vec<N>),
+        Branch(Box<N>, Box<N>, Option<Box<N>>),
+        Loop(Box<N>),
+        Bind(&'static str, Box<N>, Box<N>),
+        Read(&'static str),
+        Lit(&'static str),
     }
 
     /// Assign NodeIds in a fixed DFS pre-order for reproducibility.
@@ -1938,6 +2900,30 @@ mod tests {
                 Node::Maybe(id, b)
             }
             N::Call(label) => Node::Call(id, label.clone()),
+            N::Apply(op, children) => {
+                let cs = children
+                    .iter()
+                    .map(|c| assign_ids(c, next))
+                    .collect::<Vec<_>>();
+                Node::Apply(id, OpId::from(*op), cs)
+            }
+            N::Branch(cond, then_branch, else_branch) => {
+                let c = Box::new(assign_ids(cond, next));
+                let t = Box::new(assign_ids(then_branch, next));
+                let e = else_branch.as_ref().map(|e| Box::new(assign_ids(e, next)));
+                Node::Branch(id, c, t, e)
+            }
+            N::Loop(body) => {
+                let b = Box::new(assign_ids(body, next));
+                Node::Loop(id, b)
+            }
+            N::Bind(name, value, body) => {
+                let v = Box::new(assign_ids(value, next));
+                let b = Box::new(assign_ids(body, next));
+                Node::Bind(id, name, v, b)
+            }
+            N::Read(name) => Node::Read(id, name),
+            N::Lit(s) => Node::Lit(id, s),
         };
         (id, cooked)
     }
@@ -1948,11 +2934,28 @@ mod tests {
         Scope(NodeId, String, Box<(NodeId, Node)>),
         Maybe(NodeId, Option<Box<(NodeId, Node)>>),
         Call(NodeId, String),
+        Apply(NodeId, OpId, Vec<(NodeId, Node)>),
+        Branch(
+            NodeId,
+            Box<(NodeId, Node)>,
+            Box<(NodeId, Node)>,
+            Option<Box<(NodeId, Node)>>,
+        ),
+        Loop(NodeId, Box<(NodeId, Node)>),
+        Bind(
+            NodeId,
+            &'static str,
+            Box<(NodeId, Node)>,
+            Box<(NodeId, Node)>,
+        ),
+        Read(NodeId, &'static str),
+        Lit(NodeId, &'static str),
     }
 
     struct TestAst {
         root_id: NodeId,
         by_id: HashMap<NodeId, NodeKind>,
+        lits: HashMap<NodeId, V>,
     }
 
     impl TestAst {
@@ -1960,12 +2963,17 @@ mod tests {
             let mut next = 1u64;
             let (root_id, cooked) = assign_ids(&root, &mut next);
             let mut by_id = HashMap::new();
-            flatten(cooked, &mut by_id);
-            Self { root_id, by_id }
+            let mut lits = HashMap::new();
+            flatten(cooked, &mut by_id, &mut lits);
+            Self {
+                root_id,
+                by_id,
+                lits,
+            }
         }
     }
 
-    fn flatten(n: Node, out: &mut HashMap<NodeId, NodeKind>) {
+    fn flatten(n: Node, out: &mut HashMap<NodeId, NodeKind>, lits: &mut HashMap<NodeId, V>) {
         match n {
             Node::Seq(id, children) => {
                 let child_ids: Vec<NodeId> = children.iter().map(|(cid, _)| *cid).collect();
@@ -1976,7 +2984,7 @@ mod tests {
                     },
                 );
                 for (_, c) in children {
-                    flatten(c, out);
+                    flatten(c, out, lits);
                 }
             }
             Node::Par(id, children, policy, reducer_id) => {
@@ -1990,20 +2998,20 @@ mod tests {
                     },
                 );
                 for (_, c) in children {
-                    flatten(c, out);
+                    flatten(c, out, lits);
                 }
             }
             Node::Scope(id, label, body) => {
                 let (bid, bn) = *body;
                 out.insert(id, NodeKind::Scope { label, body: bid });
-                flatten(bn, out);
+                flatten(bn, out, lits);
             }
             Node::Maybe(id, body) => {
                 let body_id = body.as_ref().map(|b| b.0);
                 out.insert(id, NodeKind::Maybe { body: body_id });
                 if let Some(b) = body {
                     let (_, bn) = *b;
-                    flatten(bn, out);
+                    flatten(bn, out, lits);
                 }
             }
             Node::Call(id, label) => {
@@ -2015,12 +3023,75 @@ mod tests {
                     },
                 );
             }
+            Node::Apply(id, op_id, children) => {
+                let child_ids: Vec<NodeId> = children.iter().map(|(cid, _)| *cid).collect();
+                out.insert(
+                    id,
+                    NodeKind::Apply {
+                        op_id,
+                        children: child_ids,
+                    },
+                );
+                for (_, c) in children {
+                    flatten(c, out, lits);
+                }
+            }
+            Node::Branch(id, cond, then_branch, else_branch) => {
+                let (cid, cn) = *cond;
+                let (tid, tn) = *then_branch;
+                let else_id = else_branch.as_ref().map(|e| e.0);
+                out.insert(
+                    id,
+                    NodeKind::Branch {
+                        cond: cid,
+                        then_branch: tid,
+                        else_branch: else_id,
+                    },
+                );
+                flatten(cn, out, lits);
+                flatten(tn, out, lits);
+                if let Some(e) = else_branch {
+                    let (_, en) = *e;
+                    flatten(en, out, lits);
+                }
+            }
+            Node::Loop(id, body) => {
+                let (bid, bn) = *body;
+                out.insert(id, NodeKind::Loop { body: bid });
+                flatten(bn, out, lits);
+            }
+            Node::Bind(id, name, value, body) => {
+                let (vid, vn) = *value;
+                let (bid, bn) = *body;
+                out.insert(
+                    id,
+                    NodeKind::Bind {
+                        name: name.to_string(),
+                        value: vid,
+                        body: bid,
+                    },
+                );
+                flatten(vn, out, lits);
+                flatten(bn, out, lits);
+            }
+            Node::Read(id, name) => {
+                out.insert(
+                    id,
+                    NodeKind::Read {
+                        name: name.to_string(),
+                    },
+                );
+            }
+            Node::Lit(id, s) => {
+                out.insert(id, NodeKind::Lit);
+                lits.insert(id, V::S(s.to_string()));
+            }
         }
     }
 
     impl Ast for TestAst {
         type Value = V;
-        type Delta = ();
+        type Delta = TDelta;
         type EffectError = EE;
         type Cursor = ();
 
@@ -2033,62 +3104,91 @@ mod tests {
         fn unit_value(&self) -> V {
             V::Unit
         }
+        fn truthy(&self, value: &V) -> Option<bool> {
+            match value {
+                V::S(s) if s == "true" => Some(true),
+                V::S(s) if s == "false" => Some(false),
+                _ => None,
+            }
+        }
+        fn continue_loop(&self, _node: NodeId, last: &V, _iteration: usize) -> LoopDecision {
+            match last {
+                V::S(s) if s == "again" => LoopDecision::Continue,
+                _ => LoopDecision::Break,
+            }
+        }
+        fn bind_delta(&self, name: &str, value: &V) -> Option<TDelta> {
+            Some(vec![(name.to_string(), value.clone())])
+        }
+        fn lookup(&self, delta: &TDelta, name: &str) -> Option<V> {
+            delta
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        }
+        fn literal(&self, node: NodeId) -> Option<V> {
+            self.lits.get(&node).cloned()
+        }
     }
 
     // ---- Reducers --------------------------------------------------
 
     struct AllOrdered;
-    impl Reducer<V, ()> for AllOrdered {
+    impl Reducer<V, TDelta> for AllOrdered {
         fn reduce(
             &self,
             slots: &[Option<V>],
-            _deltas: &[Option<()>],
+            _deltas: &[Option<TDelta>],
             _winners: &[ChildIndex],
-        ) -> Result<(V, ()), EngineError> {
+        ) -> Result<(V, TDelta), EngineError> {
             let vs: Vec<V> = slots.iter().map(|s| s.clone().unwrap_or(V::Unit)).collect();
-            Ok((V::List(vs), ()))
+            Ok((V::List(vs), TDelta::new()))
         }
     }
 
     struct AnyFirstWinner;
-    impl Reducer<V, ()> for AnyFirstWinner {
+    impl Reducer<V, TDelta> for AnyFirstWinner {
         fn reduce(
             &self,
             slots: &[Option<V>],
-            _deltas: &[Option<()>],
+            _deltas: &[Option<TDelta>],
             winners: &[ChildIndex],
-        ) -> Result<(V, ()), EngineError> {
+        ) -> Result<(V, TDelta), EngineError> {
             let w = winners.first().copied().unwrap_or(0);
-            Ok((slots.get(w).cloned().flatten().unwrap_or(V::Unit), ()))
+            Ok((
+                slots.get(w).cloned().flatten().unwrap_or(V::Unit),
+                TDelta::new(),
+            ))
         }
     }
 
     struct FirstKOrdered;
-    impl Reducer<V, ()> for FirstKOrdered {
+    impl Reducer<V, TDelta> for FirstKOrdered {
         fn reduce(
             &self,
             slots: &[Option<V>],
-            _deltas: &[Option<()>],
+            _deltas: &[Option<TDelta>],
             winners: &[ChildIndex],
-        ) -> Result<(V, ()), EngineError> {
+        ) -> Result<(V, TDelta), EngineError> {
             let mut vs = Vec::new();
             for &i in winners {
                 if let Some(v) = slots.get(i).cloned().flatten() {
                     vs.push(v);
                 }
             }
-            Ok((V::List(vs), ()))
+            Ok((V::List(vs), TDelta::new()))
         }
     }
 
     struct CollectAllResults;
-    impl ReducerCollectAll<V, (), EE> for CollectAllResults {
+    impl ReducerCollectAll<V, TDelta, EE> for CollectAllResults {
         fn reduce(
             &self,
             slots: &[Option<Result<V, EE>>],
-            _deltas: &[Option<()>],
+            _deltas: &[Option<TDelta>],
             _winners: &[ChildIndex],
-        ) -> Result<(V, ()), EngineError> {
+        ) -> Result<(V, TDelta), EngineError> {
             let mut vs = Vec::new();
             for s in slots {
                 match s {
@@ -2097,12 +3197,12 @@ mod tests {
                     None => vs.push(V::Unit),
                 }
             }
-            Ok((V::List(vs), ()))
+            Ok((V::List(vs), TDelta::new()))
         }
     }
 
-    fn default_registry() -> Arc<ReducerRegistry<V, (), EE>> {
-        let mut r: ReducerRegistry<V, (), EE> = ReducerRegistry::new();
+    fn default_registry() -> Arc<ReducerRegistry<V, TDelta, EE>> {
+        let mut r: ReducerRegistry<V, TDelta, EE> = ReducerRegistry::new();
         r.register_fail_fast("all_ordered", Arc::new(AllOrdered));
         r.register_fail_fast("any_first", Arc::new(AnyFirstWinner));
         r.register_fail_fast("first_k", Arc::new(FirstKOrdered));
@@ -2112,6 +3212,53 @@ mod tests {
 
     fn build(root: N) -> Engine<TestAst> {
         Engine::new(TestAst::build(root), default_registry()).expect("build")
+    }
+
+    // ---- Ops -------------------------------------------------------
+
+    struct ConstS(&'static str);
+    impl Op<V> for ConstS {
+        fn apply(&self, _node: NodeId, _args: &[V]) -> Result<V, EngineError> {
+            Ok(V::S(self.0.to_string()))
+        }
+    }
+
+    struct ConcatS;
+    impl Op<V> for ConcatS {
+        fn apply(&self, _node: NodeId, args: &[V]) -> Result<V, EngineError> {
+            let mut s = String::new();
+            for a in args {
+                if let V::S(x) = a {
+                    s.push_str(x);
+                }
+            }
+            Ok(V::S(s))
+        }
+    }
+
+    struct Boom;
+    impl Op<V> for Boom {
+        fn apply(&self, node: NodeId, _args: &[V]) -> Result<V, EngineError> {
+            Err(EngineError::EvalFailed {
+                at: NodeContext::at(node, Path::root().push(node)),
+                source: Box::new(std::io::Error::other("boom")),
+            })
+        }
+    }
+
+    fn test_ops() -> Arc<OpRegistry<V>> {
+        let mut r: OpRegistry<V> = OpRegistry::new();
+        r.register("const_a", Arc::new(ConstS("a")));
+        r.register("const_b", Arc::new(ConstS("b")));
+        r.register("const_true", Arc::new(ConstS("true")));
+        r.register("const_false", Arc::new(ConstS("false")));
+        r.register("concat", Arc::new(ConcatS));
+        r.register("boom", Arc::new(Boom));
+        Arc::new(r)
+    }
+
+    fn build_with_ops(root: N) -> Engine<TestAst> {
+        Engine::new_with_ops(TestAst::build(root), default_registry(), test_ops()).expect("build")
     }
 
     fn all_ff() -> JoinPolicy {
@@ -2719,7 +3866,7 @@ mod tests {
     #[test]
     fn unknown_reducer_id_rejected_at_build() {
         // Fresh registry with no reducer registered.
-        let empty: Arc<ReducerRegistry<V, (), EE>> = Arc::new(ReducerRegistry::new());
+        let empty: Arc<ReducerRegistry<V, TDelta, EE>> = Arc::new(ReducerRegistry::new());
         let ast = N::Par {
             children: vec![N::Call("a".into())],
             policy: all_ff(),
@@ -3426,5 +4573,542 @@ mod tests {
         let ast = TestAst::build(ast);
         let err = Engine::new(ast, default_registry()).unwrap_err();
         assert!(matches!(err, EngineError::Malformed { .. }), "got {err:?}");
+    }
+
+    // ---- Apply (op fold) --------------------------------------------
+
+    #[test]
+    fn apply_zero_children_invokes_op_with_no_args() {
+        let mut e = build_with_ops(N::Apply("const_a", vec![]));
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+    }
+
+    #[test]
+    fn apply_folds_args_left_to_right() {
+        let ast = N::Apply(
+            "concat",
+            vec![N::Apply("const_a", vec![]), N::Apply("const_b", vec![])],
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "ab"));
+    }
+
+    #[test]
+    fn apply_arg_can_be_a_call() {
+        // Effects compose into value positions: the first argument is a
+        // Call that suspends; its resolved value becomes an ordinary arg.
+        let ast = N::Apply(
+            "concat",
+            vec![N::Call("x".into()), N::Apply("const_b", vec![])],
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("A".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "Ab"));
+    }
+
+    #[test]
+    fn apply_nests() {
+        let ast = N::Apply(
+            "concat",
+            vec![
+                N::Apply(
+                    "concat",
+                    vec![N::Apply("const_a", vec![]), N::Apply("const_b", vec![])],
+                ),
+                N::Apply("const_a", vec![]),
+            ],
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "aba"));
+    }
+
+    #[test]
+    fn apply_inside_par_fills_its_slot() {
+        let ast = N::Par {
+            children: vec![N::Apply("const_a", vec![]), N::Call("b".into())],
+            policy: all_ff(),
+            reducer: "all_ordered",
+        };
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1, "only the Call suspends");
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("b!".into()))).unwrap();
+        let out = e.step().unwrap();
+        match out {
+            StepOutcome::Done(V::List(vs)) => {
+                assert_eq!(vs, vec![V::S("a".into()), V::S("b!".into())]);
+            }
+            other => panic!("expected Done(List), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_unknown_op_fails_at_build() {
+        // Registered ops but an unknown id.
+        let err = Engine::new_with_ops(
+            TestAst::build(N::Apply("nope", vec![])),
+            default_registry(),
+            test_ops(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownOp { .. }), "got {err:?}");
+
+        // Plain `new` carries an empty OpRegistry: any Apply fails, even
+        // behind a lazy Seq child (full-AST validation pre-walk).
+        let ast = N::Seq(vec![N::Call("first".into()), N::Apply("const_a", vec![])]);
+        let err = Engine::new(TestAst::build(ast), default_registry()).unwrap_err();
+        assert!(matches!(err, EngineError::UnknownOp { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn apply_op_error_surfaces_as_engine_error() {
+        let mut e = build_with_ops(N::Apply("boom", vec![]));
+        let err = e.step().unwrap_err();
+        assert!(
+            matches!(err, ExecError::Engine(EngineError::EvalFailed { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn breakpoint_on_apply_arg_halts_before_that_spawn() {
+        // Apply(1) → Call x(2). The BP on the argument halts after the
+        // Apply frame spawned but before the Call enters the arena.
+        let ast = N::Apply("concat", vec![N::Call("x".into())]);
+        let mut e = build_with_ops(ast);
+        let bps = bp_at(2);
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(2)), "halted on the arg ctx");
+        assert_eq!(e.events().visit_pre, 1, "only the Apply spawned at halt");
+        assert!(
+            e.pending()
+                .iter()
+                .all(|p| !matches!(p.reason, SuspendReason::Call { .. }))
+        );
+        // Resume: the halted arg spawn proceeds and suspends on the Call.
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("X".into()))).unwrap();
+        let out = e.step_with_breakpoints(&bps).unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "X"));
+    }
+
+    // ---- Branch (value-dependent control flow) ----------------------
+
+    fn branch(cond: N, then_branch: N, else_branch: Option<N>) -> N {
+        N::Branch(
+            Box::new(cond),
+            Box::new(then_branch),
+            else_branch.map(Box::new),
+        )
+    }
+
+    #[test]
+    fn branch_true_takes_then() {
+        let ast = branch(
+            N::Apply("const_true", vec![]),
+            N::Apply("const_a", vec![]),
+            Some(N::Apply("const_b", vec![])),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+    }
+
+    #[test]
+    fn branch_false_takes_else() {
+        let ast = branch(
+            N::Apply("const_false", vec![]),
+            N::Apply("const_a", vec![]),
+            Some(N::Apply("const_b", vec![])),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "b"));
+    }
+
+    #[test]
+    fn branch_false_without_else_is_unit() {
+        let ast = branch(
+            N::Apply("const_false", vec![]),
+            N::Apply("const_a", vec![]),
+            None,
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::Unit)));
+    }
+
+    #[test]
+    fn branch_cond_can_be_a_call() {
+        let ast = branch(
+            N::Call("ask".into()),
+            N::Apply("const_a", vec![]),
+            Some(N::Apply("const_b", vec![])),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            other => panic!("expected Blocked on the cond Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("false".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "b"));
+    }
+
+    #[test]
+    fn branch_untaken_side_never_spawns() {
+        // Branch(1) → cond(2), then(3), else(4). True path: exactly the
+        // Branch, the cond, and the then side spawn — the else side
+        // must never emit a VisitPre.
+        let ast = branch(
+            N::Apply("const_true", vec![]),
+            N::Apply("const_a", vec![]),
+            Some(N::Apply("const_b", vec![])),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+        assert_eq!(
+            e.events().visit_pre,
+            3,
+            "Branch + cond + then only; the else side never spawned"
+        );
+    }
+
+    #[test]
+    fn branch_cond_without_boolean_interpretation_fails() {
+        // Maybe(None) evaluates to Unit, which TestAst::truthy maps to
+        // None → EvalFailed at the Branch node.
+        let ast = branch(N::Maybe(None), N::Apply("const_a", vec![]), None);
+        let mut e = build_with_ops(ast);
+        let err = e.step().unwrap_err();
+        assert!(
+            matches!(err, ExecError::Engine(EngineError::EvalFailed { .. })),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn breakpoint_on_selected_branch_halts_before_its_spawn() {
+        // Branch(1) → cond(2), then Call x(3), else(4). BP on the then
+        // side: the halt lands after the cond folded, before the
+        // selected side enters the arena.
+        let ast = branch(
+            N::Apply("const_true", vec![]),
+            N::Call("x".into()),
+            Some(N::Apply("const_b", vec![])),
+        );
+        let mut e = build_with_ops(ast);
+        let bps = bp_at(3);
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(3)), "halted on the then ctx");
+        assert_eq!(
+            e.events().visit_pre,
+            2,
+            "Branch + cond spawned; the selected side not yet"
+        );
+        // Resume: the then side spawns and suspends on the Call.
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("X".into()))).unwrap();
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "X"));
+    }
+
+    // ---- Loop (iterative control flow) ------------------------------
+
+    /// Drive a blocked engine by resolving the sole pending Call with
+    /// `v`, then stepping.
+    fn resolve_sole_call(e: &mut Engine<TestAst>, out: StepOutcome<V>, v: &str) -> StepOutcome<V> {
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S(v.into()))).unwrap();
+        e.step().unwrap()
+    }
+
+    #[test]
+    fn loop_breaks_immediately_on_non_continue_value() {
+        // Body value "a" != "again" → single iteration.
+        let mut e = build_with_ops(N::Loop(Box::new(N::Apply("const_a", vec![]))));
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+    }
+
+    #[test]
+    fn loop_iterates_until_break_and_yields_last_value() {
+        // Each iteration suspends on the body Call; the host answers
+        // "again" twice, then "done" — three iterations total.
+        let mut e = build_with_ops(N::Loop(Box::new(N::Call("tick".into()))));
+        let out = e.step().unwrap();
+        let out = resolve_sole_call(&mut e, out, "again");
+        let out = resolve_sole_call(&mut e, out, "again");
+        let out = resolve_sole_call(&mut e, out, "done");
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "done"));
+        // Loop(1) + body Call spawned once per iteration.
+        assert_eq!(e.events().visit_pre, 4, "Loop + 3 body spawns");
+        assert_eq!(e.events().iteration_tick, 2, "one tick per respawn");
+    }
+
+    #[test]
+    fn loop_body_respawns_with_fresh_suspension_ids() {
+        let mut e = build_with_ops(N::Loop(Box::new(N::Call("tick".into()))));
+        let out = e.step().unwrap();
+        let sid1 = match &out {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        let out = resolve_sole_call(&mut e, out, "again");
+        let sid2 = match &out {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        assert_ne!(sid1, sid2, "each iteration is a fresh suspension");
+    }
+
+    #[test]
+    fn breakpoint_on_loop_body_halts_before_every_iteration() {
+        // Loop(1) → Call tick(2). The BP fires before iteration 0's
+        // spawn AND again before iteration 1's respawn.
+        let mut e = build_with_ops(N::Loop(Box::new(N::Call("tick".into()))));
+        let bps = bp_at(2);
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(2)), "halted before iteration 0");
+        // Resume into the Call, answer "again".
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert!(matches!(
+                    newly_pending[0].reason,
+                    SuspendReason::Call { .. }
+                ));
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("again".into()))).unwrap();
+        // The respawn halts again on the same breakpoint.
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        assert_eq!(bp_halt(&out), Some(NodeId(2)), "halted before iteration 1");
+        // Resume, answer "done" — loop completes.
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            other => panic!("expected Blocked on the Call, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("done".into()))).unwrap();
+        let out = e.run_to_yield_with_breakpoints(&bps).unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "done"));
+    }
+
+    #[test]
+    fn loop_composes_with_branch_and_apply() {
+        // Loop { Branch(Call("more?"), then=const "again", else=const_b) }
+        // First pass: cond resolves "true" → body value "again" → loop
+        // continues. Second pass: cond resolves "false" → body value
+        // "b" → loop breaks with "b".
+        let ast = N::Loop(Box::new(N::Branch(
+            Box::new(N::Call("more?".into())),
+            Box::new(N::Apply("const_again", vec![])),
+            Some(Box::new(N::Apply("const_b", vec![]))),
+        )));
+        let mut r: OpRegistry<V> = OpRegistry::new();
+        r.register("const_again", Arc::new(ConstS("again")));
+        r.register("const_b", Arc::new(ConstS("b")));
+        let mut e =
+            Engine::new_with_ops(TestAst::build(ast), default_registry(), Arc::new(r)).unwrap();
+        let out = e.step().unwrap();
+        let out = resolve_sole_call(&mut e, out, "true");
+        let out = resolve_sole_call(&mut e, out, "false");
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "b"));
+    }
+
+    // ---- Bind / Read (lexical env) ----------------------------------
+
+    fn bind(name: &'static str, value: N, body: N) -> N {
+        N::Bind(name, Box::new(value), Box::new(body))
+    }
+
+    #[test]
+    fn bind_then_read_roundtrips() {
+        let ast = bind("x", N::Apply("const_a", vec![]), N::Read("x"));
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+    }
+
+    #[test]
+    fn bind_shadows_outer_binding() {
+        let ast = bind(
+            "x",
+            N::Apply("const_a", vec![]),
+            bind("x", N::Apply("const_b", vec![]), N::Read("x")),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "b"));
+    }
+
+    #[test]
+    fn read_reaches_outer_binding_through_inner_level() {
+        let ast = bind(
+            "x",
+            N::Apply("const_a", vec![]),
+            bind("y", N::Apply("const_b", vec![]), N::Read("x")),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
+    }
+
+    #[test]
+    fn unbound_read_suspends_as_call_labelled_with_the_name() {
+        let mut e = build_with_ops(N::Read("z"));
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                match &newly_pending[0].reason {
+                    SuspendReason::Call { spec } => {
+                        assert_eq!(spec.label, "z");
+                        assert_eq!(spec.payload["kind"], "read");
+                    }
+                    other => panic!("expected Call-shaped reason, got {other:?}"),
+                }
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("supplied".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "supplied"));
+    }
+
+    #[test]
+    fn bind_value_can_be_a_call() {
+        let ast = bind("x", N::Call("fetch".into()), N::Read("x"));
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        let out = resolve_sole_call(&mut e, out, "fetched");
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "fetched"));
+    }
+
+    #[test]
+    fn read_feeds_apply_argument() {
+        let ast = bind(
+            "x",
+            N::Apply("const_a", vec![]),
+            N::Apply("concat", vec![N::Read("x"), N::Apply("const_b", vec![])]),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "ab"));
+    }
+
+    #[test]
+    fn binding_is_lexical_not_dynamic() {
+        // Seq [ Bind(x, "a", Read x), Read x ] — the second Read sits
+        // outside the Bind body, so it must NOT see the binding and
+        // suspends to the host instead.
+        let ast = N::Seq(vec![
+            bind("x", N::Apply("const_a", vec![]), N::Read("x")),
+            N::Read("x"),
+        ]);
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                match &newly_pending[0].reason {
+                    SuspendReason::Call { spec } => assert_eq!(spec.label, "x"),
+                    other => panic!("expected Call-shaped reason, got {other:?}"),
+                }
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked on the outer Read, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("outer".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "outer"));
+    }
+
+    #[test]
+    fn lit_completes_with_its_value() {
+        let mut e = build_with_ops(N::Apply(
+            "concat",
+            vec![N::Lit("x"), N::Lit("y"), N::Read("nope_bound")],
+        ));
+        let out = e.step().unwrap();
+        // Two lits folded eagerly; the read suspends.
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => newly_pending[0].id,
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("z".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "xyz"));
+    }
+
+    #[test]
+    fn branch_selects_on_bound_value() {
+        // The full composition: bind a flag, branch on a Read of it.
+        let ast = bind(
+            "flag",
+            N::Apply("const_true", vec![]),
+            branch(
+                N::Read("flag"),
+                N::Apply("const_a", vec![]),
+                Some(N::Apply("const_b", vec![])),
+            ),
+        );
+        let mut e = build_with_ops(ast);
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "a"));
     }
 }

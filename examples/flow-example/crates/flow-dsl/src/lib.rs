@@ -86,6 +86,22 @@ pub enum Flow {
         /// Inner flow, evaluated when present.
         body: Option<Box<Flow>>,
     },
+    /// Selects one side based on a runtime value: `cond` runs first
+    /// (typically a `Call`), its `Text` value is read as `"true"` /
+    /// `"false"`, and **only the selected side ever spawns** — the
+    /// untaken side (even a whole `Par` cascade) never enters the
+    /// engine arena.
+    Branch {
+        /// Stable node id.
+        id: NodeId,
+        /// Condition flow; its value decides the side.
+        cond: Box<Flow>,
+        /// Side taken when the condition value is `"true"`.
+        then_branch: Box<Flow>,
+        /// Side taken when the condition value is `"false"`; absent
+        /// means the branch completes with `Unit`.
+        else_branch: Option<Box<Flow>>,
+    },
 }
 
 impl Flow {
@@ -97,6 +113,7 @@ impl Flow {
             Flow::Call { label, .. } => format!("Call {label:?}"),
             Flow::Scope { label, .. } => format!("Scope {label:?}"),
             Flow::Maybe { .. } => "Maybe".into(),
+            Flow::Branch { .. } => "Branch".into(),
         }
     }
 }
@@ -256,6 +273,8 @@ pub fn canned_response(label: &str) -> String {
         }
         "citation_check" => "citations: 3 sources cross-verified".into(),
         "write_report" => "report: 380 words, 3 citations, ready".into(),
+        "cache_lookup" => "false".into(),
+        "serve_cached" => "cached: yesterday's report, still fresh".into(),
         other => format!("<no handler for {other}>"),
     }
 }
@@ -311,6 +330,58 @@ pub fn research_pipeline(ids: &IdGen) -> Flow {
     }
 }
 
+/// Builds a cache-gated variant of the research pipeline.
+///
+/// A `Branch` asks `cache_lookup` first: `"true"` serves the cached
+/// report, `"false"` runs the live search fan-out. Whichever side
+/// loses never spawns — a runtime value decides the orchestration
+/// shape, and the frame tree / breakpoints only ever see the taken
+/// side.
+pub fn gated_pipeline(ids: &IdGen) -> Flow {
+    Flow::Seq {
+        id: ids.node(),
+        children: vec![
+            Flow::Branch {
+                id: ids.node(),
+                cond: Box::new(Flow::Call {
+                    id: ids.node(),
+                    label: "cache_lookup".into(),
+                }),
+                then_branch: Box::new(Flow::Call {
+                    id: ids.node(),
+                    label: "serve_cached".into(),
+                }),
+                else_branch: Some(Box::new(Flow::Scope {
+                    id: ids.node(),
+                    label: "live_research".into(),
+                    body: Box::new(Flow::Par {
+                        id: ids.node(),
+                        children: vec![
+                            Flow::Call {
+                                id: ids.node(),
+                                label: "search_arxiv".into(),
+                            },
+                            Flow::Call {
+                                id: ids.node(),
+                                label: "search_web".into(),
+                            },
+                        ],
+                        policy: Some(JoinPolicy {
+                            shape: JoinShape::Any,
+                            fail: FailPolicy::FailFast,
+                        }),
+                        reducer_id: Some("reduce_any_first_winner".into()),
+                    }),
+                })),
+            },
+            Flow::Call {
+                id: ids.node(),
+                label: "write_report".into(),
+            },
+        ],
+    }
+}
+
 // ---------- FlowAst — Ast impl for the engine ---------------------------
 
 /// [`Ast`] adapter wrapping a borrowed [`Flow`] tree.
@@ -341,6 +412,18 @@ impl<'a> FlowAst<'a> {
             }
             Flow::Scope { body, .. } => Self::index(body, out),
             Flow::Maybe { body: Some(b), .. } => Self::index(b, out),
+            Flow::Branch {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::index(cond, out);
+                Self::index(then_branch, out);
+                if let Some(e) = else_branch {
+                    Self::index(e, out);
+                }
+            }
             Flow::Maybe { body: None, .. } | Flow::Call { .. } => {}
         }
     }
@@ -394,6 +477,16 @@ impl<'a> Ast for FlowAst<'a> {
             Flow::Maybe { body, .. } => NodeKind::Maybe {
                 body: body.as_deref().map(|b| b.node_id()),
             },
+            Flow::Branch {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            } => NodeKind::Branch {
+                cond: cond.node_id(),
+                then_branch: then_branch.node_id(),
+                else_branch: else_branch.as_deref().map(|e| e.node_id()),
+            },
             Flow::Call { label, .. } => NodeKind::Call {
                 label: label.clone(),
                 payload: serde_json::Value::Null,
@@ -403,6 +496,14 @@ impl<'a> Ast for FlowAst<'a> {
 
     fn unit_value(&self) -> FlowValue {
         FlowValue::Unit
+    }
+
+    fn truthy(&self, value: &FlowValue) -> Option<bool> {
+        match value {
+            FlowValue::Text(s) if s == "true" => Some(true),
+            FlowValue::Text(s) if s == "false" => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -823,6 +924,70 @@ pub fn run_flow_sync(program: &Flow) -> Result<HashMap<NodeId, String>, FlowErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives the gated pipeline, answering `cache_lookup` with
+    /// `cache_answer` and everything else with its canned response.
+    /// Returns the final value, the resolved labels in order, and the
+    /// spawn count.
+    fn drive_gated(cache_answer: &str) -> (FlowValue, Vec<String>, u32) {
+        let ids = IdGen::new();
+        let program = gated_pipeline(&ids);
+        let mut stepper = FlowStepper::new(&program);
+        let bp = BreakpointSet::new();
+        let mut labels = Vec::new();
+        loop {
+            match stepper.run_to_yield_with_breakpoints(&bp).expect("step") {
+                StepOutcome::Ready => {}
+                StepOutcome::Done(v) => return (v, labels, stepper.events().visit_pre),
+                StepOutcome::Blocked { .. } => {
+                    let outstanding: Vec<(SuspensionId, String)> = stepper
+                        .pending()
+                        .iter()
+                        .filter_map(|p| match &p.reason {
+                            SuspendReason::Call { spec } => Some((p.id, spec.label.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    for (sid, label) in outstanding {
+                        let response = if label == "cache_lookup" {
+                            cache_answer.to_string()
+                        } else {
+                            canned_response(&label)
+                        };
+                        labels.push(label);
+                        stepper
+                            .resolve(sid, Ok(FlowValue::Text(response)))
+                            .expect("resolve");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn branch_cache_miss_runs_the_live_fanout_only() {
+        let (_, labels, _) = drive_gated("false");
+        assert!(labels.iter().any(|l| l == "search_arxiv"));
+        assert!(labels.iter().any(|l| l == "search_web"));
+        assert!(
+            !labels.iter().any(|l| l == "serve_cached"),
+            "the cached side must never suspend: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn branch_cache_hit_never_spawns_the_live_cascade() {
+        let (_, labels, visit_pre) = drive_gated("true");
+        assert!(labels.iter().any(|l| l == "serve_cached"));
+        assert!(
+            !labels.iter().any(|l| l.starts_with("search_")),
+            "the live side must never suspend: {labels:?}"
+        );
+        // Taken path spawns exactly: Seq, Branch, cond Call, cached
+        // Call, write_report Call. The Scope/Par/search subtree never
+        // enters the arena.
+        assert_eq!(visit_pre, 5, "the live Par cascade never spawned");
+    }
 
     #[test]
     fn research_pipeline_runs_end_to_end() {
@@ -1428,7 +1593,10 @@ mod tests {
         let schema = Flow::schema();
         assert_eq!(schema.name, "Flow");
         let names: Vec<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, vec!["Seq", "Par", "Call", "Scope", "Maybe"]);
+        assert_eq!(
+            names,
+            vec!["Seq", "Par", "Call", "Scope", "Maybe", "Branch"]
+        );
     }
 
     #[test]
@@ -1481,7 +1649,7 @@ mod tests {
         let json = Flow::schema().to_json();
         assert_eq!(json["name"], "Flow");
         let variants = json["variants"].as_array().expect("variants array");
-        assert_eq!(variants.len(), 5);
+        assert_eq!(variants.len(), 6);
 
         // Spot-check Maybe.body → optional.
         let maybe = variants
@@ -1845,7 +2013,7 @@ mod tests {
             }],
         };
         let diags = Linter::<Flow>::new().with_rule(DeadVariants).lint(&program);
-        assert_eq!(diags.len(), 3, "diags = {diags:?}");
+        assert_eq!(diags.len(), 4, "diags = {diags:?}");
         assert!(diags.iter().all(|d| d.rule == "dead-variants"));
         assert!(diags.iter().all(|d| d.severity == Severity::Info));
         assert!(diags.iter().all(|d| d.node == root_id));

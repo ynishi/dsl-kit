@@ -43,7 +43,7 @@ use dsl_kit::{
 use dsl_kit_schema::DslSchema;
 use flow_dsl::{
     Flow, FlowAst, FlowEffectErr, FlowStepper, FlowValue, canned_response, check_unique_ids,
-    flow_default_registry, flow_syntax_overrides, pretty, research_pipeline,
+    flow_default_registry, flow_syntax_overrides, gated_pipeline, pretty, research_pipeline,
 };
 
 /// Sync effect backend for the drive layer: answers every `Call` with
@@ -262,6 +262,59 @@ async fn run_flow_async_fanout(
 /// Small standalone `Par`-of-three-calls program used by the FailFast
 /// demo. Kept separate from the research pipeline so a single failure
 /// isolates the fan-out cancellation behavior.
+/// A runtime value decides the orchestration shape: `Branch` asks
+/// `cache_lookup` first, then spawns **only** the selected side. The
+/// losing side — cached reply or a whole `Par` cascade — never enters
+/// the engine arena, so breakpoints and the frame tree only ever see
+/// the path actually taken.
+fn demonstrate_value_branch() {
+    struct GateResolver {
+        cache: &'static str,
+        labels: Vec<String>,
+    }
+    impl<'a> EffectResolver<FlowAst<'a>> for GateResolver {
+        fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
+            let label = match &pending.reason {
+                SuspendReason::Call { spec } => spec.label.clone(),
+                other => unreachable!("drive only hands Call suspensions: {other:?}"),
+            };
+            let response = if label == "cache_lookup" {
+                self.cache.to_string()
+            } else {
+                canned_response(&label)
+            };
+            self.labels.push(label);
+            Ok(FlowValue::Text(response))
+        }
+    }
+
+    for cache in ["true", "false"] {
+        let ids = IdGen::new();
+        let program = gated_pipeline(&ids);
+        let mut engine = Engine::new(FlowAst::new(&program), Arc::new(flow_default_registry()))
+            .expect("engine builds");
+        let mut resolver = GateResolver {
+            cache,
+            labels: Vec::new(),
+        };
+        match drive(&mut engine, &mut resolver, &BreakpointSet::new()).expect("drive") {
+            DriveOutcome::Done(_) => {}
+            DriveOutcome::Break { at } => panic!("unexpected break: {at:?}"),
+        }
+        let side = if cache == "true" {
+            "cached reply; the live Par cascade never spawned"
+        } else {
+            "live fan-out; the cached side never spawned"
+        };
+        println!("  cache_lookup -> {cache:<5} took the {side}");
+        println!(
+            "    resolved: {}   (visit_pre = {})",
+            resolver.labels.join(", "),
+            engine.events().visit_pre
+        );
+    }
+}
+
 /// The rescue for the fail-loud section above: with
 /// `flow_syntax_overrides` (grammar layer) and the
 /// `#[dsl_build(with = ...)]` converters (build layer) the same schema
@@ -451,6 +504,9 @@ async fn main() -> miette::Result<()> {
 
     println!("\n=== FailFast demo (Par of 3, middle slot fails) ===");
     run_failfast_demo();
+
+    println!("\n=== Value-dependent branch (cache gate; untaken side never spawns) ===");
+    demonstrate_value_branch();
 
     println!("\n=== Drive with a live breakpoint (halt before a Par kid spawns) ===");
     let target = find_call_node(&program, "search_github").expect("pipeline has search_github");

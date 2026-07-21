@@ -128,7 +128,7 @@ fn synthesized_examples_cover_every_variant_and_build_typed() {
     let grammar = generated_grammar();
     let examples =
         dsl_kit_parse::example_gen::examples_from_grammar(&grammar).expect("examples synthesize");
-    assert_eq!(examples.per_rule.len(), 5, "one example per Flow variant");
+    assert_eq!(examples.per_rule.len(), 6, "one example per Flow variant");
     for e in &examples.per_rule {
         let tree = grammar.parse(&e.text).unwrap_or_else(|err| {
             panic!(
