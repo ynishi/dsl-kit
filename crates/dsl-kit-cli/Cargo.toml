@@ -1,0 +1,34 @@
+[package]
+name = "dsl-kit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Developer CLI for dsl-kit. Ships an MCP mode (`dsl-kit-cli mcp`) that serves a minimal built-in reference DSL through the dsl-kit-mcp framework, so `cargo install dsl-kit-cli` gives you a working stepper without writing a host first. Room for more subcommands (lint, schema dump, grammar preview) as the CLI grows."
+
+[[bin]]
+name = "dsl-kit-cli"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit         = { workspace = true }
+dsl-kit-core    = { workspace = true }
+dsl-kit-mcp     = { workspace = true }
+dsl-kit-macros  = { workspace = true }
+dsl-kit-schema  = { workspace = true }
+dsl-kit-parse   = { workspace = true }
+dsl-kit-lint    = { workspace = true }
+rmcp            = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio           = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+serde_json      = "1"
+tracing         = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait     = "0.1"
+anyhow          = "1"
+clap            = { version = "4", features = ["derive"] }

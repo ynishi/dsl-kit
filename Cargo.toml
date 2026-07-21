@@ -8,6 +8,7 @@ members = [
     "crates/dsl-kit-parse",
     "crates/dsl-kit",
     "crates/dsl-kit-mcp",
+    "crates/dsl-kit-cli",
     "examples/flow-example",
     "examples/flow-example/crates/flow-dsl",
     "examples/flow-example/crates/flow-host",
@@ -39,6 +40,7 @@ dsl-kit-lint   = { path = "crates/dsl-kit-lint",   version = "0.1.0" }
 dsl-kit-parse  = { path = "crates/dsl-kit-parse",  version = "0.1.0" }
 dsl-kit        = { path = "crates/dsl-kit",        version = "0.1.0" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.1.0" }
+dsl-kit-cli    = { path = "crates/dsl-kit-cli",    version = "0.1.0" }
 flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.1.0" }
 flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.1.0" }
 expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.1.0" }
