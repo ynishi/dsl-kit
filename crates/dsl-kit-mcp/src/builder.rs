@@ -52,6 +52,7 @@ use tokio::sync::Mutex;
 
 use crate::host::DslHost;
 use crate::resources::{ResourceEntry, kit_resources};
+use dsl_kit::{SuggesterHandle, noop_handle};
 
 /// Per-call context handed to every tool handler.
 ///
@@ -104,6 +105,7 @@ pub struct DslMcpBuilder {
     tools: Vec<RegisteredTool>,
     expose_kit_resources: bool,
     extra_resources: Vec<ResourceEntry>,
+    suggester: SuggesterHandle,
 }
 
 impl Default for DslMcpBuilder {
@@ -125,7 +127,22 @@ impl DslMcpBuilder {
             tools: Vec::new(),
             expose_kit_resources: true,
             extra_resources: Vec::new(),
+            suggester: noop_handle(),
         }
+    }
+
+    /// Injects a fuzzy-match [`Suggester`](dsl_kit::Suggester) used to
+    /// enrich this server's `unknown tool` diagnostic with
+    /// `did you mean X?` hints when an MCP client mistypes a tool
+    /// name.
+    ///
+    /// The default is a no-op suggester, so this crate does not pull
+    /// in any similarity algorithm on its own. Pass
+    /// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` at the
+    /// composition root to enable Jaro-Winkler hints.
+    pub fn with_suggester(mut self, suggester: SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
     }
 
     /// Suppresses the built-in `dsl-kit://kit/*` resources on the
@@ -291,6 +308,7 @@ impl DslMcpBuilder {
             instructions: self.instructions,
             tools: Arc::new(self.tools),
             resources: Arc::new(resources),
+            suggester: self.suggester,
         }
     }
 }
@@ -304,12 +322,32 @@ pub struct DslMcpServer {
     instructions: Option<String>,
     tools: Arc<Vec<RegisteredTool>>,
     resources: Arc<Vec<ResourceEntry>>,
+    suggester: SuggesterHandle,
 }
 
 impl DslMcpServer {
     /// Number of registered resources (for tests / introspection).
     pub fn resource_count(&self) -> usize {
         self.resources.len()
+    }
+}
+
+/// Shared formatter for the `unknown tool` `invalid_params` message.
+///
+/// Extracted so the enrichment path can be exercised in isolation
+/// without constructing an rmcp `RequestContext`; the production
+/// dispatcher in [`DslMcpServer::call_tool`] and the unit tests both
+/// call in through the same entry point, keeping the `did you mean`
+/// wording pinned in one place.
+pub(crate) fn format_unknown_tool(
+    query: &str,
+    tool_names: &[&str],
+    suggester: &dyn dsl_kit::Suggester,
+) -> String {
+    let base = format!("unknown tool {query:?}");
+    match suggester.enrich_unknown(query, tool_names) {
+        Some(hint) => format!("{base} ({hint})"),
+        None => base,
     }
 }
 
@@ -397,7 +435,9 @@ impl ServerHandler for DslMcpServer {
             .iter()
             .find(|t| t.name == request.name)
             .ok_or_else(|| {
-                McpError::invalid_params(format!("unknown tool {:?}", request.name), None)
+                let names: Vec<&str> = self.tools.iter().map(|t| t.name.as_ref()).collect();
+                let msg = format_unknown_tool(&request.name, &names, &*self.suggester);
+                McpError::invalid_params(msg, None)
             })?;
 
         let args_value = request.arguments.map(Value::Object).unwrap_or(Value::Null);
@@ -503,6 +543,27 @@ mod tests {
             .build();
         assert_eq!(server.resource_count(), 1);
         assert_eq!(server.resources[0].uri, "example://guide/hello");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_defaults_to_noop_message() {
+        // With no suggester injected the message stays literal, matching
+        // the historical `unknown tool "X"` wording.
+        let names = ["echo", "greet"];
+        let msg = format_unknown_tool("ech", &names, &*dsl_kit::noop_handle());
+        assert_eq!(msg, "unknown tool \"ech\"");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_with_fuzzy_suggests_closest() {
+        use dsl_kit_fuzzy::FuzzySuggester;
+        let names = ["echo", "greet"];
+        let suggester = FuzzySuggester::default();
+        let msg = format_unknown_tool("ech", &names, &suggester);
+        assert!(
+            msg.contains("did you mean") && msg.contains("echo"),
+            "expected `echo` in the hint, got: {msg}"
+        );
     }
 
     #[tokio::test]

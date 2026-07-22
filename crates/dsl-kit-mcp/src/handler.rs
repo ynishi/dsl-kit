@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use dsl_kit::{BreakCondition, BreakpointId, BreakpointSet, NodeId, Path};
+use dsl_kit::{BreakCondition, BreakpointId, BreakpointSet, NodeId, Path, SuggesterHandle, noop_handle};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -152,6 +152,7 @@ pub struct DslMcpHandler {
     tool_router: ToolRouter<Self>,
     state: Arc<Mutex<HandlerState>>,
     expose_kit_resources: bool,
+    suggester: SuggesterHandle,
 }
 
 impl DslMcpHandler {
@@ -171,7 +172,24 @@ impl DslMcpHandler {
                 breakpoints: BreakpointSet::new(),
             })),
             expose_kit_resources: true,
+            suggester: noop_handle(),
         }
+    }
+
+    /// Injects a fuzzy-match [`Suggester`](dsl_kit::Suggester) used to
+    /// enrich this handler's `unknown-*` diagnostics with
+    /// `did you mean X?` hints. Applies to `dsl_kit_step` (unknown
+    /// `mode`) and `dsl_kit_explain` (unknown diagnostic `code`); the
+    /// tool-name dispatcher lives on [`crate::DslMcpServer`] and takes
+    /// its own suggester.
+    ///
+    /// The default is a no-op suggester, so the crate does not pull in
+    /// any similarity algorithm on its own. Pass
+    /// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` at the
+    /// composition root to enable Jaro-Winkler hints.
+    pub fn with_suggester(mut self, suggester: SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
     }
 
     /// Suppresses the built-in `dsl-kit://kit/*` resources.
@@ -353,9 +371,7 @@ impl DslMcpHandler {
             "to_yield" => host.step_to_yield(breakpoints).await,
             "to_done" => host.step_to_done(breakpoints).await,
             other => {
-                return Err(format!(
-                    "unknown mode {other:?}; use \"one\", \"to_yield\", or \"to_done\""
-                ));
+                return Err(format_unknown_mode(other, &*self.suggester));
             }
         }?;
 
@@ -439,9 +455,7 @@ impl DslMcpHandler {
                 Some(entry) => Ok(json!({ "code": entry.code, "help": entry.help }).to_string()),
                 None => {
                     let known: Vec<&str> = entries.iter().map(|e| e.code.as_str()).collect();
-                    Err(format!(
-                        "unknown error code {code:?}. Known codes: {known:?}"
-                    ))
+                    Err(format_unknown_error_code(&code, &known, &*self.suggester))
                 }
             },
         }
@@ -707,5 +721,89 @@ fn describe_condition(cond: &BreakCondition) -> Value {
         BreakCondition::Not(inner) => json!({ "kind": "not", "child": describe_condition(inner) }),
         BreakCondition::Always => json!({ "kind": "always" }),
         BreakCondition::Never => json!({ "kind": "never" }),
+    }
+}
+
+/// Shared formatter for the `dsl_kit_step` unknown-`mode` error
+/// message. Preserves the historical explicit-list wording (`use
+/// "one", "to_yield", or "to_done"`) as a base, and appends a
+/// `did you mean` hint when the injected suggester returns one.
+pub(crate) fn format_unknown_mode(query: &str, suggester: &dyn dsl_kit::Suggester) -> String {
+    const VALID_MODES: &[&str] = &["one", "to_yield", "to_done"];
+    let base = format!(
+        "unknown mode {query:?}; use \"one\", \"to_yield\", or \"to_done\""
+    );
+    match suggester.enrich_unknown(query, VALID_MODES) {
+        Some(hint) => format!("{base} ({hint})"),
+        None => base,
+    }
+}
+
+/// Shared formatter for the `dsl_kit_explain` unknown-code error
+/// message. When the suggester surfaces at least one candidate the
+/// message uses the compact `did you mean` form; otherwise it falls
+/// back to dumping the full known-code list so callers running
+/// without an injected suggester keep the historical debugging
+/// affordance.
+pub(crate) fn format_unknown_error_code(
+    query: &str,
+    known: &[&str],
+    suggester: &dyn dsl_kit::Suggester,
+) -> String {
+    match suggester.enrich_unknown(query, known) {
+        Some(hint) => format!("unknown error code {query:?} ({hint})"),
+        None => format!("unknown error code {query:?}. Known codes: {known:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsl_kit::noop_handle;
+    use dsl_kit_fuzzy::FuzzySuggester;
+
+    #[test]
+    fn unknown_mode_defaults_to_noop_message() {
+        // No suggester injected: keep the historical explicit-list wording.
+        let msg = format_unknown_mode("oe", &*noop_handle());
+        assert_eq!(
+            msg,
+            "unknown mode \"oe\"; use \"one\", \"to_yield\", or \"to_done\""
+        );
+    }
+
+    #[test]
+    fn unknown_mode_with_fuzzy_suggests_closest() {
+        let suggester = FuzzySuggester::default();
+        let msg = format_unknown_mode("onee", &suggester);
+        assert!(
+            msg.contains("did you mean") && msg.contains("one"),
+            "expected `one` in the hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_error_code_defaults_to_full_dump() {
+        // Fallback path preserves the full-known-list dump so callers
+        // running without an injected suggester keep the debugging
+        // affordance.
+        let known = ["dsl_kit::exec::halt", "dsl_kit::exec::bind"];
+        let msg = format_unknown_error_code("dsl_kit::exec::hault", &known, &*noop_handle());
+        assert!(msg.contains("Known codes:"), "expected fallback dump, got: {msg}");
+    }
+
+    #[test]
+    fn unknown_error_code_with_fuzzy_uses_compact_hint() {
+        let known = ["dsl_kit::exec::halt", "dsl_kit::exec::bind"];
+        let suggester = FuzzySuggester::default();
+        let msg = format_unknown_error_code("dsl_kit::exec::hault", &known, &suggester);
+        assert!(
+            msg.contains("did you mean") && msg.contains("dsl_kit::exec::halt"),
+            "expected compact hint, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Known codes:"),
+            "compact hint should skip the fallback dump, got: {msg}"
+        );
     }
 }
