@@ -212,13 +212,19 @@ fn build_tree(
             // but a client may have typoed a variant slot). We only
             // have UNKNOWN_FIELD to describe "top-level key unknown"
             // in this dialect; that reads correctly here.
-            diags.push(Diagnostic::error(
-                codes::UNKNOWN_FIELD,
-                format!(
+            let all_slots = crate::all_slot_names(variant);
+            let hint = suggester.enrich_unknown(key, &all_slots);
+            let msg = match hint {
+                Some(h) => format!(
+                    "unknown key `{}` on variant `{}` (not a declared field or child slot; {})",
+                    key, variant.name, h
+                ),
+                None => format!(
                     "unknown key `{}` on variant `{}` (not a declared field or child slot)",
                     key, variant.name
                 ),
-            ));
+            };
+            diags.push(Diagnostic::error(codes::UNKNOWN_FIELD, msg));
         }
     }
 
@@ -439,6 +445,25 @@ mod tests {
         assert_eq!(err.diagnostics.len(), 1);
         assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_VARIANT);
         assert!(err.diagnostics[0].message.contains("Add"));
+    }
+
+    #[test]
+    fn unknown_key_suggests_declared_slot() {
+        // The serde-bridge front-end mirrors the check_conformance
+        // pair-hint: a typo of a declared field name gets `did you
+        // mean` on its UNKNOWN_FIELD diagnostic.
+        let value = json!({ "type": "Lit", "vlue": 1 });
+        let err = from_json_value(&value, &schema()).unwrap_err();
+        let d = err
+            .diagnostics
+            .iter()
+            .find(|d| d.code == codes::UNKNOWN_FIELD)
+            .expect("expected UNKNOWN_FIELD");
+        assert!(
+            d.message.contains("did you mean") && d.message.contains("value"),
+            "expected `value` in the hint, got: {}",
+            d.message
+        );
     }
 
     #[test]

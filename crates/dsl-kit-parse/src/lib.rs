@@ -441,8 +441,8 @@ pub fn check_conformance_with(
         return out;
     };
 
-    check_fields(tree, variant, &mut out);
-    check_children(tree, variant, &mut out);
+    check_fields(tree, variant, &mut out, suggester);
+    check_children(tree, variant, &mut out, suggester);
     out
 }
 
@@ -462,7 +462,49 @@ pub(crate) fn format_unknown_variant(
     }
 }
 
-fn check_fields(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnostic>) {
+/// Shared formatter for `UNKNOWN_FIELD` and `UNKNOWN_CHILD` messages.
+///
+/// `kind` is `"field"` or `"child slot"`. `all_candidates` should
+/// include both declared field names and declared child slot names so
+/// a `did you mean` hint can point at either. `missing_candidates`
+/// carries the slot names that are declared but currently absent from
+/// the tree; suggestions that appear in this set are marked
+/// `(missing)` — the "pair hint" that makes payloads like
+/// `taget` → `target` (missing) diagnose themselves at a glance.
+pub(crate) fn format_unknown_slot(
+    kind: &str,
+    query: &str,
+    variant_name: &str,
+    all_candidates: &[&str],
+    missing_candidates: &[&str],
+    suggester: &dyn Suggester,
+) -> String {
+    let base = format!("unknown {kind} `{query}` on variant `{variant_name}`");
+    let sugs = suggester.suggest(query, all_candidates);
+    if sugs.is_empty() {
+        return base;
+    }
+    let joined = sugs
+        .iter()
+        .take(3)
+        .map(|s| {
+            if missing_candidates.contains(&s.candidate) {
+                format!("`{}` (missing)", s.candidate)
+            } else {
+                format!("`{}`", s.candidate)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{base} (did you mean: {joined})")
+}
+
+fn check_fields(
+    tree: &ParseTree,
+    variant: &VariantSchema,
+    out: &mut Vec<Diagnostic>,
+    suggester: &dyn Suggester,
+) {
     // Duplicate field names.
     for i in 0..tree.fields.len() {
         let (name, _) = &tree.fields[i];
@@ -496,6 +538,12 @@ fn check_fields(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnos
         }
     }
 
+    // Precompute the "missing-so-far" set once: slot names that are
+    // declared but currently absent from `tree`. Used as the pair-hint
+    // marker on UNKNOWN_FIELD suggestions.
+    let missing = missing_slot_names(tree, variant);
+    let all_slots = all_slot_names(variant);
+
     // Unknown fields.
     for (name, _) in &tree.fields {
         if variant.fields.iter().any(|f| &f.name == name) {
@@ -515,18 +563,25 @@ fn check_fields(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnos
                 .with_span(tree.span),
             );
         } else {
-            out.push(
-                Diagnostic::error(
-                    codes::UNKNOWN_FIELD,
-                    format!("unknown field `{}` on variant `{}`", name, variant.name),
-                )
-                .with_span(tree.span),
+            let msg = format_unknown_slot(
+                "field",
+                name,
+                &variant.name,
+                &all_slots,
+                &missing,
+                suggester,
             );
+            out.push(Diagnostic::error(codes::UNKNOWN_FIELD, msg).with_span(tree.span));
         }
     }
 }
 
-fn check_children(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnostic>) {
+fn check_children(
+    tree: &ParseTree,
+    variant: &VariantSchema,
+    out: &mut Vec<Diagnostic>,
+    suggester: &dyn Suggester,
+) {
     // Duplicate child slot names.
     for i in 0..tree.children.len() {
         let (name, _) = &tree.children[i];
@@ -573,6 +628,11 @@ fn check_children(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagn
         }
     }
 
+    // Same pair-hint precomputation as check_fields, sharing the
+    // "declared but currently absent" set across both diagnostics.
+    let missing = missing_slot_names(tree, variant);
+    let all_slots = all_slot_names(variant);
+
     // Unknown child slots.
     for (name, _) in &tree.children {
         if variant.children.iter().any(|c| &c.name == name) {
@@ -591,18 +651,55 @@ fn check_children(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagn
                 .with_span(tree.span),
             );
         } else {
-            out.push(
-                Diagnostic::error(
-                    codes::UNKNOWN_CHILD,
-                    format!(
-                        "unknown child slot `{}` on variant `{}`",
-                        name, variant.name
-                    ),
-                )
-                .with_span(tree.span),
+            let msg = format_unknown_slot(
+                "child slot",
+                name,
+                &variant.name,
+                &all_slots,
+                &missing,
+                suggester,
             );
+            out.push(Diagnostic::error(codes::UNKNOWN_CHILD, msg).with_span(tree.span));
         }
     }
+}
+
+/// Names of every declared payload field and child slot on
+/// `variant`, in that order. Used as the `all_candidates` slice for
+/// [`format_unknown_slot`].
+pub(crate) fn all_slot_names(variant: &VariantSchema) -> Vec<&str> {
+    variant
+        .fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .chain(variant.children.iter().map(|c| c.name.as_str()))
+        .collect()
+}
+
+/// Names of declared slots that are **not** currently present on
+/// `tree`. Includes fields with no matching entry in `tree.fields`
+/// and children whose slot has zero occurrences on the tree. Feeds
+/// [`format_unknown_slot`]'s `(missing)` pair-hint marker.
+pub(crate) fn missing_slot_names<'a>(
+    tree: &ParseTree,
+    variant: &'a VariantSchema,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for f in &variant.fields {
+        if tree.field(&f.name).is_none() {
+            out.push(f.name.as_str());
+        }
+    }
+    for c in &variant.children {
+        let count = tree
+            .child_slot(&c.name)
+            .map(<[ParseTree]>::len)
+            .unwrap_or(0);
+        if count == 0 {
+            out.push(c.name.as_str());
+        }
+    }
+    out
 }
 
 fn diag_arity(
@@ -949,6 +1046,78 @@ mod tests {
             diags[0].message.contains("did you mean") && diags[0].message.contains("Add"),
             "expected FuzzySuggester to surface `Add`; got: {}",
             diags[0].message
+        );
+    }
+
+    #[test]
+    fn unknown_field_suggests_declared_field() {
+        // The design's canonical example: `taget` should surface `target`
+        // as a `did you mean` hint on the UNKNOWN_FIELD diagnostic.
+        let schema = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![VariantSchema {
+                name: "Load".into(),
+                fields: vec![
+                    FieldSchema {
+                        name: "target".into(),
+                        ty: "String".into(),
+                    },
+                    FieldSchema {
+                        name: "count".into(),
+                        ty: "u32".into(),
+                    },
+                ],
+                children: vec![],
+            }],
+        };
+        let mut tree = ParseTree::new("Load");
+        tree.fields
+            .push(("taget".into(), RawValue::Json(json!("a"))));
+        tree.fields
+            .push(("count".into(), RawValue::Json(json!(1))));
+        let diags = check_conformance(&tree, &schema);
+
+        let unknown = diags
+            .iter()
+            .find(|d| d.code == codes::UNKNOWN_FIELD)
+            .expect("expected an UNKNOWN_FIELD diagnostic for `taget`");
+        assert!(
+            unknown.message.contains("did you mean") && unknown.message.contains("target"),
+            "expected `target` in the hint, got: {}",
+            unknown.message
+        );
+        assert!(
+            unknown.message.contains("(missing)"),
+            "expected `(missing)` pair-hint since `target` is a required field \
+             not present on the tree; got: {}",
+            unknown.message
+        );
+    }
+
+    #[test]
+    fn unknown_child_suggests_declared_child() {
+        let schema = schema_add_lit();
+        let mut add = ParseTree::new("Add");
+        // `lsh` is a typo of `lhs`; `rhs` is present so only `lhs`
+        // remains in the missing set.
+        add.children.push(("lsh".into(), vec![lit(1)]));
+        add.children.push(("rhs".into(), vec![lit(2)]));
+        let diags = check_conformance(&add, &schema);
+
+        let unknown = diags
+            .iter()
+            .find(|d| d.code == codes::UNKNOWN_CHILD)
+            .expect("expected an UNKNOWN_CHILD diagnostic for `lsh`");
+        assert!(
+            unknown.message.contains("did you mean") && unknown.message.contains("lhs"),
+            "expected `lhs` in the hint, got: {}",
+            unknown.message
+        );
+        assert!(
+            unknown.message.contains("(missing)"),
+            "expected `(missing)` pair-hint on the `lhs` suggestion since \
+             the `lhs` slot is required but absent; got: {}",
+            unknown.message
         );
     }
 
