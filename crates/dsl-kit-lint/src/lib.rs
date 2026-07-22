@@ -502,8 +502,7 @@ impl<A: Walk + DslSchema> Rule<A> for DeadVariants {
 /// authors decide what a "label" means for their DSL (a payload
 /// field, an annotation, a source-level identifier they store on a
 /// node, …).
-pub type TypoLabelExtractor<A> =
-    Box<dyn Fn(&A) -> Vec<(NodeId, String)> + Send + Sync>;
+pub type TypoLabelExtractor<A> = Box<dyn Fn(&A) -> Vec<(NodeId, String)> + Send + Sync>;
 
 /// Opt-in rule that flags strings that look like a mistyped schema
 /// variant name.
@@ -897,11 +896,7 @@ mod tests {
     /// unify at trait level).
     struct FixedSuggester(&'static str);
     impl dsl_kit_core::Suggester for FixedSuggester {
-        fn suggest<'a>(
-            &self,
-            _q: &str,
-            cands: &'a [&str],
-        ) -> Vec<dsl_kit_core::Suggestion<'a>> {
+        fn suggest<'a>(&self, _q: &str, cands: &'a [&str]) -> Vec<dsl_kit_core::Suggestion<'a>> {
             cands
                 .iter()
                 .find(|c| **c == self.0)

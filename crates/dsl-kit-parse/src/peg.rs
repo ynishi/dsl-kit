@@ -612,11 +612,10 @@ impl<'g, 'i> Interpreter<'g, 'i> {
         let Some(&rule) = self.rules_by_name.get(name) else {
             let candidates: Vec<&str> = self.rules_by_name.keys().copied().collect();
             let base = format!("reference to undefined rule `{name}`");
-            let msg =
-                match crate::BuiltinLevenshteinSuggester.enrich_unknown(name, &candidates) {
-                    Some(hint) => format!("{base} ({hint})"),
-                    None => base,
-                };
+            let msg = match crate::BuiltinLevenshteinSuggester.enrich_unknown(name, &candidates) {
+                Some(hint) => format!("{base} ({hint})"),
+                None => base,
+            };
             self.fatal_error = Some(
                 Diagnostic::error(codes::UNKNOWN_RULE, msg)
                     .with_span(Some(Span::new(self.pos, self.pos))),

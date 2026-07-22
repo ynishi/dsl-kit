@@ -680,10 +680,7 @@ pub(crate) fn all_slot_names(variant: &VariantSchema) -> Vec<&str> {
 /// `tree`. Includes fields with no matching entry in `tree.fields`
 /// and children whose slot has zero occurrences on the tree. Feeds
 /// [`format_unknown_slot`]'s `(missing)` pair-hint marker.
-pub(crate) fn missing_slot_names<'a>(
-    tree: &ParseTree,
-    variant: &'a VariantSchema,
-) -> Vec<&'a str> {
+pub(crate) fn missing_slot_names<'a>(tree: &ParseTree, variant: &'a VariantSchema) -> Vec<&'a str> {
     let mut out = Vec::new();
     for f in &variant.fields {
         if tree.field(&f.name).is_none() {
@@ -1073,8 +1070,7 @@ mod tests {
         let mut tree = ParseTree::new("Load");
         tree.fields
             .push(("taget".into(), RawValue::Json(json!("a"))));
-        tree.fields
-            .push(("count".into(), RawValue::Json(json!(1))));
+        tree.fields.push(("count".into(), RawValue::Json(json!(1))));
         let diags = check_conformance(&tree, &schema);
 
         let unknown = diags

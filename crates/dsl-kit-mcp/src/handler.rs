@@ -28,7 +28,9 @@
 
 use std::sync::Arc;
 
-use dsl_kit::{BreakCondition, BreakpointId, BreakpointSet, NodeId, Path, SuggesterHandle, noop_handle};
+use dsl_kit::{
+    BreakCondition, BreakpointId, BreakpointSet, NodeId, Path, SuggesterHandle, noop_handle,
+};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -730,9 +732,7 @@ fn describe_condition(cond: &BreakCondition) -> Value {
 /// `did you mean` hint when the injected suggester returns one.
 pub(crate) fn format_unknown_mode(query: &str, suggester: &dyn dsl_kit::Suggester) -> String {
     const VALID_MODES: &[&str] = &["one", "to_yield", "to_done"];
-    let base = format!(
-        "unknown mode {query:?}; use \"one\", \"to_yield\", or \"to_done\""
-    );
+    let base = format!("unknown mode {query:?}; use \"one\", \"to_yield\", or \"to_done\"");
     match suggester.enrich_unknown(query, VALID_MODES) {
         Some(hint) => format!("{base} ({hint})"),
         None => base,
@@ -789,7 +789,10 @@ mod tests {
         // affordance.
         let known = ["dsl_kit::exec::halt", "dsl_kit::exec::bind"];
         let msg = format_unknown_error_code("dsl_kit::exec::hault", &known, &*noop_handle());
-        assert!(msg.contains("Known codes:"), "expected fallback dump, got: {msg}");
+        assert!(
+            msg.contains("Known codes:"),
+            "expected fallback dump, got: {msg}"
+        );
     }
 
     #[test]

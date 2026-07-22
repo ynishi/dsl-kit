@@ -216,9 +216,7 @@ pub fn check_schema_consistency_with(
                         Some(hint) => format!("{base} ({hint})"),
                         None => base,
                     };
-                    out.push(
-                        Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_node(*id),
-                    );
+                    out.push(Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_node(*id));
                 }
             }
         });
