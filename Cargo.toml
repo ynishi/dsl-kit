@@ -6,6 +6,7 @@ members = [
     "crates/dsl-kit-schema",
     "crates/dsl-kit-lint",
     "crates/dsl-kit-parse",
+    "crates/dsl-kit-fuzzy",
     "crates/dsl-kit",
     "crates/dsl-kit-mcp",
     "crates/dsl-kit-cli",
@@ -38,6 +39,7 @@ dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.1.0" }
 dsl-kit-schema = { path = "crates/dsl-kit-schema", version = "0.1.0" }
 dsl-kit-lint   = { path = "crates/dsl-kit-lint",   version = "0.1.0" }
 dsl-kit-parse  = { path = "crates/dsl-kit-parse",  version = "0.1.0" }
+dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy",  version = "0.1.0" }
 dsl-kit        = { path = "crates/dsl-kit",        version = "0.1.0" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.1.0" }
 dsl-kit-cli    = { path = "crates/dsl-kit-cli",    version = "0.1.0" }

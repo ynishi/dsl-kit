@@ -1,0 +1,19 @@
+[package]
+name = "dsl-kit-fuzzy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Fuzzy-match Suggester implementation for dsl-kit (Jaro-Winkler / Levenshtein / Damerau-Levenshtein)."
+
+[dependencies]
+dsl-kit-core = { workspace = true }
+strsim       = "0.11"
+
+[dev-dependencies]

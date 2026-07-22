@@ -329,6 +329,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl-kit-fuzzy"
+version = "0.1.0"
+dependencies = [
+ "dsl-kit-core",
+ "strsim",
+]
+
+[[package]]
 name = "dsl-kit-lint"
 version = "0.1.0"
 dependencies = [
