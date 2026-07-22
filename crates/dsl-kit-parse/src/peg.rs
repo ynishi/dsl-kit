@@ -73,7 +73,7 @@
 #![allow(clippy::result_unit_err)]
 
 use crate::{BuildError, Diagnostic, ParseTree, RawValue, Span};
-use dsl_kit_core::NodeId;
+use dsl_kit_core::{NodeId, Suggester};
 use dsl_kit_macros::{DslNode as DslNodeDerive, DslSchema as DslSchemaDerive};
 use std::collections::{BTreeSet, HashMap};
 
@@ -208,10 +208,15 @@ impl Grammar {
             .get(self.start.as_str())
             .copied()
             .ok_or_else(|| {
-                BuildError::single(Diagnostic::error(
-                    codes::UNKNOWN_RULE,
-                    format!("start rule `{}` is not defined in the grammar", self.start),
-                ))
+                let names: Vec<&str> = rules_by_name.keys().copied().collect();
+                let base = format!("start rule `{}` is not defined in the grammar", self.start);
+                let msg = match crate::BuiltinLevenshteinSuggester
+                    .enrich_unknown(self.start.as_str(), &names)
+                {
+                    Some(hint) => format!("{base} ({hint})"),
+                    None => base,
+                };
+                BuildError::single(Diagnostic::error(codes::UNKNOWN_RULE, msg))
             })?;
 
         let mut interp = Interpreter::new(input, rules_by_name);
@@ -605,12 +610,16 @@ impl<'g, 'i> Interpreter<'g, 'i> {
 
     fn run_rule_ref(&mut self, name: &str) -> Result<(), ()> {
         let Some(&rule) = self.rules_by_name.get(name) else {
+            let candidates: Vec<&str> = self.rules_by_name.keys().copied().collect();
+            let base = format!("reference to undefined rule `{name}`");
+            let msg =
+                match crate::BuiltinLevenshteinSuggester.enrich_unknown(name, &candidates) {
+                    Some(hint) => format!("{base} ({hint})"),
+                    None => base,
+                };
             self.fatal_error = Some(
-                Diagnostic::error(
-                    codes::UNKNOWN_RULE,
-                    format!("reference to undefined rule `{name}`"),
-                )
-                .with_span(Some(Span::new(self.pos, self.pos))),
+                Diagnostic::error(codes::UNKNOWN_RULE, msg)
+                    .with_span(Some(Span::new(self.pos, self.pos))),
             );
             return Err(());
         };
@@ -1205,12 +1214,45 @@ mod tests {
     }
 
     #[test]
+    fn unknown_rule_ref_suggests_declared_rule() {
+        // A typo of a declared rule name should surface the correct
+        // name via the built-in Levenshtein suggester.
+        let ids = IdGen::new();
+        let start = rule(&ids, "start", rule_ref(&ids, "helo"));
+        let target = rule(&ids, "hello", token(&ids, "hi"));
+        let g = Grammar::new(vec![start, target], "start");
+        let err = g.parse("hi").unwrap_err();
+        assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_RULE);
+        assert!(
+            err.diagnostics[0].message.contains("did you mean")
+                && err.diagnostics[0].message.contains("hello"),
+            "expected hint, got: {}",
+            err.diagnostics[0].message
+        );
+    }
+
+    #[test]
     fn unknown_start_rule_is_diagnosed() {
         let ids = IdGen::new();
         let r = rule(&ids, "other", token(&ids, "x"));
         let g = Grammar::new(vec![r], "start");
         let err = g.parse("x").unwrap_err();
         assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_RULE);
+    }
+
+    #[test]
+    fn unknown_start_rule_suggests_declared_rule() {
+        let ids = IdGen::new();
+        let r = rule(&ids, "start", token(&ids, "x"));
+        let g = Grammar::new(vec![r], "strat");
+        let err = g.parse("x").unwrap_err();
+        assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_RULE);
+        assert!(
+            err.diagnostics[0].message.contains("did you mean")
+                && err.diagnostics[0].message.contains("start"),
+            "expected hint, got: {}",
+            err.diagnostics[0].message
+        );
     }
 
     #[test]

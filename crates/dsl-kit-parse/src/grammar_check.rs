@@ -44,7 +44,7 @@
 
 use crate::peg::{Grammar, Peg, codes as peg_codes};
 use crate::{Diagnostic, Location, Severity};
-use dsl_kit_core::NodeId;
+use dsl_kit_core::{NodeId, Suggester};
 use dsl_kit_schema::NodeSchema;
 use std::collections::{HashMap, HashSet};
 
@@ -182,7 +182,24 @@ pub fn check_nullable_repeat(g: &Grammar) -> Vec<Diagnostic> {
 /// Schema variants that no grammar node produces are `Warning`-severity
 /// reachability hints; hand-built values may legitimately fill the gap.
 pub fn check_schema_consistency(g: &Grammar, schema: &NodeSchema) -> Vec<Diagnostic> {
+    check_schema_consistency_with(g, schema, &crate::BuiltinLevenshteinSuggester)
+}
+
+/// Variant of [`check_schema_consistency`] that routes
+/// `did you mean X?` hints through a caller-supplied [`Suggester`].
+///
+/// The free function [`check_schema_consistency`] delegates here with
+/// the crate's built-in Levenshtein backend, so existing callers see
+/// no behavioural change. Reach for this variant to plug in a
+/// different similarity algorithm (e.g. `dsl-kit-fuzzy`'s
+/// `FuzzySuggester`) at a specific call site.
+pub fn check_schema_consistency_with(
+    g: &Grammar,
+    schema: &NodeSchema,
+    suggester: &dyn Suggester,
+) -> Vec<Diagnostic> {
     let declared: HashSet<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
+    let declared_names: Vec<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
     let mut referenced: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for r in &g.rules {
@@ -190,16 +207,17 @@ pub fn check_schema_consistency(g: &Grammar, schema: &NodeSchema) -> Vec<Diagnos
             if let Peg::Node { id, variant, .. } = p {
                 referenced.insert(variant.clone());
                 if !declared.contains(variant.as_str()) {
+                    let base = format!(
+                        "grammar produces variant `{variant}` which is \
+                         not declared in schema `{}`",
+                        schema.name
+                    );
+                    let msg = match suggester.enrich_unknown(variant, &declared_names) {
+                        Some(hint) => format!("{base} ({hint})"),
+                        None => base,
+                    };
                     out.push(
-                        Diagnostic::error(
-                            codes::UNKNOWN_VARIANT,
-                            format!(
-                                "grammar produces variant `{variant}` which is \
-                                 not declared in schema `{}`",
-                                schema.name
-                            ),
-                        )
-                        .with_node(*id),
+                        Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_node(*id),
                     );
                 }
             }
@@ -668,6 +686,26 @@ mod tests {
         assert_eq!(errs.len(), 1, "diags = {diags:?}");
         assert!(errs[0].message.contains("`Xyz`"));
         assert!(errs[0].message.contains("`Expr`"));
+    }
+
+    #[test]
+    fn unknown_grammar_variant_suggests_declared_variant() {
+        // A typo of a declared schema variant should surface the
+        // correct name via the crate's built-in Levenshtein
+        // suggester.
+        let ids = IdGen::new();
+        let r = rule(&ids, "s", node(&ids, "Aad", token(&ids, "a")));
+        let g = Grammar::new(vec![r], "s");
+        let diags = check_schema_consistency(&g, &schema_expr());
+        let err = diags
+            .iter()
+            .find(|d| d.code == codes::UNKNOWN_VARIANT)
+            .expect("expected UNKNOWN_VARIANT");
+        assert!(
+            err.message.contains("did you mean") && err.message.contains("Add"),
+            "expected `Add` in the hint, got: {}",
+            err.message
+        );
     }
 
     #[test]
