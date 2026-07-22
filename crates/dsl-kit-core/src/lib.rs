@@ -531,7 +531,7 @@ pub enum EngineError {
 
     /// A `ParFrame` referenced a `ReducerId` that is not registered in
     /// the active [`ReducerRegistry`].
-    #[error("unknown reducer {id:?}")]
+    #[error("unknown reducer {id:?}{hint}")]
     #[diagnostic(
         code(dsl_kit::reducer::unknown),
         help(
@@ -541,11 +541,17 @@ pub enum EngineError {
     UnknownReducer {
         /// The unknown reducer id.
         id: ReducerId,
+        /// Optional `did you mean` hint produced by the registry's
+        /// injected [`Suggester`]. Empty when no suggester is wired
+        /// or no candidate scored above threshold, so the historical
+        /// `unknown reducer "X"` wording is preserved as the base
+        /// case.
+        hint: String,
     },
 
     /// An `Apply` node referenced an [`OpId`] that is not registered in
     /// the active [`OpRegistry`].
-    #[error("unknown op {id:?}")]
+    #[error("unknown op {id:?}{hint}")]
     #[diagnostic(
         code(dsl_kit::op::unknown),
         help(
@@ -555,6 +561,10 @@ pub enum EngineError {
     UnknownOp {
         /// The unknown op id.
         id: OpId,
+        /// Optional `did you mean` hint produced by the registry's
+        /// injected [`Suggester`]. Same semantics as
+        /// [`Self::UnknownReducer::hint`].
+        hint: String,
     },
 }
 
@@ -601,9 +611,11 @@ pub fn engine_error_catalog() -> Vec<ErrorCatalogEntry> {
         },
         EngineError::UnknownReducer {
             id: ReducerId(String::new()),
+            hint: String::new(),
         },
         EngineError::UnknownOp {
             id: OpId(String::new()),
+            hint: String::new(),
         },
     ];
 
@@ -914,6 +926,7 @@ impl<V, D, EE> Clone for ReducerHandle<V, D, EE> {
 pub struct ReducerRegistry<V, D, EffectError> {
     fail_fast: HashMap<ReducerId, Arc<dyn Reducer<V, D>>>,
     collect_all: HashMap<ReducerId, Arc<dyn ReducerCollectAll<V, D, EffectError>>>,
+    suggester: crate::suggest::SuggesterHandle,
 }
 
 impl<V, D, EE> Default for ReducerRegistry<V, D, EE> {
@@ -928,7 +941,22 @@ impl<V, D, EE> ReducerRegistry<V, D, EE> {
         Self {
             fail_fast: HashMap::new(),
             collect_all: HashMap::new(),
+            suggester: crate::suggest::noop_handle(),
         }
+    }
+
+    /// Injects a fuzzy-match [`Suggester`](crate::Suggester) used to
+    /// enrich [`EngineError::UnknownReducer`] with a `did you mean X?`
+    /// hint at [`Self::resolve`] time.
+    ///
+    /// The default is a no-op suggester, so the crate stays free of a
+    /// similarity algorithm on its own. Pass
+    /// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` (or any
+    /// other [`Suggester`](crate::Suggester) impl) at the composition
+    /// root to enable hints.
+    pub fn with_suggester(mut self, suggester: crate::suggest::SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
     }
 
     /// Registers a FailFast-typed reducer under `id`.
@@ -959,19 +987,37 @@ impl<V, D, EE> ReducerRegistry<V, D, EE> {
         id: &ReducerId,
         fail: FailPolicy,
     ) -> Result<ReducerHandle<V, D, EE>, EngineError> {
+        let miss = || {
+            // Candidates are drawn from the branch the caller asked
+            // for so the hint never suggests an id that would still
+            // miss under the same `fail` policy.
+            let names: Vec<&str> = match fail {
+                FailPolicy::FailFast => self.fail_fast.keys().map(|k| k.0.as_str()).collect(),
+                FailPolicy::CollectAll => self.collect_all.keys().map(|k| k.0.as_str()).collect(),
+            };
+            let hint = self
+                .suggester
+                .enrich_unknown(&id.0, &names)
+                .map(|h| format!(" ({h})"))
+                .unwrap_or_default();
+            EngineError::UnknownReducer {
+                id: id.clone(),
+                hint,
+            }
+        };
         match fail {
             FailPolicy::FailFast => self
                 .fail_fast
                 .get(id)
                 .cloned()
                 .map(ReducerHandle::FailFast)
-                .ok_or_else(|| EngineError::UnknownReducer { id: id.clone() }),
+                .ok_or_else(miss),
             FailPolicy::CollectAll => self
                 .collect_all
                 .get(id)
                 .cloned()
                 .map(ReducerHandle::CollectAll)
-                .ok_or_else(|| EngineError::UnknownReducer { id: id.clone() }),
+                .ok_or_else(miss),
         }
     }
 }
@@ -1032,6 +1078,7 @@ pub type OpHandle<V> = Arc<dyn Op<V>>;
 /// [`Engine::new_with_ops`]: crate::Engine::new_with_ops
 pub struct OpRegistry<V> {
     ops: HashMap<OpId, OpHandle<V>>,
+    suggester: crate::suggest::SuggesterHandle,
 }
 
 impl<V> Default for OpRegistry<V> {
@@ -1045,7 +1092,21 @@ impl<V> OpRegistry<V> {
     pub fn new() -> Self {
         Self {
             ops: HashMap::new(),
+            suggester: crate::suggest::noop_handle(),
         }
+    }
+
+    /// Injects a fuzzy-match [`Suggester`](crate::Suggester) used to
+    /// enrich [`EngineError::UnknownOp`] with a `did you mean X?`
+    /// hint at [`Self::resolve`] time.
+    ///
+    /// The default is a no-op suggester, so the crate stays free of a
+    /// similarity algorithm on its own. Pass
+    /// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` at the
+    /// composition root to enable hints.
+    pub fn with_suggester(mut self, suggester: crate::suggest::SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
     }
 
     /// Registers an op under `id`.
@@ -1056,10 +1117,18 @@ impl<V> OpRegistry<V> {
     /// Resolves the op for an `Apply` frame at spawn / validation time.
     /// Returns [`EngineError::UnknownOp`] on miss.
     pub fn resolve(&self, id: &OpId) -> Result<OpHandle<V>, EngineError> {
-        self.ops
-            .get(id)
-            .cloned()
-            .ok_or_else(|| EngineError::UnknownOp { id: id.clone() })
+        self.ops.get(id).cloned().ok_or_else(|| {
+            let names: Vec<&str> = self.ops.keys().map(|k| k.0.as_str()).collect();
+            let hint = self
+                .suggester
+                .enrich_unknown(&id.0, &names)
+                .map(|h| format!(" ({h})"))
+                .unwrap_or_default();
+            EngineError::UnknownOp {
+                id: id.clone(),
+                hint,
+            }
+        })
     }
 }
 
@@ -1678,5 +1747,122 @@ mod tests {
 
         let miss = reg.resolve(&"nope".into(), FailPolicy::FailFast);
         assert!(matches!(miss, Err(EngineError::UnknownReducer { .. })));
+    }
+
+    /// Fixed-output suggester used to prove the with_suggester wiring
+    /// without depending on `dsl-kit-fuzzy` — a real dev-dep on that
+    /// crate would create a cycle since fuzzy already depends on
+    /// dsl-kit-core, and cargo cannot unify the `Suggester` trait
+    /// across the two versions of core that would result.
+    struct FixedSuggester(&'static str);
+    impl Suggester for FixedSuggester {
+        fn suggest<'a>(&self, _q: &str, cands: &'a [&str]) -> Vec<Suggestion<'a>> {
+            cands
+                .iter()
+                .find(|c| **c == self.0)
+                .map(|c| Suggestion {
+                    candidate: c,
+                    score: 1.0,
+                })
+                .into_iter()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn unknown_reducer_defaults_to_no_hint() {
+        // Without an injected suggester the historical `unknown
+        // reducer "X"` wording is preserved verbatim.
+        struct Noop;
+        impl Reducer<i64, ()> for Noop {
+            fn reduce(
+                &self,
+                _s: &[Option<i64>],
+                _d: &[Option<()>],
+                _w: &[ChildIndex],
+            ) -> Result<(i64, ()), EngineError> {
+                Ok((0, ()))
+            }
+        }
+        let mut reg: ReducerRegistry<i64, (), std::io::Error> = ReducerRegistry::new();
+        reg.register_fail_fast("first", Arc::new(Noop));
+        let miss = reg.resolve(&"frst".into(), FailPolicy::FailFast);
+        let err = match miss {
+            Err(e) => e,
+            Ok(_) => panic!("expected miss"),
+        };
+        // Base wording matches the historical `{id:?}` Debug shape;
+        // the trailing `hint` is empty so no parenthesised clause
+        // appears.
+        assert_eq!(err.to_string(), "unknown reducer ReducerId(\"frst\")");
+    }
+
+    #[test]
+    fn unknown_reducer_with_suggester_appends_hint() {
+        struct Noop;
+        impl Reducer<i64, ()> for Noop {
+            fn reduce(
+                &self,
+                _s: &[Option<i64>],
+                _d: &[Option<()>],
+                _w: &[ChildIndex],
+            ) -> Result<(i64, ()), EngineError> {
+                Ok((0, ()))
+            }
+        }
+        let mut reg: ReducerRegistry<i64, (), std::io::Error> = ReducerRegistry::new();
+        reg.register_fail_fast("first", Arc::new(Noop));
+        let reg = reg.with_suggester(Arc::new(FixedSuggester("first")));
+        let miss = reg.resolve(&"frst".into(), FailPolicy::FailFast);
+        let err = match miss {
+            Err(e) => e,
+            Ok(_) => panic!("expected miss"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did you mean") && msg.contains("first"),
+            "expected hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_op_defaults_to_no_hint() {
+        struct AddOp;
+        impl Op<i64> for AddOp {
+            fn apply(&self, _n: NodeId, args: &[i64]) -> Result<i64, EngineError> {
+                Ok(args.iter().sum())
+            }
+        }
+        let mut reg: OpRegistry<i64> = OpRegistry::new();
+        reg.register("add", Arc::new(AddOp));
+        let miss = reg.resolve(&"ad".into());
+        let err = match miss {
+            Err(e) => e,
+            Ok(_) => panic!("expected miss"),
+        };
+        assert_eq!(err.to_string(), "unknown op OpId(\"ad\")");
+    }
+
+    #[test]
+    fn unknown_op_with_suggester_appends_hint() {
+        struct AddOp;
+        impl Op<i64> for AddOp {
+            fn apply(&self, _n: NodeId, args: &[i64]) -> Result<i64, EngineError> {
+                Ok(args.iter().sum())
+            }
+        }
+        let mut reg: OpRegistry<i64> = OpRegistry::new();
+        reg.register("add", Arc::new(AddOp));
+        let reg = reg.with_suggester(Arc::new(FixedSuggester("add")));
+        let miss = reg.resolve(&"ad".into());
+        let err = match miss {
+            Err(e) => e,
+            Ok(_) => panic!("expected miss"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did you mean") && msg.contains("add"),
+            "expected hint, got: {msg}"
+        );
     }
 }
