@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.0] - 2026-07-22
+
+Fuzzy-match `did you mean X?` hints wired through every `unknown-*`
+diagnostic in the kit, plus a new plugin crate that ships the
+similarity algorithm.
+
+- `dsl-kit-fuzzy` — new leaf crate. `FuzzySuggester` implements the
+  core `Suggester` trait via `strsim ^0.11` with Jaro-Winkler default,
+  Levenshtein / Damerau-Levenshtein switchable, `threshold` 0.7, and
+  `max_results` 3. Depends on `dsl-kit-core` only; other kit crates
+  never depend on it, so pulling in a similarity algorithm stays
+  opt-in at the composition root.
+- `dsl-kit-core` — new `suggest` module owns the shared contract:
+  `Suggester` trait (`suggest` + `enrich_unknown` default formatter),
+  `NoopSuggester` zero-cost default, `Suggestion { candidate, score }`,
+  `SuggesterHandle = Arc<dyn Suggester>`, and a `noop_handle()`
+  constructor. The trait is `&[&str]`-only so plugins do not need to
+  depend on `NodeSchema` / `OpRegistry` / any downstream type.
+- `dsl-kit-core` — `OpRegistry` and `ReducerRegistry` gain
+  `with_suggester(SuggesterHandle) -> Self`. `EngineError::UnknownOp`
+  and `EngineError::UnknownReducer` grow a `hint: String` field:
+  empty by default preserves the historical `unknown op OpId(...)` /
+  `unknown reducer ReducerId(...)` wording, populated by
+  `resolve()` when a suggester is injected. `matches!` patterns keep
+  working; explicit `EngineError::UnknownOp { id }` constructors need
+  to add `hint: String::new()`.
+- `dsl-kit-parse` — every `unknown-*` diagnostic now routes through
+  the trait. `check_conformance` / `from_json_value` / `from_json_str`
+  keep their signatures and use an internal `BuiltinLevenshteinSuggester`
+  (case-insensitive Levenshtein, the same algorithm the crate has
+  always shipped); new `check_conformance_with` / `from_json_value_with`
+  / `from_json_str_with` variants accept a `&dyn Suggester` for
+  injection. `check_schema_consistency_with` is the same idea on the
+  grammar-check side. `UNKNOWN_FIELD` / `UNKNOWN_CHILD` also mark a
+  suggested candidate `(missing)` when that slot is declared but
+  currently absent — the pair-hint the design brief calls for on
+  typo pairs like `taget` -> `target`. PEG's undefined-rule /
+  unresolved-start-rule diagnostics get the same enrichment.
+- `dsl-kit-mcp` — `DslMcpHandler` and `DslMcpBuilder` (flowed into
+  `DslMcpServer`) gain `with_suggester(SuggesterHandle) -> Self`.
+  `dsl_kit_step` unknown `mode`, `dsl_kit_explain` unknown `code`
+  (which now uses the compact `did you mean` form when the suggester
+  fires, falling back to the full `Known codes:` dump otherwise), and
+  `DslMcpServer::call_tool` unknown tool name all carry hints. Default
+  is `noop_handle()`, so the crate does not pull in a similarity
+  algorithm on its own.
+- `dsl-kit-lint` — new opt-in `TypoHint` rule. Takes a caller-supplied
+  extractor closure `Fn(&A) -> Vec<(NodeId, String)>` that decides
+  what "labels" mean for the DSL; `with_suggester(SuggesterHandle)`
+  wires in the plugin. Reports `Severity::Info` diagnostics named
+  `"typo-hint"` for every extracted label that is a near-miss but
+  not an exact schema variant name. Not registered by
+  `Linter::with_defaults` — same policy as `DeadVariants`.
+
 ## [0.1.0] - 2026-07-22
 
 Initial release.

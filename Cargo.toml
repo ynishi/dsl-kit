@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
@@ -34,16 +34,16 @@ categories = ["parser-implementations", "development-tools"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-dsl-kit-core   = { path = "crates/dsl-kit-core",   version = "0.1.0" }
-dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.1.0" }
-dsl-kit-schema = { path = "crates/dsl-kit-schema", version = "0.1.0" }
-dsl-kit-lint   = { path = "crates/dsl-kit-lint",   version = "0.1.0" }
-dsl-kit-parse  = { path = "crates/dsl-kit-parse",  version = "0.1.0" }
-dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy",  version = "0.1.0" }
-dsl-kit        = { path = "crates/dsl-kit",        version = "0.1.0" }
-dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.1.0" }
-dsl-kit-cli    = { path = "crates/dsl-kit-cli",    version = "0.1.0" }
-flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.1.0" }
-flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.1.0" }
-expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.1.0" }
-expr-host      = { path = "examples/expr-example/crates/expr-host", version = "0.1.0" }
+dsl-kit-core   = { path = "crates/dsl-kit-core",   version = "0.2.0" }
+dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.2.0" }
+dsl-kit-schema = { path = "crates/dsl-kit-schema", version = "0.2.0" }
+dsl-kit-lint   = { path = "crates/dsl-kit-lint",   version = "0.2.0" }
+dsl-kit-parse  = { path = "crates/dsl-kit-parse",  version = "0.2.0" }
+dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy",  version = "0.2.0" }
+dsl-kit        = { path = "crates/dsl-kit",        version = "0.2.0" }
+dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.2.0" }
+dsl-kit-cli    = { path = "crates/dsl-kit-cli",    version = "0.2.0" }
+flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.2.0" }
+flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.2.0" }
+expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.2.0" }
+expr-host      = { path = "examples/expr-example/crates/expr-host", version = "0.2.0" }
