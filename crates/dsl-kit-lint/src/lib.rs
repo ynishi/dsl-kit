@@ -34,7 +34,7 @@
 
 use std::collections::HashSet;
 
-use dsl_kit_core::{NodeId, Phase, Walk};
+use dsl_kit_core::{NodeId, Phase, SuggesterHandle, Walk, noop_handle};
 use dsl_kit_schema::{DslSchema, Multiplicity};
 
 // ---------- Diagnostics -------------------------------------------------
@@ -494,6 +494,101 @@ impl<A: Walk + DslSchema> Rule<A> for DeadVariants {
     }
 }
 
+/// Type of the label-extraction closure used by [`TypoHint`].
+///
+/// Given an AST, yields `(node, label)` pairs identifying the
+/// strings the rule should cross-check against the schema. Each
+/// label is checked once; the rule does not walk on its own so DSL
+/// authors decide what a "label" means for their DSL (a payload
+/// field, an annotation, a source-level identifier they store on a
+/// node, …).
+pub type TypoLabelExtractor<A> =
+    Box<dyn Fn(&A) -> Vec<(NodeId, String)> + Send + Sync>;
+
+/// Opt-in rule that flags strings that look like a mistyped schema
+/// variant name.
+///
+/// Given a caller-supplied extractor that yields `(node, label)`
+/// pairs from the AST, the rule runs each `label` through an
+/// injected [`Suggester`](dsl_kit_core::Suggester) against the target's schema variant names
+/// and reports every near-miss as a `Severity::Info` diagnostic. An
+/// exact match is never flagged.
+///
+/// The rule is dormant unless a suggester is injected via
+/// [`Self::with_suggester`]: the default is a no-op that returns no
+/// candidates, so simply registering the rule keeps the lint pass
+/// zero-cost. Pass
+/// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` at the
+/// composition root to enable hints.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use dsl_kit_lint::{Linter, TypoHint};
+/// use dsl_kit_fuzzy::FuzzySuggester;
+///
+/// let linter = Linter::<MyDsl>::with_defaults().with_rule(
+///     TypoHint::new(|ast: &MyDsl| ast.collect_labels())
+///         .with_suggester(Arc::new(FuzzySuggester::default())),
+/// );
+/// ```
+pub struct TypoHint<A: Walk> {
+    suggester: SuggesterHandle,
+    extractor: TypoLabelExtractor<A>,
+}
+
+impl<A: Walk> TypoHint<A> {
+    /// Rule name (also attached to every diagnostic it emits).
+    pub const NAME: &'static str = "typo-hint";
+
+    /// Builds a rule from a label extractor. Starts with a no-op
+    /// suggester so the rule is dormant until
+    /// [`Self::with_suggester`] is called.
+    pub fn new<F>(extractor: F) -> Self
+    where
+        F: Fn(&A) -> Vec<(NodeId, String)> + Send + Sync + 'static,
+    {
+        Self {
+            suggester: noop_handle(),
+            extractor: Box::new(extractor),
+        }
+    }
+
+    /// Injects the [`Suggester`](dsl_kit_core::Suggester) the rule uses to score labels
+    /// against schema variant names.
+    pub fn with_suggester(mut self, suggester: SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
+    }
+}
+
+impl<A: Walk + DslSchema> Rule<A> for TypoHint<A> {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check(&self, ast: &A, ctx: &mut LintContext) {
+        let schema = A::schema();
+        let names: Vec<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
+        for (node, label) in (self.extractor)(ast) {
+            // An exact match is not a typo; skip it before spending
+            // a similarity computation on it.
+            if names.iter().any(|n| *n == label) {
+                continue;
+            }
+            if let Some(hint) = self.suggester.enrich_unknown(&label, &names) {
+                ctx.report(
+                    Self::NAME,
+                    Severity::Info,
+                    node,
+                    format!("`{label}` looks like a schema variant name; {hint}"),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +889,72 @@ mod tests {
         assert_eq!(diags[0].severity, Severity::Info);
         assert_eq!(diags[0].node, NodeId(1)); // anchored to root
         assert!(diags[0].message.contains("Beta"));
+    }
+
+    /// Fixed-output suggester used in TypoHint tests to prove the
+    /// wiring without depending on `dsl-kit-fuzzy` (a dev-dep would
+    /// create a `core -> fuzzy -> core` cycle that cargo cannot
+    /// unify at trait level).
+    struct FixedSuggester(&'static str);
+    impl dsl_kit_core::Suggester for FixedSuggester {
+        fn suggest<'a>(
+            &self,
+            _q: &str,
+            cands: &'a [&str],
+        ) -> Vec<dsl_kit_core::Suggestion<'a>> {
+            cands
+                .iter()
+                .find(|c| **c == self.0)
+                .map(|c| dsl_kit_core::Suggestion {
+                    candidate: c,
+                    score: 1.0,
+                })
+                .into_iter()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn typo_hint_dormant_without_suggester() {
+        // Rule is registered but no suggester injected: NoopSuggester
+        // returns no candidates, so nothing fires even for near-miss
+        // labels.
+        let ast = TwoVar::Alpha { id: NodeId(1) };
+        let rule = TypoHint::new(|_ast: &TwoVar| vec![(NodeId(1), "Alph".to_string())]);
+        let diags = Linter::<TwoVar>::new().with_rule(rule).lint(&ast);
+        assert!(diags.is_empty(), "expected zero diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn typo_hint_fires_with_suggester_on_near_miss() {
+        use std::sync::Arc;
+        let ast = TwoVar::Alpha { id: NodeId(1) };
+        let rule = TypoHint::new(|_ast: &TwoVar| vec![(NodeId(1), "Alph".to_string())])
+            .with_suggester(Arc::new(FixedSuggester("Alpha")));
+        let diags = Linter::<TwoVar>::new().with_rule(rule).lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].rule, TypoHint::<TwoVar>::NAME);
+        assert_eq!(diags[0].severity, Severity::Info);
+        assert_eq!(diags[0].node, NodeId(1));
+        assert!(
+            diags[0].message.contains("Alph")
+                && diags[0].message.contains("did you mean")
+                && diags[0].message.contains("Alpha"),
+            "unexpected message: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn typo_hint_skips_exact_match() {
+        // An exact match against a schema variant name is not a typo
+        // — the rule must not fire even with a suggester injected.
+        use std::sync::Arc;
+        let ast = TwoVar::Alpha { id: NodeId(1) };
+        let rule = TypoHint::new(|_ast: &TwoVar| vec![(NodeId(1), "Alpha".to_string())])
+            .with_suggester(Arc::new(FixedSuggester("Alpha")));
+        let diags = Linter::<TwoVar>::new().with_rule(rule).lint(&ast);
+        assert!(diags.is_empty(), "expected zero diagnostics, got {diags:?}");
     }
 
     #[test]
