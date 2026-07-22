@@ -372,6 +372,7 @@ name = "dsl-kit-parse"
 version = "0.1.0"
 dependencies = [
  "dsl-kit-core",
+ "dsl-kit-fuzzy",
  "dsl-kit-macros",
  "dsl-kit-schema",
  "serde",

@@ -46,7 +46,8 @@
 //! assert_eq!(tree.variant, "Add");
 //! ```
 
-use crate::{BuildError, Diagnostic, ParseTree, RawValue, codes, nearest_candidates};
+use crate::{BuildError, BuiltinLevenshteinSuggester, Diagnostic, ParseTree, RawValue, codes};
+use dsl_kit_core::Suggester;
 use dsl_kit_schema::{Multiplicity, NodeSchema, VariantSchema};
 use serde_json::Value;
 
@@ -78,13 +79,25 @@ pub mod serde_codes {
 /// have no `Span` mapping here — the parser's own position isn't
 /// exposed by `serde_json` in a stable way).
 pub fn from_json_str(input: &str, schema: &NodeSchema) -> Result<ParseTree, BuildError> {
+    from_json_str_with(input, schema, &BuiltinLevenshteinSuggester)
+}
+
+/// Variant of [`from_json_str`] that routes `did you mean X?` hints
+/// through a caller-supplied [`Suggester`]. See
+/// [`from_json_value_with`] for the same wiring on
+/// [`serde_json::Value`] inputs.
+pub fn from_json_str_with(
+    input: &str,
+    schema: &NodeSchema,
+    suggester: &dyn Suggester,
+) -> Result<ParseTree, BuildError> {
     let value: Value = serde_json::from_str(input).map_err(|e| {
         BuildError::single(Diagnostic::error(
             serde_codes::NOT_OBJECT,
             format!("invalid JSON: {e}"),
         ))
     })?;
-    from_json_value(&value, schema)
+    from_json_value_with(&value, schema, suggester)
 }
 
 /// Parses a [`serde_json::Value`] into a [`ParseTree`] using `schema`
@@ -98,8 +111,24 @@ pub fn from_json_str(input: &str, schema: &NodeSchema) -> Result<ParseTree, Buil
 /// returning; a malformed document yields one [`BuildError`] with
 /// every problem, not the first-encountered one.
 pub fn from_json_value(value: &Value, schema: &NodeSchema) -> Result<ParseTree, BuildError> {
+    from_json_value_with(value, schema, &BuiltinLevenshteinSuggester)
+}
+
+/// Variant of [`from_json_value`] that routes `did you mean X?` hints
+/// through a caller-supplied [`Suggester`].
+///
+/// The free function [`from_json_value`] delegates here with the same
+/// crate-private Levenshtein backend used by
+/// [`crate::check_conformance`]. Reach for this variant to plug in a
+/// different similarity algorithm (e.g. `dsl-kit-fuzzy`'s
+/// `FuzzySuggester`) without touching the parse trunk contract.
+pub fn from_json_value_with(
+    value: &Value,
+    schema: &NodeSchema,
+    suggester: &dyn Suggester,
+) -> Result<ParseTree, BuildError> {
     let mut diags = Vec::new();
-    let tree = build_tree(value, schema, &mut diags);
+    let tree = build_tree(value, schema, &mut diags, suggester);
     if diags.is_empty() {
         Ok(tree.unwrap_or_else(|| ParseTree::new("")))
     } else {
@@ -114,6 +143,7 @@ fn build_tree(
     value: &Value,
     schema: &NodeSchema,
     diags: &mut Vec<Diagnostic>,
+    suggester: &dyn Suggester,
 ) -> Option<ParseTree> {
     let obj = match value {
         Value::Object(map) => map,
@@ -150,17 +180,7 @@ fn build_tree(
     let variant = match schema.variant(&variant_name) {
         Some(v) => v,
         None => {
-            let candidates = nearest_candidates(&variant_name, &schema.variants, 3);
-            let msg = if candidates.is_empty() {
-                format!("unknown variant `{}` for `{}`", variant_name, schema.name)
-            } else {
-                format!(
-                    "unknown variant `{}` for `{}` (did you mean: {})",
-                    variant_name,
-                    schema.name,
-                    candidates.join(", ")
-                )
-            };
+            let msg = crate::format_unknown_variant(&variant_name, schema, suggester);
             diags.push(Diagnostic::error(codes::UNKNOWN_VARIANT, msg));
             return None;
         }
@@ -175,7 +195,15 @@ fn build_tree(
         if let Some(_field) = variant.fields.iter().find(|f| &f.name == key) {
             tree.fields.push((key.clone(), RawValue::Json(val.clone())));
         } else if let Some(child) = variant.children.iter().find(|c| &c.name == key) {
-            let subtrees = build_child_slot(child.multiplicity, val, variant, key, schema, diags);
+            let subtrees = build_child_slot(
+                child.multiplicity,
+                val,
+                variant,
+                key,
+                schema,
+                diags,
+                suggester,
+            );
             tree.children.push((key.clone(), subtrees));
         } else {
             // Not a declared field, not a declared child — either a
@@ -204,10 +232,13 @@ fn build_child_slot(
     slot: &str,
     schema: &NodeSchema,
     diags: &mut Vec<Diagnostic>,
+    suggester: &dyn Suggester,
 ) -> Vec<ParseTree> {
     match m {
         Multiplicity::One => match val {
-            Value::Object(_) => build_tree(val, schema, diags).into_iter().collect(),
+            Value::Object(_) => build_tree(val, schema, diags, suggester)
+                .into_iter()
+                .collect(),
             _ => {
                 diags.push(Diagnostic::error(
                     serde_codes::CHILD_SHAPE,
@@ -223,7 +254,9 @@ fn build_child_slot(
         },
         Multiplicity::Optional => match val {
             Value::Null => Vec::new(),
-            Value::Object(_) => build_tree(val, schema, diags).into_iter().collect(),
+            Value::Object(_) => build_tree(val, schema, diags, suggester)
+                .into_iter()
+                .collect(),
             _ => {
                 diags.push(Diagnostic::error(
                     serde_codes::CHILD_SHAPE,
@@ -240,7 +273,7 @@ fn build_child_slot(
         Multiplicity::Many => match val {
             Value::Array(items) => items
                 .iter()
-                .filter_map(|item| build_tree(item, schema, diags))
+                .filter_map(|item| build_tree(item, schema, diags, suggester))
                 .collect(),
             _ => {
                 diags.push(Diagnostic::error(

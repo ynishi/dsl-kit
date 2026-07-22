@@ -28,7 +28,7 @@
 
 #![warn(missing_docs)]
 
-use dsl_kit_core::{IdGen, NodeId};
+use dsl_kit_core::{IdGen, NodeId, Suggester, Suggestion};
 use dsl_kit_schema::{ChildSchema, Multiplicity, NodeSchema, VariantSchema};
 use serde_json::{Value, json};
 use std::fmt;
@@ -416,20 +416,27 @@ pub mod codes {
 /// `NoEmptyManyChildren` lint rule is the place to complain about
 /// domain-level emptiness.
 pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnostic> {
+    check_conformance_with(tree, schema, &BuiltinLevenshteinSuggester)
+}
+
+/// Variant of [`check_conformance`] that routes `did you mean X?`
+/// hints through a caller-supplied [`Suggester`].
+///
+/// The free function [`check_conformance`] delegates here with a
+/// crate-private [`Suggester`] backed by the same Levenshtein
+/// algorithm the crate has always shipped, so existing callers see no
+/// behavioural change. Reach for this variant when you want to plug
+/// in a different similarity algorithm (e.g. `dsl-kit-fuzzy`'s
+/// `FuzzySuggester` with Jaro-Winkler) at a specific call site.
+pub fn check_conformance_with(
+    tree: &ParseTree,
+    schema: &NodeSchema,
+    suggester: &dyn Suggester,
+) -> Vec<Diagnostic> {
     let mut out = Vec::new();
 
     let Some(variant) = schema.variant(&tree.variant) else {
-        let candidates = nearest_candidates(&tree.variant, &schema.variants, 3);
-        let msg = if candidates.is_empty() {
-            format!("unknown variant `{}` for `{}`", tree.variant, schema.name)
-        } else {
-            format!(
-                "unknown variant `{}` for `{}` (did you mean: {})",
-                tree.variant,
-                schema.name,
-                candidates.join(", ")
-            )
-        };
+        let msg = format_unknown_variant(&tree.variant, schema, suggester);
         out.push(Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_span(tree.span));
         return out;
     };
@@ -437,6 +444,22 @@ pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnosti
     check_fields(tree, variant, &mut out);
     check_children(tree, variant, &mut out);
     out
+}
+
+/// Shared formatter for the `UNKNOWN_VARIANT` diagnostic message,
+/// used by both [`check_conformance_with`] and the serde bridge so the
+/// wording stays consistent across front-ends.
+pub(crate) fn format_unknown_variant(
+    query: &str,
+    schema: &NodeSchema,
+    suggester: &dyn Suggester,
+) -> String {
+    let names: Vec<&str> = schema.variants.iter().map(|v| v.name.as_str()).collect();
+    let base = format!("unknown variant `{}` for `{}`", query, schema.name);
+    match suggester.enrich_unknown(query, &names) {
+        Some(hint) => format!("{base} ({hint})"),
+        None => base,
+    }
 }
 
 fn check_fields(tree: &ParseTree, variant: &VariantSchema, out: &mut Vec<Diagnostic>) {
@@ -605,22 +628,44 @@ fn diag_arity(
 }
 
 // ---------------------------------------------------------------------------
-// Nearest-candidate suggestions (small Levenshtein)
+// Built-in Suggester (case-insensitive Levenshtein, cutoff = max(query.len, 1))
 // ---------------------------------------------------------------------------
 
-pub(crate) fn nearest_candidates(query: &str, variants: &[VariantSchema], k: usize) -> Vec<String> {
-    let mut scored: Vec<(usize, &str)> = variants
-        .iter()
-        .map(|v| (levenshtein(query, &v.name), v.name.as_str()))
-        .collect();
-    scored.sort_by_key(|(d, name)| (*d, name.to_string()));
-    let cutoff = query.len().max(1);
-    scored
-        .into_iter()
-        .filter(|(d, _)| *d <= cutoff)
-        .take(k)
-        .map(|(_, n)| n.to_string())
-        .collect()
+/// Default [`Suggester`] used by [`check_conformance`] and the serde
+/// bridge when no explicit suggester is supplied.
+///
+/// Backed by an ASCII-case-insensitive Levenshtein edit distance with
+/// cutoff `max(query.len(), 1)` — the same behaviour the crate has
+/// shipped since Round 1, kept internal so the parser does not need
+/// to depend on the plugin crate.
+pub(crate) struct BuiltinLevenshteinSuggester;
+
+impl Suggester for BuiltinLevenshteinSuggester {
+    fn suggest<'a>(&self, query: &str, candidates: &'a [&str]) -> Vec<Suggestion<'a>> {
+        let cutoff = query.chars().count().max(1);
+        let mut scored: Vec<(usize, &'a str)> = candidates
+            .iter()
+            .map(|c| (levenshtein(query, c), *c))
+            .filter(|(d, _)| *d <= cutoff)
+            .collect();
+        scored.sort_by(|(da, na), (db, nb)| da.cmp(db).then_with(|| na.cmp(nb)));
+        scored.truncate(3);
+        scored
+            .into_iter()
+            .map(|(d, name)| Suggestion {
+                candidate: name,
+                score: normalise_edit(d, query, name),
+            })
+            .collect()
+    }
+}
+
+fn normalise_edit(distance: usize, a: &str, b: &str) -> f64 {
+    let max_len = a.chars().count().max(b.chars().count());
+    if max_len == 0 {
+        return 1.0;
+    }
+    1.0 - (distance as f64 / max_len as f64)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -886,6 +931,23 @@ mod tests {
         assert!(
             diags[0].message.contains("Add"),
             "expected Add to appear as a candidate; got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn unknown_variant_uses_injected_suggester() {
+        use dsl_kit_fuzzy::FuzzySuggester;
+
+        let schema = schema_add_lit();
+        let tree = ParseTree::new("Adx"); // Jaro-Winkler prefix bias picks "Add"
+        let suggester = FuzzySuggester::default();
+        let diags = check_conformance_with(&tree, &schema, &suggester);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, codes::UNKNOWN_VARIANT);
+        assert!(
+            diags[0].message.contains("did you mean") && diags[0].message.contains("Add"),
+            "expected FuzzySuggester to surface `Add`; got: {}",
             diags[0].message
         );
     }
