@@ -8,7 +8,7 @@
 //! candidates with a string-similarity algorithm from the `strsim`
 //! crate.
 //!
-//! # Choosing an algorithm
+//! ## Choosing an algorithm
 //!
 //! - [`Algorithm::JaroWinkler`] (default): weights matching prefixes,
 //!   tends to score short typos in identifiers well
@@ -19,7 +19,7 @@
 //!   transposition of two adjacent characters as a single edit
 //!   (`taget` → `target`).
 //!
-//! # Example
+//! ## Example
 //!
 //! ```
 //! use std::sync::Arc;

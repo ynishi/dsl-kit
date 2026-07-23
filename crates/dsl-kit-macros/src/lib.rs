@@ -417,10 +417,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
             } else {
                 let ty_src = normalize_type_str(&f.ty.to_token_stream().to_string());
                 let (shape, _) = payload_shape(&f.ty, &name);
-                let optional = matches!(
-                    shape,
-                    PayloadShape::OptionInner | PayloadShape::VecInner,
-                );
+                let optional = matches!(shape, PayloadShape::OptionInner | PayloadShape::VecInner,);
                 field_ctors.push(quote! {
                     ::dsl_kit_schema::FieldSchema {
                         name: #ident_str.to_string(),

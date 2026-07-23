@@ -289,12 +289,7 @@ fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> 
             }
             choice(ids, alts)
         };
-        let tail = repeat(
-            ids,
-            seq(ids, vec![token(ids, ","), tail_alt(ids)]),
-            0,
-            None,
-        );
+        let tail = repeat(ids, seq(ids, vec![token(ids, ","), tail_alt(ids)]), 0, None);
         let full = seq(ids, vec![arg_choice, tail]);
         items.push(repeat(ids, full, 0, Some(1)));
     } else {
@@ -855,9 +850,7 @@ mod tests {
             Some(&RawValue::Text("none".into())),
         );
         // `%str` spelling.
-        let t2 = g
-            .parse(r#"Row(description: "hi")"#)
-            .expect("string parses");
+        let t2 = g.parse(r#"Row(description: "hi")"#).expect("string parses");
         assert_eq!(t2.field("description"), Some(&RawValue::Text("hi".into())));
         // Omitted entirely (Layer 1 optional PEG wrap).
         let t3 = g.parse(r#"Row()"#).expect("omitted parses");

@@ -1338,7 +1338,10 @@ mod tests {
     fn build_field_vec_covers_every_shape() {
         // Absent → empty.
         let t = ParseTree::new("Row");
-        assert_eq!(build_field_vec::<String>(&t, "tags").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            build_field_vec::<String>(&t, "tags").unwrap(),
+            Vec::<String>::new()
+        );
         // JSON null → empty.
         let mut t2 = ParseTree::new("Row");
         t2.fields.push(("tags".into(), RawValue::Json(Value::Null)));
@@ -1364,8 +1367,7 @@ mod tests {
         );
         // Empty bracketed text.
         let mut t5 = ParseTree::new("Row");
-        t5.fields
-            .push(("tags".into(), RawValue::Text("[]".into())));
+        t5.fields.push(("tags".into(), RawValue::Text("[]".into())));
         assert_eq!(
             build_field_vec::<String>(&t5, "tags").unwrap(),
             Vec::<String>::new(),
