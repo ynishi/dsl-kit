@@ -135,12 +135,38 @@ pub enum HostOutcome {
     Done,
 }
 
+/// Error message returned by the default [`DslHost::resolve`] for
+/// call-less DSLs. Hosts whose DSL has no external calls inherit this
+/// via the trait default; hosts with real effects override `resolve`
+/// (and typically report [`DslHost::supports_calls`] as `true`).
+pub const RESOLVE_UNSUPPORTED_MSG: &str =
+    "resolve not supported: this host's DSL has no external calls";
+
+/// Builds the standard "step budget exceeded" error surfaced by the
+/// default [`DslHost::step_to_done`] when a host advances past its
+/// [`step_budget`](DslHost::step_budget) without reaching a terminal
+/// outcome. Centralised so the wording stays pinned in one place.
+fn step_budget_exceeded_msg(budget: usize) -> String {
+    format!("step_to_done exceeded step budget of {budget}")
+}
+
 /// DSL-agnostic surface the MCP handler drives.
 ///
 /// The step / resolve methods are `async` so hosts whose semantics
 /// need to await external work (network calls, tool invocations,
 /// MCP round-trips) can do so directly. Purely synchronous hosts
 /// simply wrap sync bodies in `async { … }` at zero runtime cost.
+///
+/// Call-less (declarative) DSLs need only implement the required
+/// methods: [`resolve`](Self::resolve) and
+/// [`step_to_done`](Self::step_to_done) carry defaults suited to a host
+/// that never suspends on an external effect. The default `resolve`
+/// returns [`RESOLVE_UNSUPPORTED_MSG`]; the default `step_to_done`
+/// drives [`step_to_yield`](Self::step_to_yield) up to
+/// [`step_budget`](Self::step_budget) (`4096`) iterations, returning on
+/// `Done` / `Suspended` and otherwise erroring with the standard
+/// budget-exceeded message. Such hosts typically override
+/// [`supports_calls`](Self::supports_calls) to return `false`.
 ///
 /// The trait uses [`async_trait`] to stay `dyn`-compatible; the MCP
 /// handler holds a `Box<dyn DslHost>`.
@@ -164,6 +190,27 @@ pub trait DslHost: Send + Sync {
     /// A full snapshot of the stepper state.
     fn snapshot(&self) -> HostSnapshot;
 
+    /// Whether this host's DSL can suspend on external calls.
+    ///
+    /// The default is `true` (the host may hit `Call`-shaped effects and
+    /// use [`resolve`](Self::resolve) /
+    /// [`resolve_by_id`](Self::resolve_by_id)). Call-less (declarative)
+    /// hosts override this to `false`; the MCP handler then gates the
+    /// resolve tools behind a clear [`RESOLVE_UNSUPPORTED_MSG`] error
+    /// instead of driving a resolver.
+    fn supports_calls(&self) -> bool {
+        true
+    }
+
+    /// Maximum [`step_to_yield`](Self::step_to_yield) iterations the
+    /// default [`step_to_done`](Self::step_to_done) will run before
+    /// bailing out with a budget-exceeded error. Defaults to `4096`,
+    /// matching the reference host's safety limit. Override to widen or
+    /// tighten the guard.
+    fn step_budget(&self) -> usize {
+        4096
+    }
+
     /// Run one step. If `breakpoints` is non-empty, the host is
     /// expected to yield `Suspended { reason: "breakpoint", .. }`
     /// before executing a node whose context matches any registered
@@ -179,15 +226,35 @@ pub trait DslHost: Send + Sync {
         breakpoints: &dsl_kit::BreakpointSet,
     ) -> Result<HostOutcome, String>;
 
-    /// Run to completion, resolving suspensions with a host-defined
-    /// default (typically canned responses). Breakpoints are honoured
-    /// mid-run — they suspend the loop just like an `AwaitEffect`, and
-    /// resolution is performed on breakpoint yields too so the stepper
-    /// keeps making progress.
+    /// Run to completion.
+    ///
+    /// Hosts with external calls override this to resolve suspensions
+    /// with a host-defined default (typically canned responses) so the
+    /// stepper keeps making progress; breakpoints are honoured mid-run
+    /// and resolution is performed on breakpoint yields too.
+    ///
+    /// The default implementation is written purely in terms of
+    /// [`step_to_yield`](Self::step_to_yield) and suits call-less DSLs:
+    /// it drives the stepper forward on `Advanced`, returns immediately
+    /// on `Done` or `Suspended` (preserving breakpoint / suspend
+    /// semantics identical to `step_to_yield`), and bails out with the
+    /// standard budget-exceeded error after
+    /// [`step_budget`](Self::step_budget) iterations without reaching a
+    /// terminal outcome.
     async fn step_to_done(
         &mut self,
         breakpoints: &dsl_kit::BreakpointSet,
-    ) -> Result<HostOutcome, String>;
+    ) -> Result<HostOutcome, String> {
+        let budget = self.step_budget();
+        for _ in 0..budget {
+            match self.step_to_yield(breakpoints).await? {
+                HostOutcome::Done => return Ok(HostOutcome::Done),
+                outcome @ HostOutcome::Suspended { .. } => return Ok(outcome),
+                HostOutcome::Advanced => continue,
+            }
+        }
+        Err(step_budget_exceeded_msg(budget))
+    }
 
     /// Resolve the currently suspended call.
     ///
@@ -195,7 +262,15 @@ pub trait DslHost: Send + Sync {
     /// its canned response for the call's label). Used by the
     /// single-in-flight legacy path — for fan-out, use
     /// [`resolve_by_id`](Self::resolve_by_id).
-    async fn resolve(&mut self, result: Option<String>) -> Result<ResolvedCall, String>;
+    ///
+    /// The default implementation returns [`RESOLVE_UNSUPPORTED_MSG`],
+    /// which is the correct behaviour for a call-less DSL that never
+    /// suspends on an external effect. Hosts with real effects override
+    /// this (and report [`supports_calls`](Self::supports_calls) as
+    /// `true`).
+    async fn resolve(&mut self, _result: Option<String>) -> Result<ResolvedCall, String> {
+        Err(RESOLVE_UNSUPPORTED_MSG.to_string())
+    }
 
     /// Resolve a specific pending suspension by its stable id.
     ///
@@ -297,5 +372,161 @@ pub trait DslHost: Send + Sync {
     /// against the new AST).
     async fn load_json(&mut self, _input: &str) -> Result<(), String> {
         Err("load_json not supported by this host".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsl_kit::BreakpointSet;
+
+    /// Behaviour script controlling the stub's `step_to_yield`.
+    enum YieldScript {
+        /// Return `Advanced` `n` times, then `Done` forever.
+        AdvanceThenDone(usize),
+        /// Return `Suspended` on the very first call.
+        SuspendNow,
+        /// Return `Advanced` forever (never terminates on its own).
+        AdvanceForever,
+    }
+
+    /// Minimal call-less host: implements only the required trait
+    /// methods and inherits the defaults for `resolve`, `step_to_done`,
+    /// `supports_calls`, and `step_budget`.
+    struct MinimalHost {
+        script: YieldScript,
+        /// Number of `step_to_yield` invocations observed.
+        calls: usize,
+    }
+
+    impl MinimalHost {
+        fn new(script: YieldScript) -> Self {
+            Self { script, calls: 0 }
+        }
+    }
+
+    fn test_location() -> HostLocation {
+        HostLocation {
+            node: 0,
+            path: Vec::new(),
+            depth: 0,
+            frame: None,
+            iteration: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DslHost for MinimalHost {
+        fn dsl_name(&self) -> &str {
+            "minimal"
+        }
+
+        fn root_node_id(&self) -> u64 {
+            0
+        }
+
+        fn root_summary(&self) -> String {
+            "Minimal".into()
+        }
+
+        fn ast_size(&self) -> usize {
+            1
+        }
+
+        fn ast_pretty(&self) -> String {
+            "Minimal".into()
+        }
+
+        fn snapshot(&self) -> HostSnapshot {
+            HostSnapshot {
+                depth: 0,
+                current_path: None,
+                suspended_call: None,
+                pending: Vec::new(),
+                results: Vec::new(),
+                events: EventCounts::default(),
+            }
+        }
+
+        async fn step_one(&mut self, breakpoints: &BreakpointSet) -> Result<HostOutcome, String> {
+            self.step_to_yield(breakpoints).await
+        }
+
+        async fn step_to_yield(
+            &mut self,
+            _breakpoints: &BreakpointSet,
+        ) -> Result<HostOutcome, String> {
+            self.calls += 1;
+            let outcome = match self.script {
+                YieldScript::AdvanceThenDone(n) => {
+                    if self.calls > n {
+                        HostOutcome::Done
+                    } else {
+                        HostOutcome::Advanced
+                    }
+                }
+                YieldScript::SuspendNow => HostOutcome::Suspended {
+                    reason: "await-effect".into(),
+                    at: test_location(),
+                },
+                YieldScript::AdvanceForever => HostOutcome::Advanced,
+            };
+            Ok(outcome)
+        }
+
+        fn reset(&mut self) {
+            self.calls = 0;
+        }
+    }
+
+    #[test]
+    fn defaults_reflect_call_capable_host() {
+        let host = MinimalHost::new(YieldScript::AdvanceForever);
+        assert!(host.supports_calls());
+        assert_eq!(host.step_budget(), 4096);
+    }
+
+    #[tokio::test]
+    async fn default_resolve_reports_unsupported() {
+        let mut host = MinimalHost::new(YieldScript::AdvanceThenDone(0));
+        let err = host
+            .resolve(None)
+            .await
+            .expect_err("call-less host must reject resolve");
+        assert_eq!(err, RESOLVE_UNSUPPORTED_MSG);
+    }
+
+    #[tokio::test]
+    async fn default_step_to_done_advances_then_done() {
+        let bps = BreakpointSet::new();
+        let mut host = MinimalHost::new(YieldScript::AdvanceThenDone(3));
+        let outcome = host.step_to_done(&bps).await.expect("reaches done");
+        assert!(matches!(outcome, HostOutcome::Done));
+        // 3 Advanced + 1 Done = 4 step_to_yield calls.
+        assert_eq!(host.calls, 4);
+    }
+
+    #[tokio::test]
+    async fn default_step_to_done_returns_on_suspend() {
+        let bps = BreakpointSet::new();
+        let mut host = MinimalHost::new(YieldScript::SuspendNow);
+        let outcome = host.step_to_done(&bps).await.expect("suspends");
+        assert!(matches!(outcome, HostOutcome::Suspended { .. }));
+        // The loop must stop on the first suspension, not keep spinning.
+        assert_eq!(host.calls, 1);
+    }
+
+    #[tokio::test]
+    async fn default_step_to_done_exhausts_budget() {
+        let bps = BreakpointSet::new();
+        let mut host = MinimalHost::new(YieldScript::AdvanceForever);
+        let budget = host.step_budget();
+        let err = host
+            .step_to_done(&bps)
+            .await
+            .expect_err("never-terminating host must exhaust the budget");
+        assert_eq!(err, step_budget_exceeded_msg(budget));
+        // Budget is the number of step_to_yield iterations attempted.
+        assert_eq!(host.calls, budget);
     }
 }

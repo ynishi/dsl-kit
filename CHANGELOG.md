@@ -57,6 +57,34 @@ contract that closes GH issue #1.
   needs its `SyntaxOverrides` value production and `parse_policy`
   converter.
 
+Default `DslHost` implementations for call-less DSLs — closes GH
+issue #3.
+
+- `dsl-kit-mcp` — `DslHost::resolve` and `DslHost::step_to_done`
+  gain default bodies suited to hosts whose DSL never suspends on
+  external calls: `resolve` returns the new
+  `RESOLVE_UNSUPPORTED_MSG` constant, `step_to_done` drives
+  `step_to_yield` (returning on `Done` / `Suspended`, so breakpoint
+  and suspend semantics match `step_to_yield` exactly) up to a
+  configurable `step_budget()` (default `4096`) before erroring
+  with a standardized budget-exceeded message. New
+  `supports_calls()` hook (default `true`): hosts that override it
+  to `false` get `dsl_kit_resolve` / `dsl_kit_resolve_by_id` gated
+  at the handler with the same `RESOLVE_UNSUPPORTED_MSG` error.
+  Existing hosts that override both methods are unaffected.
+
+Normalized type names in schema / diagnostics — closes GH issue #4.
+
+- `dsl-kit-macros` — `#[derive(DslSchema)]` normalizes the
+  `FieldSchema.ty` source text captured from the token stream, so
+  types render idiomatically (`Option < String >` →
+  `Option<String>`, `HashMap < String , u32 >` →
+  `HashMap<String, u32>`). Every consumer (BuildError diagnostics,
+  exported schema JSON, generated docs / examples) inherits the
+  tidied spelling. Consumers matching on the previous spaced form
+  should update; parse-side comparisons were already
+  whitespace-insensitive via `strip_ws`.
+
 ## [0.2.0] - 2026-07-22
 
 Fuzzy-match `did you mean X?` hints wired through every `unknown-*`

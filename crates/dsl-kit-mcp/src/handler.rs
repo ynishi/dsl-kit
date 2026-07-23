@@ -46,7 +46,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::host::{DslHost, HostEffectError, HostOutcome, PendingProjection};
+use crate::host::{
+    DslHost, HostEffectError, HostOutcome, PendingProjection, RESOLVE_UNSUPPORTED_MSG,
+};
 use crate::resources::{ResourceEntry, kit_resources};
 
 // ---------- Parameter types ---------------------------------------------
@@ -327,7 +329,9 @@ impl DslMcpHandler {
 
     /// Resolve a specific pending suspension by its stable id.
     /// Supports both success (`ok`) and effect-side failure (`err`)
-    /// variants.
+    /// variants. Call-less hosts (those reporting
+    /// [`DslHost::supports_calls`] as `false`) reject this with
+    /// [`RESOLVE_UNSUPPORTED_MSG`].
     #[tool(name = "dsl_kit_resolve_by_id")]
     pub async fn dsl_kit_resolve_by_id(
         &self,
@@ -347,6 +351,9 @@ impl DslMcpHandler {
             }
         };
         let mut guard = self.state.lock().await;
+        if !guard.host.supports_calls() {
+            return Err(RESOLVE_UNSUPPORTED_MSG.to_string());
+        }
         let resolved = guard.host.resolve_by_id(params.id, result).await?;
         Ok(json!({
             "resolved": {
@@ -380,13 +387,18 @@ impl DslMcpHandler {
         Ok(outcome_to_json(&outcome).to_string())
     }
 
-    /// Provide a response for the currently suspended call.
+    /// Provide a response for the currently suspended call. Call-less
+    /// hosts (those reporting [`DslHost::supports_calls`] as `false`)
+    /// reject this with [`RESOLVE_UNSUPPORTED_MSG`].
     #[tool(name = "dsl_kit_resolve")]
     pub async fn dsl_kit_resolve(
         &self,
         Parameters(params): Parameters<ResolveParams>,
     ) -> Result<String, String> {
         let mut guard = self.state.lock().await;
+        if !guard.host.supports_calls() {
+            return Err(RESOLVE_UNSUPPORTED_MSG.to_string());
+        }
         let resolved = guard.host.resolve(params.result).await?;
         Ok(json!({
             "resolved": {

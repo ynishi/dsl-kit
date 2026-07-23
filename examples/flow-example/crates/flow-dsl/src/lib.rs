@@ -1609,6 +1609,10 @@ mod tests {
         assert_eq!(par.children[0].multiplicity, Multiplicity::Many);
         let field_names: Vec<&str> = par.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, vec!["policy", "reducer_id"]);
+        // Generic payload types are spelled without the token-stream
+        // whitespace (`Option < JoinPolicy >` → `Option<JoinPolicy>`).
+        assert_eq!(par.fields[0].ty, "Option<JoinPolicy>");
+        assert_eq!(par.fields[1].ty, "Option<String>");
 
         // Call { id, label: String } — id stripped, label payload.
         let call = schema.variant("Call").expect("Call");

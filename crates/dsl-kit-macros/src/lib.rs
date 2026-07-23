@@ -415,7 +415,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                     }
                 });
             } else {
-                let ty_src = f.ty.to_token_stream().to_string();
+                let ty_src = normalize_type_str(&f.ty.to_token_stream().to_string());
                 let (shape, _) = payload_shape(&f.ty, &name);
                 let optional = matches!(
                     shape,
@@ -1154,4 +1154,65 @@ fn dsl_build_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
         }
     }
     Ok(with)
+}
+
+/// Collapses the whitespace that `TokenStream::to_string` inserts between
+/// tokens so a type renders in its canonical, source-like form
+/// (`Option < String >` → `Option<String>`). Pure string transform used
+/// only for the human-facing `FieldSchema.ty` label; every consumer
+/// (`BuildError` diagnostics, schema JSON export, generated docs) inherits
+/// the tidied spelling.
+///
+/// The stringified token stream is a sequence of single-space-separated
+/// tokens, so normalization reduces to deciding the separator between each
+/// adjacent pair:
+///
+/// - no space before `<` `>` `,` `::` `(` `)`
+/// - no space after `<` `::` `&` `(`
+/// - exactly one space after `,` (the default separator)
+///
+/// This yields `HashMap<String, u32>`, `std::string::String`, `&str`, and
+/// `&'a str` (the lifetime/type gap is preserved because neither `'a` nor
+/// the following token is a special punctuation token).
+fn normalize_type_str(s: &str) -> String {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, tok) in tokens.iter().enumerate() {
+        if i > 0 {
+            let prev = tokens[i - 1];
+            let no_space = matches!(*tok, "<" | ">" | "," | "::" | "(" | ")")
+                || matches!(prev, "<" | "::" | "&" | "(");
+            if !no_space {
+                out.push(' ');
+            }
+        }
+        out.push_str(tok);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_type_str;
+
+    #[test]
+    fn normalize_collapses_token_stream_whitespace() {
+        assert_eq!(normalize_type_str("Option < String >"), "Option<String>");
+        assert_eq!(normalize_type_str("Vec < String >"), "Vec<String>");
+        assert_eq!(
+            normalize_type_str("HashMap < String , u32 >"),
+            "HashMap<String, u32>"
+        );
+        assert_eq!(
+            normalize_type_str("Option < Vec < String > >"),
+            "Option<Vec<String>>"
+        );
+        assert_eq!(
+            normalize_type_str("std :: string :: String"),
+            "std::string::String"
+        );
+        assert_eq!(normalize_type_str("& str"), "&str");
+        assert_eq!(normalize_type_str("& 'a str"), "&'a str");
+        assert_eq!(normalize_type_str("String"), "String");
+    }
 }
