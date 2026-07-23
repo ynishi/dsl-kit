@@ -15,12 +15,18 @@
 //! parallel implementation.
 //!
 //! Round 17 removes that duplication: [`FlowStepper`] is now a thin
-//! adapter that owns an `Engine<FlowAst<'_>>` and forwards every
+//! adapter that owns an `Engine<FlowAst>` and forwards every
 //! [`Stepper`] method to it. Fan-out, cancellation queueing, event
 //! emission, and breakpoint peek-ahead all live on the engine (design
 //! doc §5). The flow-dsl crate owns only the intent side: the AST, the
 //! value / error taxonomy, and the concrete reducer instances the
 //! registry lookups return.
+//!
+//! [`FlowAst`] is the worked example of a *hand-written* owned AST
+//! projection — the non-derive counterpart of [`dsl_kit::OwnedDerivedAst`]
+//! for authors whose enum does not go through `#[derive(DslExec)]`: it
+//! copies each node's [`NodeKind`] out at construction so the engine
+//! holds no borrow of the tree and a long-lived host needs no `Box::leak`.
 
 #![warn(missing_docs)]
 
@@ -372,26 +378,37 @@ pub fn gated_pipeline(ids: &IdGen) -> Flow {
 
 // ---------- FlowAst — Ast impl for the engine ---------------------------
 
-/// [`Ast`] adapter wrapping a borrowed [`Flow`] tree.
+/// [`Ast`] adapter over a [`Flow`] tree, projected into owned storage.
 ///
-/// Builds a `NodeId → &Flow` lookup at construction so `node_kind`
-/// answers in O(1). Used by [`Engine`] as the intent-side oracle; the
-/// engine owns runtime mechanics.
-pub struct FlowAst<'a> {
-    root: &'a Flow,
-    lookup: HashMap<NodeId, &'a Flow>,
+/// `Flow` classifies its own nodes by hand (it does not go through
+/// `#[derive(DslExec)]`), so this is the hand-written counterpart of
+/// [`dsl_kit::OwnedDerivedAst`]: [`FlowAst::new`] walks `root` once and
+/// stores each node's engine [`NodeKind`] *by value* in a
+/// `NodeId → NodeKind` table. Because the projection copies out
+/// everything `node_kind` needs, the borrow of `root` ends when the
+/// constructor returns — an [`Engine`] built from a `FlowAst` carries no
+/// lifetime, so a long-lived host can own program and engine together
+/// without `Box::leak`. Kept as the worked example for DSL authors whose
+/// AST is not derive-generated.
+pub struct FlowAst {
+    root: NodeId,
+    lookup: HashMap<NodeId, NodeKind>,
 }
 
-impl<'a> FlowAst<'a> {
-    /// Build an `Ast` view over `root`, indexing every reachable node.
-    pub fn new(root: &'a Flow) -> Self {
+impl FlowAst {
+    /// Build an `Ast` view over `root`, projecting every reachable node's
+    /// classification into owned storage.
+    pub fn new(root: &Flow) -> Self {
         let mut lookup = HashMap::new();
         Self::index(root, &mut lookup);
-        Self { root, lookup }
+        Self {
+            root: root.node_id(),
+            lookup,
+        }
     }
 
-    fn index(flow: &'a Flow, out: &mut HashMap<NodeId, &'a Flow>) {
-        out.insert(flow.node_id(), flow);
+    fn index(flow: &Flow, out: &mut HashMap<NodeId, NodeKind>) {
+        out.insert(flow.node_id(), flow_node_kind(flow));
         match flow {
             Flow::Seq { children, .. } | Flow::Par { children, .. } => {
                 for c in children {
@@ -417,69 +434,76 @@ impl<'a> FlowAst<'a> {
     }
 }
 
-impl<'a> Ast for FlowAst<'a> {
+/// Maps a `Flow` node to its engine [`NodeKind`].
+///
+/// Called once per node at [`FlowAst::new`] time; the returned
+/// classification is stored by value so the projection outlives the
+/// borrowed tree.
+fn flow_node_kind(flow: &Flow) -> NodeKind {
+    match flow {
+        Flow::Seq { children, .. } => NodeKind::Seq {
+            children: children.iter().map(|c| c.node_id()).collect(),
+        },
+        Flow::Par {
+            children,
+            policy,
+            reducer_id,
+            ..
+        } => {
+            let policy = policy.unwrap_or(JoinPolicy {
+                shape: JoinShape::All,
+                fail: FailPolicy::FailFast,
+            });
+            let reducer_id = ReducerId::from(
+                reducer_id
+                    .clone()
+                    .unwrap_or_else(|| "reduce_all_ordered".into()),
+            );
+            NodeKind::Par {
+                children: children.iter().map(|c| c.node_id()).collect(),
+                policy,
+                reducer_id,
+            }
+        }
+        Flow::Scope { label, body, .. } => NodeKind::Scope {
+            label: label.clone(),
+            body: body.node_id(),
+        },
+        Flow::Maybe { body, .. } => NodeKind::Maybe {
+            body: body.as_deref().map(|b| b.node_id()),
+        },
+        Flow::Branch {
+            cond,
+            then_branch,
+            else_branch,
+            ..
+        } => NodeKind::Branch {
+            cond: cond.node_id(),
+            then_branch: then_branch.node_id(),
+            else_branch: else_branch.as_deref().map(|e| e.node_id()),
+        },
+        Flow::Call { label, .. } => NodeKind::Call {
+            label: label.clone(),
+            payload: serde_json::Value::Null,
+        },
+    }
+}
+
+impl Ast for FlowAst {
     type Value = FlowValue;
     type Delta = ();
     type EffectError = FlowEffectErr;
     type Cursor = FlowCursor;
 
     fn root(&self) -> NodeId {
-        self.root.node_id()
+        self.root
     }
 
     fn node_kind(&self, id: NodeId) -> NodeKind {
-        let flow = self
-            .lookup
+        self.lookup
             .get(&id)
-            .copied()
-            .unwrap_or_else(|| panic!("unknown NodeId {id:?}"));
-        match flow {
-            Flow::Seq { children, .. } => NodeKind::Seq {
-                children: children.iter().map(|c| c.node_id()).collect(),
-            },
-            Flow::Par {
-                children,
-                policy,
-                reducer_id,
-                ..
-            } => {
-                let policy = policy.unwrap_or(JoinPolicy {
-                    shape: JoinShape::All,
-                    fail: FailPolicy::FailFast,
-                });
-                let reducer_id = ReducerId::from(
-                    reducer_id
-                        .clone()
-                        .unwrap_or_else(|| "reduce_all_ordered".into()),
-                );
-                NodeKind::Par {
-                    children: children.iter().map(|c| c.node_id()).collect(),
-                    policy,
-                    reducer_id,
-                }
-            }
-            Flow::Scope { label, body, .. } => NodeKind::Scope {
-                label: label.clone(),
-                body: body.node_id(),
-            },
-            Flow::Maybe { body, .. } => NodeKind::Maybe {
-                body: body.as_deref().map(|b| b.node_id()),
-            },
-            Flow::Branch {
-                cond,
-                then_branch,
-                else_branch,
-                ..
-            } => NodeKind::Branch {
-                cond: cond.node_id(),
-                then_branch: then_branch.node_id(),
-                else_branch: else_branch.as_deref().map(|e| e.node_id()),
-            },
-            Flow::Call { label, .. } => NodeKind::Call {
-                label: label.clone(),
-                payload: serde_json::Value::Null,
-            },
-        }
+            .cloned()
+            .unwrap_or_else(|| panic!("unknown NodeId {id:?}"))
     }
 
     fn unit_value(&self) -> FlowValue {
@@ -562,8 +586,8 @@ pub struct FlowCursor;
 /// [`FlowStepper::results`] for debugger snapshots. Everything else —
 /// pending list, cancellation drain, frame tree projection, event
 /// counter, breakpoint peek-ahead, fan-out fold — lives on the engine.
-pub struct FlowStepper<'a> {
-    engine: Engine<FlowAst<'a>>,
+pub struct FlowStepper {
+    engine: Engine<FlowAst>,
     /// Successful `Call` results keyed by node id. The engine records
     /// values on `Frame::Value` leaves inside the arena but consumes
     /// them when the enclosing `Seq` advances; this map preserves them
@@ -572,17 +596,21 @@ pub struct FlowStepper<'a> {
     results: HashMap<NodeId, String>,
 }
 
-impl<'a> FlowStepper<'a> {
+impl FlowStepper {
     /// Creates a fresh stepper anchored at `root`, using the default
     /// reducer registry.
-    pub fn new(root: &'a Flow) -> Self {
+    ///
+    /// `root` is borrowed only while the [`FlowAst`] projection is built;
+    /// the resulting stepper owns its engine and holds no borrow of the
+    /// tree afterwards.
+    pub fn new(root: &Flow) -> Self {
         Self::with_registry(root, Arc::new(flow_default_registry()))
     }
 
     /// Creates a fresh stepper anchored at `root` with a caller-supplied
     /// reducer registry.
     pub fn with_registry(
-        root: &'a Flow,
+        root: &Flow,
         registry: Arc<ReducerRegistry<FlowValue, (), FlowEffectErr>>,
     ) -> Self {
         let engine = Engine::new(FlowAst::new(root), registry).expect("root Ast validation");
@@ -670,7 +698,7 @@ fn flow_value_to_text(v: &FlowValue) -> String {
 
 // ---------- v3 Stepper impl --------------------------------------------
 
-impl<'a> Stepper for FlowStepper<'a> {
+impl Stepper for FlowStepper {
     type Value = FlowValue;
     type Cursor = FlowCursor;
     type Delta = ();

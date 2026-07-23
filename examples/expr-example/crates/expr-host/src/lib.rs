@@ -26,8 +26,8 @@ const EXPR_DEMO_PROGRAM: &str = include_str!("./resources_data/demo-program.md")
 
 /// `DslHost` adapter around the arithmetic DSL.
 pub struct ExprHost {
-    program: &'static Expr,
-    engine: Engine<ExprAst<'static>>,
+    program: Expr,
+    engine: Engine<ExprAst>,
     /// Resolution history projected into `HostSnapshot::results`.
     resolved_log: Vec<(u64, String)>,
     final_value: Option<i64>,
@@ -37,13 +37,16 @@ impl ExprHost {
     /// Builds a host around the built-in demo program.
     pub fn new_with_default_program() -> Self {
         let ids = IdGen::new();
-        let program: &'static Expr = Box::leak(Box::new(demo_program(&ids)));
-        Self::with_program(program)
+        Self::with_program(demo_program(&ids))
     }
 
-    /// Builds a host around a caller-supplied `Expr` reference.
-    pub fn with_program(program: &'static Expr) -> Self {
-        let engine = expr_engine(program).expect("expr program validates");
+    /// Builds a host that owns a caller-supplied `Expr` program.
+    ///
+    /// The engine projects the tree into owned storage
+    /// ([`ExprAst`] = `OwnedDerivedAst`), so the host holds program and
+    /// engine together with no `Box::leak` and no `'static` requirement.
+    pub fn with_program(program: Expr) -> Self {
+        let engine = expr_engine(&program).expect("expr program validates");
         Self {
             program,
             engine,
@@ -74,11 +77,11 @@ impl DslHost for ExprHost {
     }
 
     fn ast_size(&self) -> usize {
-        count_nodes(self.program)
+        count_nodes(&self.program)
     }
 
     fn ast_pretty(&self) -> String {
-        pretty(self.program)
+        pretty(&self.program)
     }
 
     fn snapshot(&self) -> HostSnapshot {
@@ -228,7 +231,7 @@ impl DslHost for ExprHost {
     }
 
     fn reset(&mut self) {
-        self.engine = expr_engine(self.program).expect("expr program validates");
+        self.engine = expr_engine(&self.program).expect("expr program validates");
         self.resolved_log.clear();
         self.final_value = None;
     }
@@ -257,7 +260,7 @@ impl DslHost for ExprHost {
 
     fn lint_json(&self) -> Option<String> {
         use dsl_kit_lint::Linter;
-        let diagnostics = Linter::<Expr>::with_defaults().lint(self.program);
+        let diagnostics = Linter::<Expr>::with_defaults().lint(&self.program);
         let value: Vec<serde_json::Value> = diagnostics
             .into_iter()
             .map(|d| {
@@ -281,12 +284,9 @@ impl DslHost for ExprHost {
         let tree = from_json_str(input, &Expr::schema()).map_err(|e| e.to_json().to_string())?;
         let ids = IdGen::new();
         let program = Expr::from_parse_tree(&tree, &ids).map_err(|e| e.to_json().to_string())?;
-        // Same lifetime shape as the default program: leak the Box so
-        // the host keeps a `&'static Expr`. Each `load_json` call leaks
-        // one AST; acceptable for a demo host, but a production host
-        // owning a `Box<Expr>` would drop the previous program here.
-        let leaked: &'static Expr = Box::leak(Box::new(program));
-        self.program = leaked;
+        // Owned program: the host holds `Expr` by value, so replacing it
+        // drops the previous AST here — no `Box::leak`, no per-load leak.
+        self.program = program;
         self.reset();
         Ok(())
     }

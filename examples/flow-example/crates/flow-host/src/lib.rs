@@ -23,24 +23,27 @@ use flow_dsl::{Flow, FlowStepper, FlowValue, canned_response, pretty, research_p
 const FLOW_GRAMMAR: &str = include_str!("./resources_data/grammar.md");
 const FLOW_RESEARCH_PIPELINE: &str = include_str!("./resources_data/research-pipeline.md");
 
-/// `DslHost` that owns a leaked-static [`Flow`] program plus its
-/// stepper.
+/// `DslHost` that owns its [`Flow`] program outright, alongside the
+/// [`FlowStepper`] driving it.
+///
+/// The stepper's [`FlowAst`](flow_dsl::FlowAst) projection copies the
+/// tree's classification into owned storage, so the host holds program
+/// and stepper together with no `Box::leak` and no `'static` borrow.
 pub struct FlowHost {
-    program: &'static Flow,
-    stepper: FlowStepper<'static>,
+    program: Flow,
+    stepper: FlowStepper,
 }
 
 impl FlowHost {
     /// Builds a host around the built-in research pipeline.
     pub fn new_with_default_program() -> Self {
         let ids = IdGen::new();
-        let program: &'static Flow = Box::leak(Box::new(research_pipeline(&ids)));
-        Self::with_program(program)
+        Self::with_program(research_pipeline(&ids))
     }
 
-    /// Builds a host around a caller-supplied `Flow` reference.
-    pub fn with_program(program: &'static Flow) -> Self {
-        let stepper = FlowStepper::new(program);
+    /// Builds a host that owns a caller-supplied `Flow` program.
+    pub fn with_program(program: Flow) -> Self {
+        let stepper = FlowStepper::new(&program);
         Self { program, stepper }
     }
 }
@@ -70,11 +73,11 @@ impl DslHost for FlowHost {
     }
 
     fn ast_size(&self) -> usize {
-        count_nodes(self.program)
+        count_nodes(&self.program)
     }
 
     fn ast_pretty(&self) -> String {
-        pretty(self.program)
+        pretty(&self.program)
     }
 
     fn snapshot(&self) -> HostSnapshot {
@@ -293,7 +296,7 @@ impl DslHost for FlowHost {
     }
 
     fn reset(&mut self) {
-        self.stepper = FlowStepper::new(self.program);
+        self.stepper = FlowStepper::new(&self.program);
     }
 
     fn resources(&self) -> Vec<ResourceEntry> {
@@ -320,7 +323,7 @@ impl DslHost for FlowHost {
 
     fn lint_json(&self) -> Option<String> {
         use dsl_kit_lint::Linter;
-        let diagnostics = Linter::<Flow>::with_defaults().lint(self.program);
+        let diagnostics = Linter::<Flow>::with_defaults().lint(&self.program);
         let value: Vec<serde_json::Value> = diagnostics
             .into_iter()
             .map(|d| {
@@ -429,13 +432,13 @@ mod tests {
         // the JSON envelope intact.
         let ids = IdGen::new();
         let empty_seq_id = ids.node();
-        let program: &'static Flow = Box::leak(Box::new(Flow::Seq {
+        let program = Flow::Seq {
             id: ids.node(),
             children: vec![Flow::Seq {
                 id: empty_seq_id,
                 children: vec![],
             }],
-        }));
+        };
         let host = FlowHost::with_program(program);
         let text = host.lint_json().expect("FlowHost wires lint_json");
         let value: serde_json::Value =

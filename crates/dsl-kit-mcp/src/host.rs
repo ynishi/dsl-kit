@@ -168,6 +168,16 @@ fn step_budget_exceeded_msg(budget: usize) -> String {
 /// budget-exceeded message. Such hosts typically override
 /// [`supports_calls`](Self::supports_calls) to return `false`.
 ///
+/// A host is long-lived by nature (it owns its program and engine for
+/// the whole MCP session, and `load` replaces the program repeatedly),
+/// so build the engine over an owned AST — [`dsl_kit::OwnedDerivedAst`]
+/// for derive-based DSLs, or a hand-written projection like the flow
+/// example's `FlowAst` — rather than leaking the program with
+/// `Box::leak` to satisfy a borrow-based `Ast`. The owned projection
+/// borrows the tree only during construction, so `program: N` and the
+/// engine can live in the same struct and `reset` / `load` re-project
+/// without accumulating memory.
+///
 /// The trait uses [`async_trait`] to stay `dyn`-compatible; the MCP
 /// handler holds a `Box<dyn DslHost>`.
 #[async_trait::async_trait]

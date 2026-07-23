@@ -1199,6 +1199,13 @@ pub trait DslSemantics {
 /// Construction walks the tree once to build the `NodeId -> node`
 /// lookup; `node_kind` / `literal` then delegate to the derived
 /// classification and every semantic hook to `S`.
+///
+/// This form borrows the tree (`&'a N`), so an [`Engine`] built from it
+/// cannot outlive the program it walks — the right choice for a
+/// transient engine. See [`OwnedDerivedAst`] for a variant that projects
+/// the tree into owned storage and carries no lifetime; reach for it
+/// when embedding an engine in a long-lived host that would otherwise
+/// need `Box::leak` to keep program and engine together.
 pub struct DerivedAst<'a, N, S> {
     root: &'a N,
     by_id: HashMap<NodeId, &'a N>,
@@ -1265,6 +1272,134 @@ where
 
     fn literal(&self, node: NodeId) -> Option<Self::Value> {
         self.node(node).exec_literal().map(S::Value::from)
+    }
+}
+
+/// Owned counterpart of [`DerivedAst`]: an engine-ready [`Ast`] that
+/// carries no borrow of the source tree.
+///
+/// [`DerivedAst`] keeps `&'a N` references into a live tree, so an
+/// [`Engine`] built from it cannot outlive that tree. A long-lived host
+/// that wants to hold its program and engine together in one struct
+/// therefore had to synthesise a `&'static` borrow with `Box::leak`.
+/// `OwnedDerivedAst` removes that need: its constructor walks `root`
+/// once, projecting each node's classification ([`NodeKind`]) and
+/// literal payload into an owned side table. The borrow ends when the
+/// constructor returns, so the result carries no lifetime — a host can
+/// own `program: N` alongside `engine: Engine<OwnedDerivedAst<L, S>>` in
+/// the same struct with no leak and no `unsafe` (and no `Arc`).
+///
+/// Use [`DerivedAst`] when a borrow of the tree is acceptable — a
+/// transient engine that lives no longer than the program it walks. Use
+/// `OwnedDerivedAst` when the engine is embedded in a long-lived host.
+///
+/// When `L` and `S` are both [`Clone`], `OwnedDerivedAst` is `Clone`,
+/// so a host can keep a pristine copy of the projection to rebuild the
+/// engine from on reset.
+pub struct OwnedDerivedAst<L, S> {
+    root: NodeId,
+    nodes: HashMap<NodeId, OwnedNode<L>>,
+    sem: S,
+}
+
+/// Owned per-node projection captured by [`OwnedDerivedAst::new`]: the
+/// node's engine classification plus its literal payload, both stored
+/// by value so the projection outlives the source tree.
+#[derive(Clone)]
+struct OwnedNode<L> {
+    kind: NodeKind,
+    literal: Option<L>,
+}
+
+impl<L, S> OwnedDerivedAst<L, S> {
+    /// Walks `root` once, projecting each node's classification and
+    /// literal payload into owned storage. The borrow ends when this
+    /// constructor returns — the result carries no lifetime.
+    pub fn new<N>(root: &N, sem: S) -> Self
+    where
+        N: DslExec<LitValue = L>,
+    {
+        fn collect<N: DslExec>(node: &N, map: &mut HashMap<NodeId, OwnedNode<N::LitValue>>) {
+            map.insert(
+                node.node_id(),
+                OwnedNode {
+                    kind: node.exec_kind(),
+                    literal: node.exec_literal(),
+                },
+            );
+            for child in node.children() {
+                collect(child, map);
+            }
+        }
+        let mut nodes = HashMap::new();
+        collect(root, &mut nodes);
+        Self {
+            root: root.node_id(),
+            nodes,
+            sem,
+        }
+    }
+
+    fn node(&self, id: NodeId) -> &OwnedNode<L> {
+        self.nodes.get(&id).expect("unknown NodeId")
+    }
+}
+
+impl<L, S> Clone for OwnedDerivedAst<L, S>
+where
+    L: Clone,
+    S: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root,
+            nodes: self.nodes.clone(),
+            sem: self.sem.clone(),
+        }
+    }
+}
+
+impl<L, S> Ast for OwnedDerivedAst<L, S>
+where
+    L: Clone + fmt::Debug,
+    S: DslSemantics,
+    S::Value: From<L>,
+{
+    type Value = S::Value;
+    type Delta = S::Delta;
+    type EffectError = S::EffectError;
+    type Cursor = S::Cursor;
+
+    fn root(&self) -> NodeId {
+        self.root
+    }
+
+    fn node_kind(&self, id: NodeId) -> NodeKind {
+        self.node(id).kind.clone()
+    }
+
+    fn unit_value(&self) -> Self::Value {
+        self.sem.unit_value()
+    }
+
+    fn truthy(&self, value: &Self::Value) -> Option<bool> {
+        self.sem.truthy(value)
+    }
+
+    fn continue_loop(&self, node: NodeId, last: &Self::Value, iteration: usize) -> LoopDecision {
+        self.sem.continue_loop(node, last, iteration)
+    }
+
+    fn bind_delta(&self, name: &str, value: &Self::Value) -> Option<Self::Delta> {
+        self.sem.bind_delta(name, value)
+    }
+
+    fn lookup(&self, delta: &Self::Delta, name: &str) -> Option<Self::Value> {
+        self.sem.lookup(delta, name)
+    }
+
+    fn literal(&self, node: NodeId) -> Option<Self::Value> {
+        self.node(node).literal.clone().map(S::Value::from)
     }
 }
 

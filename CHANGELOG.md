@@ -85,6 +85,41 @@ Normalized type names in schema / diagnostics — closes GH issue #4.
   should update; parse-side comparisons were already
   whitespace-insensitive via `strip_ws`.
 
+Owned AST projection so long-lived hosts avoid `Box::leak` — closes
+GH issue #2. Stronger than the issue's original `Arc` sketch: the
+projection needs neither `Arc` nor `unsafe`, and the resulting engine
+is genuinely `'static` (it borrows nothing), so a host can hold its
+program and engine in one struct and drop / replace the program on
+its own terms.
+
+- `dsl-kit-core` — new `OwnedDerivedAst<L, S>`, the owned counterpart
+  of `DerivedAst<'a, N, S>`. `OwnedDerivedAst::new(&root, sem)` walks
+  the tree once and projects each node's `NodeKind` classification and
+  literal payload into an owned side table; the borrow of `root` ends
+  when the constructor returns, so the value carries no lifetime.
+  Implements `Ast` under the same bounds as `DerivedAst`
+  (`L: Clone + Debug`, `S: DslSemantics`, `S::Value: From<L>`) and is
+  `Clone` when `L` and `S` both are, letting a host keep a pristine
+  copy to rebuild from on reset. `DerivedAst` is unchanged and remains
+  the right choice for a transient engine that lives no longer than the
+  program it walks — this is purely additive.
+- `dsl-kit` — `OwnedDerivedAst` is re-exported through the crate's
+  wholesale `pub use dsl_kit_core::*` facade.
+- `dsl-kit-cli` — the built-in reference host (`RefHost`) now owns its
+  `Ref` program by value and builds its engine over `OwnedDerivedAst`;
+  the two `Box::leak` sites (default program + `load_json`) are gone,
+  and `load_json` drops the previous program instead of leaking.
+- `examples/expr-example` — `ExprAst` is now
+  `OwnedDerivedAst<<Expr as DslExec>::LitValue, ExprSemantics>` (no
+  lifetime); `ExprHost` owns its `Expr` and drops both `Box::leak`
+  sites. `expr_engine` returns a `'static` `Engine<ExprAst>`.
+- `examples/flow-example` — worked example of the hand-written owned
+  projection for a non-derive AST: `FlowAst` drops its lifetime
+  parameter and stores each node's `NodeKind` by value (via the new
+  `flow_node_kind` helper) instead of borrowing `&Flow`; `FlowStepper`
+  and `FlowHost` shed their lifetimes and `FlowHost` owns its `Flow`
+  program with no `Box::leak`.
+
 ## [0.2.0] - 2026-07-22
 
 Fuzzy-match `did you mean X?` hints wired through every `unknown-*`

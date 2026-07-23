@@ -212,7 +212,7 @@ fn synthesized_examples_cover_every_variant_and_build_typed() {
 /// Answers each `Call` with `done:<label>`.
 struct EchoResolver;
 
-impl<'a> EffectResolver<FlowAst<'a>> for EchoResolver {
+impl EffectResolver<FlowAst> for EchoResolver {
     fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
         let SuspendReason::Call { spec } = &pending.reason else {
             unreachable!("drive only hands Call suspensions to the resolver");

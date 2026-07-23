@@ -55,7 +55,7 @@ struct CannedResolver {
     results: Vec<(NodeId, String)>,
 }
 
-impl<'a> EffectResolver<FlowAst<'a>> for CannedResolver {
+impl EffectResolver<FlowAst> for CannedResolver {
     fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
         let label = match &pending.reason {
             SuspendReason::Call { spec } => spec.label.clone(),
@@ -82,7 +82,7 @@ struct SlowCannedResolver {
     resolved: usize,
 }
 
-impl<'a> AsyncEffectResolver<FlowAst<'a>> for SlowCannedResolver {
+impl AsyncEffectResolver<FlowAst> for SlowCannedResolver {
     async fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
         let label = match &pending.reason {
             SuspendReason::Call { spec } => spec.label.clone(),
@@ -272,7 +272,7 @@ fn demonstrate_value_branch() {
         cache: &'static str,
         labels: Vec<String>,
     }
-    impl<'a> EffectResolver<FlowAst<'a>> for GateResolver {
+    impl EffectResolver<FlowAst> for GateResolver {
         fn resolve(&mut self, pending: &Pending) -> Result<FlowValue, FlowEffectErr> {
             let label = match &pending.reason {
                 SuspendReason::Call { spec } => spec.label.clone(),

@@ -18,8 +18,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use dsl_kit::{
-    DerivedAst, DslNode, DslSemantics, Engine, EngineError, ExecError, IdGen, NodeContext, NodeId,
-    Op, OpRegistry, Path, Phase, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
+    DslExec, DslNode, DslSemantics, Engine, EngineError, ExecError, IdGen, NodeContext, NodeId, Op,
+    OpRegistry, OwnedDerivedAst, Path, Phase, ReducerRegistry, StepOutcome, Stepper, SuspendReason,
     SuspensionId, Walk,
 };
 
@@ -212,7 +212,11 @@ impl DslSemantics for ExprSemantics {
 
 /// Engine-ready [`Ast`] over `Expr`: derived classification zipped
 /// with [`ExprSemantics`].
-pub type ExprAst<'a> = DerivedAst<'a, Expr, ExprSemantics>;
+///
+/// Owned projection ([`OwnedDerivedAst`]): the engine carries no borrow
+/// of the `Expr` tree, so a long-lived host can own its program and
+/// engine together without `Box::leak`.
+pub type ExprAst = OwnedDerivedAst<<Expr as DslExec>::LitValue, ExprSemantics>;
 
 /// A binary arithmetic op with strict arity.
 struct BinOp {
@@ -254,9 +258,12 @@ pub fn expr_ops() -> Arc<OpRegistry<i64>> {
 }
 
 /// Builds a fresh engine over `expr` with the standard op table.
-pub fn expr_engine(expr: &Expr) -> Result<Engine<ExprAst<'_>>, EngineError> {
+///
+/// The returned engine owns its [`OwnedDerivedAst`] projection and holds
+/// no borrow of `expr`, so the result carries no lifetime.
+pub fn expr_engine(expr: &Expr) -> Result<Engine<ExprAst>, EngineError> {
     Engine::new_with_ops(
-        DerivedAst::new(expr, ExprSemantics),
+        OwnedDerivedAst::new(expr, ExprSemantics),
         Arc::new(ReducerRegistry::new()),
         expr_ops(),
     )

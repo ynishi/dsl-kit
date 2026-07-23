@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use dsl_kit::{
-    BreakpointSet, DerivedAst, DslNode, DslSemantics, Engine, EngineError, IdGen, NodeContext,
-    NodeId, Op, OpRegistry, Path, Pending, ReducerRegistry, StepOutcome, Stepper,
+    BreakpointSet, DslExec, DslNode, DslSemantics, Engine, EngineError, IdGen, NodeContext, NodeId,
+    Op, OpRegistry, OwnedDerivedAst, Path, Pending, ReducerRegistry, StepOutcome, Stepper,
 };
 use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection, ResolvedCall,
@@ -181,7 +181,11 @@ impl DslSemantics for RefSemantics {
 }
 
 /// Engine-ready `Ast` over `Ref`.
-pub type RefAst<'a> = DerivedAst<'a, Ref, RefSemantics>;
+///
+/// Owned projection (see [`OwnedDerivedAst`]): the engine holds no borrow
+/// of the `Ref` tree, so [`RefHost`] can own its program and engine in
+/// the same struct without `Box::leak`.
+pub type RefAst = OwnedDerivedAst<<Ref as DslExec>::LitValue, RefSemantics>;
 
 /// Binary arithmetic op.
 struct BinOp {
@@ -220,9 +224,9 @@ fn ops() -> Arc<OpRegistry<i64>> {
     Arc::new(ops)
 }
 
-fn engine(root: &Ref) -> Result<Engine<RefAst<'_>>, EngineError> {
+fn engine(root: &Ref) -> Result<Engine<RefAst>, EngineError> {
     Engine::new_with_ops(
-        DerivedAst::new(root, RefSemantics),
+        OwnedDerivedAst::new(root, RefSemantics),
         Arc::new(ReducerRegistry::new()),
         ops(),
     )
@@ -305,8 +309,8 @@ With `y = 5, z = 2` it completes to `16`.
 /// `DslHost` adapter around the reference DSL — an [`Engine`] wrapper
 /// symmetric to `expr-host`, so the MCP surface stays generic.
 pub struct RefHost {
-    program: &'static Ref,
-    engine: Engine<RefAst<'static>>,
+    program: Ref,
+    engine: Engine<RefAst>,
     resolved_log: Vec<(u64, String)>,
     final_value: Option<i64>,
 }
@@ -315,12 +319,14 @@ impl RefHost {
     /// Build a host around the built-in demo program.
     pub fn new_with_default_program() -> Self {
         let ids = IdGen::new();
-        let program: &'static Ref = Box::leak(Box::new(demo_program(&ids)));
-        Self::with_program(program)
+        Self::with_program(demo_program(&ids))
     }
 
-    fn with_program(program: &'static Ref) -> Self {
-        let engine = engine(program).expect("reference program validates");
+    /// Build a host that owns `program` outright. The engine projects the
+    /// tree into owned storage ([`OwnedDerivedAst`]), so no `Box::leak`
+    /// is needed to keep program and engine together.
+    fn with_program(program: Ref) -> Self {
+        let engine = engine(&program).expect("reference program validates");
         Self {
             program,
             engine,
@@ -351,11 +357,11 @@ impl DslHost for RefHost {
     }
 
     fn ast_size(&self) -> usize {
-        count_nodes(self.program)
+        count_nodes(&self.program)
     }
 
     fn ast_pretty(&self) -> String {
-        pretty(self.program)
+        pretty(&self.program)
     }
 
     fn snapshot(&self) -> HostSnapshot {
@@ -501,7 +507,7 @@ impl DslHost for RefHost {
     }
 
     fn reset(&mut self) {
-        self.engine = engine(self.program).expect("reference program validates");
+        self.engine = engine(&self.program).expect("reference program validates");
         self.resolved_log.clear();
         self.final_value = None;
     }
@@ -522,7 +528,7 @@ impl DslHost for RefHost {
 
     fn lint_json(&self) -> Option<String> {
         use dsl_kit_lint::Linter;
-        let diagnostics = Linter::<Ref>::with_defaults().lint(self.program);
+        let diagnostics = Linter::<Ref>::with_defaults().lint(&self.program);
         let value: Vec<serde_json::Value> = diagnostics
             .into_iter()
             .map(|d| {
@@ -543,8 +549,9 @@ impl DslHost for RefHost {
         let tree = from_json_str(input, &Ref::schema()).map_err(|e| e.to_json().to_string())?;
         let ids = IdGen::new();
         let program = Ref::from_parse_tree(&tree, &ids).map_err(|e| e.to_json().to_string())?;
-        let leaked: &'static Ref = Box::leak(Box::new(program));
-        self.program = leaked;
+        // Owned program: replace the previous one outright (the old `Ref`
+        // is dropped here) and re-project via `reset` — no `Box::leak`.
+        self.program = program;
         self.reset();
         Ok(())
     }
