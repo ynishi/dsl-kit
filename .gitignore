@@ -4,3 +4,5 @@ workspace
 .mcp.json
 target
 .codex
+logs
+.metadata_cache/
