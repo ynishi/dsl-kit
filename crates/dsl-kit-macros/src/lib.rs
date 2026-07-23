@@ -105,6 +105,46 @@ fn matches_enum(ty: &Type, enum_name: &Ident) -> bool {
     }
 }
 
+/// Payload-side (non-recursive) type shape recognized by the derive.
+///
+/// Mirrors the child-side [`Recursion`] enum but only tracks the two
+/// wrappers whose absence has an obvious default: `Option<T>` (→ `None`)
+/// and `Vec<T>` (→ empty vec). Any other payload type is treated as
+/// `PayloadShape::Bare` and takes the `build_field` path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PayloadShape {
+    /// Plain payload type: uses `dsl_kit_parse::build_field`.
+    Bare,
+    /// `Option<T>` where `T` is not the enum itself. Absent field →
+    /// `None`.
+    OptionInner,
+    /// `Vec<T>` where `T` is not the enum itself. Absent field →
+    /// `vec![]`.
+    VecInner,
+}
+
+/// Classifies a payload field by outer wrapper. Recursive shapes
+/// (detected by [`detect_recursion`]) are handled separately and never
+/// pass through here.
+fn payload_shape(ty: &Type, enum_name: &Ident) -> (PayloadShape, Option<Type>) {
+    let Some(seg) = last_segment(ty) else {
+        return (PayloadShape::Bare, None);
+    };
+    let Some(inner) = single_generic_type(seg) else {
+        return (PayloadShape::Bare, None);
+    };
+    // `Option<T>` / `Vec<T>` where `T` itself is the enum are recursive
+    // shapes handled by `detect_recursion`; skip them here.
+    if matches_enum(inner, enum_name) {
+        return (PayloadShape::Bare, None);
+    }
+    match seg.ident.to_string().as_str() {
+        "Option" => (PayloadShape::OptionInner, Some(inner.clone())),
+        "Vec" => (PayloadShape::VecInner, Some(inner.clone())),
+        _ => (PayloadShape::Bare, None),
+    }
+}
+
 fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
     if matches_enum(ty, enum_name) {
         return Some(Recursion::Direct);
@@ -376,10 +416,16 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                 });
             } else {
                 let ty_src = f.ty.to_token_stream().to_string();
+                let (shape, _) = payload_shape(&f.ty, &name);
+                let optional = matches!(
+                    shape,
+                    PayloadShape::OptionInner | PayloadShape::VecInner,
+                );
                 field_ctors.push(quote! {
                     ::dsl_kit_schema::FieldSchema {
                         name: #ident_str.to_string(),
                         ty: #ty_src.to_string(),
+                        optional: #optional,
                     }
                 });
             }
@@ -506,7 +552,35 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                     .to_compile_error()
                     .into();
                 }
-                let_bindings.push(quote! { let #ident = #path(tree, #ident_str)?; });
+                // If the field's type is `Option<T>` or `Vec<T>` the
+                // schema marks it optional (see `derive_dsl_schema`),
+                // so `check_conformance` no longer diagnoses absence.
+                // The converter would still error on the missing field,
+                // so short-circuit to the natural default before we
+                // call it: `None` for `Option<T>`, `vec![]` for
+                // `Vec<T>`. Bare payload types still delegate
+                // unconditionally.
+                let (shape, _) = payload_shape(&f.ty, &name);
+                let call = match shape {
+                    PayloadShape::OptionInner => quote! {
+                        let #ident = if tree.field(#ident_str).is_some() {
+                            #path(tree, #ident_str)?
+                        } else {
+                            ::std::option::Option::None
+                        };
+                    },
+                    PayloadShape::VecInner => quote! {
+                        let #ident = if tree.field(#ident_str).is_some() {
+                            #path(tree, #ident_str)?
+                        } else {
+                            ::std::vec::Vec::new()
+                        };
+                    },
+                    PayloadShape::Bare => quote! {
+                        let #ident = #path(tree, #ident_str)?;
+                    },
+                };
+                let_bindings.push(call);
                 ctor_fields.push(quote! { #ident });
                 continue;
             }
@@ -542,9 +616,31 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                 ctor_fields.push(quote! { #ident });
             } else {
                 let ty = &f.ty;
-                let_bindings.push(quote! {
-                    let #ident: #ty = ::dsl_kit_parse::build_field(tree, #ident_str)?;
-                });
+                let (shape, inner) = payload_shape(&f.ty, &name);
+                match (shape, inner) {
+                    (PayloadShape::OptionInner, Some(inner_ty)) => {
+                        let_bindings.push(quote! {
+                            let #ident: #ty =
+                                ::dsl_kit_parse::build_field_optional::<#inner_ty>(
+                                    tree, #ident_str,
+                                )?;
+                        });
+                    }
+                    (PayloadShape::VecInner, Some(inner_ty)) => {
+                        let_bindings.push(quote! {
+                            let #ident: #ty =
+                                ::dsl_kit_parse::build_field_vec::<#inner_ty>(
+                                    tree, #ident_str,
+                                )?;
+                        });
+                    }
+                    _ => {
+                        let_bindings.push(quote! {
+                            let #ident: #ty =
+                                ::dsl_kit_parse::build_field(tree, #ident_str)?;
+                        });
+                    }
+                }
                 ctor_fields.push(quote! { #ident });
             }
         }

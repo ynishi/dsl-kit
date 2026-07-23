@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Built-in optional payload fields and standard `Vec<String>` /
+`Option<String>` mapping — the "AI clients can omit noise fields"
+contract that closes GH issue #1.
+
+- `dsl-kit-schema` — `FieldSchema` gains a `pub optional: bool`. Set
+  to `true` for payload fields whose absence is a valid tree shape
+  (typically `Option<T>` → `None`, `Vec<T>` → empty). `to_json`
+  emits `"optional": true` only when set, preserving the pre-0.3
+  layout for required fields. Helper constructors
+  `FieldSchema::required` / `::optional` cut boilerplate for
+  hand-written schemas. **Breaking:** struct-literal callers must
+  add `optional: <bool>` to every `FieldSchema { ... }` site.
+- `dsl-kit-macros` — `#[derive(DslSchema)]` sets `optional: true`
+  automatically for payload fields typed `Option<T>` / `Vec<T>`
+  (where `T` is not the enum itself). `#[derive(DslBuild)]` routes
+  those types to new `build_field_optional` / `build_field_vec`
+  helpers by default (no `#[dsl_build(with = ...)]` needed for
+  plain `Option<String>` / `Vec<String>` / any `Option<T>` /
+  `Vec<T>` where `T: DeserializeOwned` + `FromStr` for `Option`).
+  `#[dsl_build(with = path)]` on an optional payload short-circuits
+  to `None` / `vec![]` when the field is absent, so hand-written
+  converters no longer need to defend against missing keys.
+- `dsl-kit-parse` — `check_conformance` skips the `MISSING_FIELD`
+  diagnostic for `optional: true` fields; the pair-hint pass in
+  `missing_slot_names` skips them too so `did you mean X (missing)`
+  never mislabels an optional slot. New public helpers
+  `build_field_optional::<T>` / `build_field_vec::<T>` handle every
+  canonical shape of absence: missing field, JSON `null`, canonical
+  text `none`, empty bracketed list.
+- `dsl-kit-parse::schema_gen` — built-in canonical-syntax mappings
+  added for `Option<String>` (`none` | `%str`) and `Vec<String>`
+  (`[ %str_raw ("," %str_raw)* ]`, empty list allowed). Variants
+  that carry at least one optional field emit a permissive
+  argument-list form (`(arg ("," arg)*)?`) so authors and AI
+  emitters may omit any subset of optional args from the canonical
+  text; `check_conformance` remains the authority on required /
+  duplicate / unknown-slot diagnostics.
+- `dsl-kit-parse::peg` — new `%str_raw` token: same match as
+  `%str` but contributes the raw source slice (quotes + escape
+  sequences intact) so `build_field_vec` can hand the joined field
+  text straight to `serde_json::from_str`.
+- `examples/flow-example/crates/flow-dsl` — `Par::reducer_id`
+  (`Option<String>`) loses its `#[dsl_build(with = parse_reducer_id)]`
+  attribute, `parse_reducer_id` is removed, and
+  `flow_syntax_overrides` sheds its `Option<String>` entry. The
+  built-in Layer 2 mapping now covers the shape end-to-end. Only
+  `policy: Option<JoinPolicy>` (a non-`String` `Option`) still
+  needs its `SyntaxOverrides` value production and `parse_policy`
+  converter.
+
 ## [0.2.0] - 2026-07-22
 
 Fuzzy-match `did you mean X?` hints wired through every `unknown-*`

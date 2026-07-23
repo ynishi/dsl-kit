@@ -111,18 +111,59 @@ impl VariantSchema {
 /// `"Option<JoinPolicy>"`). Kept as a string so the schema stays
 /// self-contained — consumers that need structured type information
 /// should parse it or extend the derive to emit richer field info.
+///
+/// `optional` marks fields whose absence is a valid tree shape.
+/// `#[derive(DslSchema)]` sets it automatically for payload types
+/// spelled `Option<T>` (missing → `None`) and `Vec<T>` (missing →
+/// empty). Hand-written schemas may set it directly. Optional fields
+/// are skipped by [`check_conformance`](../dsl_kit_parse/fn.check_conformance.html)'s
+/// `MISSING_FIELD` diagnostic and by `schema_gen`'s canonical PEG they
+/// may be omitted from the argument list entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSchema {
     /// Field name.
     pub name: String,
     /// Rust type as source text.
     pub ty: String,
+    /// Whether absence of this field is a valid shape (see the type
+    /// docs). Defaults to `false` (required) for hand-written schemas.
+    pub optional: bool,
 }
 
 impl FieldSchema {
+    /// Builds a required (non-optional) field. Convenience for
+    /// hand-written schemas that do not care about the optionality
+    /// flag; equivalent to a struct literal with `optional: false`.
+    pub fn required(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            optional: false,
+        }
+    }
+
+    /// Builds an optional field. Equivalent to a struct literal with
+    /// `optional: true`.
+    pub fn optional(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            optional: true,
+        }
+    }
+
     /// Renders the field as a JSON value.
+    ///
+    /// `optional: true` is emitted as an extra `"optional": true` key;
+    /// required fields omit the key entirely, preserving the pre-0.3
+    /// JSON layout so external consumers that do not know about the
+    /// flag are unaffected.
     pub fn to_json(&self) -> Value {
-        json!({ "name": self.name, "type": self.ty })
+        if self.optional {
+            json!({ "name": self.name, "type": self.ty, "optional": true })
+        } else {
+            json!({ "name": self.name, "type": self.ty })
+        }
     }
 }
 

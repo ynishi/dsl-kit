@@ -328,6 +328,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "value".into(),
                         ty: "i64".into(),
+                        optional: false,
                     }],
                     children: vec![],
                 },
@@ -350,6 +351,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "name".into(),
                         ty: "String".into(),
+                        optional: false,
                     }],
                     children: vec![
                         ChildSchema {

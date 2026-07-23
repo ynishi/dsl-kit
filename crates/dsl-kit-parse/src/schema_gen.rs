@@ -228,10 +228,21 @@ pub fn grammar_from_schema_with(
     Ok(Grammar::new(rules, START_RULE))
 }
 
-/// Builds the rule for one variant:
-/// `Node { variant } [ %kw:V "(" arg ("," arg)* ")" ]` with arguments
-/// in schema order (fields, then children).
+/// Builds the rule for one variant. Two shapes:
+///
+/// - **Strict-order** (default, variant has no optional fields):
+///   `%kw:V "(" arg ("," arg)* ")"` with arguments emitted in schema
+///   order (fields, then children). Preserves the pre-0.3 canonical
+///   spelling for variants that never omit.
+/// - **Free-order** (variant has ≥ 1 optional field): `%kw:V "(" (arg
+///   ("," arg)*)? ")"` where each arg is `arg_1 | arg_2 | ...` and
+///   every alternative carries its own `%kw:name` prefix. Args are
+///   distinguishable by that name-keyword, so the DSL author may
+///   omit any subset of optional arguments (or even all of them),
+///   and `check_conformance` remains the authority on required /
+///   duplicate / unknown-slot diagnostics.
 fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> Peg {
+    let has_optional = v.fields.iter().any(|f| f.optional);
     let mut args: Vec<Peg> = Vec::new();
     for f in &v.fields {
         let value = resolved_field_value_peg(&v.name, f, ids, overrides)
@@ -250,11 +261,49 @@ fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> 
     }
 
     let mut items = vec![token(ids, format!("%kw:{}", v.name)), token(ids, "(")];
-    for (i, arg) in args.into_iter().enumerate() {
-        if i > 0 {
-            items.push(token(ids, ","));
+    if has_optional && !args.is_empty() {
+        // Free-order: any of the argument shapes, comma-separated,
+        // whole list optional. Each argument-slot is a Field capture
+        // in its own right (built above), and the name-keyword prefix
+        // keeps the alternation unambiguous at the byte level.
+        let arg_choice = choice(ids, args);
+        // The tail repeats `("," arg_choice)`; we rebuild arg_choice
+        // per position so each Choice node gets a fresh id (Peg nodes
+        // are id-unique in a grammar).
+        let tail_alt = |ids: &IdGen| -> Peg {
+            let mut alts: Vec<Peg> = Vec::new();
+            for f in &v.fields {
+                let value = resolved_field_value_peg(&v.name, f, ids, overrides)
+                    .expect("unsupported field types were rejected before rule generation");
+                alts.push(seq(
+                    ids,
+                    vec![
+                        token(ids, format!("%kw:{}", f.name)),
+                        token(ids, ":"),
+                        field(ids, f.name.clone(), value),
+                    ],
+                ));
+            }
+            for c in &v.children {
+                alts.push(child_arg_peg(c, ids));
+            }
+            choice(ids, alts)
+        };
+        let tail = repeat(
+            ids,
+            seq(ids, vec![token(ids, ","), tail_alt(ids)]),
+            0,
+            None,
+        );
+        let full = seq(ids, vec![arg_choice, tail]);
+        items.push(repeat(ids, full, 0, Some(1)));
+    } else {
+        for (i, arg) in args.into_iter().enumerate() {
+            if i > 0 {
+                items.push(token(ids, ","));
+            }
+            items.push(arg);
         }
-        items.push(arg);
     }
     items.push(token(ids, ")"));
 
@@ -281,18 +330,66 @@ fn resolved_field_value_peg(
 
 /// Built-in value production for a payload field, by Rust type source
 /// text. `None` when the type has no canonical-syntax mapping.
+///
+/// Recognised (whitespace-insensitive on the type-source spelling):
+///
+/// - `String` → `%str`
+/// - the integer types → `%int`
+/// - `bool` → `true` / `false`
+/// - `Option<String>` → `none` | `%str`
+/// - `Vec<String>` → `[ %str ("," %str)* ]`, empty list allowed
+///
+/// The last two entries realise Layer 2 of the "built-in optional
+/// payload fields" contract — downstream DSLs no longer need to
+/// register a [`SyntaxOverrides`] entry (nor a paired
+/// `#[dsl_build(with = ...)]` converter) for these shapes.
 fn field_value_peg(f: &FieldSchema, ids: &IdGen) -> Option<Peg> {
     const INT_TYPES: &[&str] = &[
         "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
     ];
-    if f.ty == "String" {
+    let ty = strip_ws(&f.ty);
+    if ty == "String" {
         Some(token(ids, "%str"))
-    } else if INT_TYPES.contains(&f.ty.as_str()) {
+    } else if INT_TYPES.contains(&ty.as_str()) {
         Some(token(ids, "%int"))
-    } else if f.ty == "bool" {
+    } else if ty == "bool" {
         Some(choice(
             ids,
             vec![token(ids, "%kw:true"), token(ids, "%kw:false")],
+        ))
+    } else if ty == "Option<String>" {
+        // Canonical spelling of an absent Option-payload; mirrors the
+        // `Multiplicity::Optional` child idiom.
+        Some(choice(
+            ids,
+            vec![token(ids, "%kw:none"), token(ids, "%str")],
+        ))
+    } else if ty == "Vec<String>" {
+        // `[ %str_raw ("," %str_raw)* ]` with empty list allowed.
+        // `%str_raw` (peg-level primitive) contributes the raw
+        // source slice for each element — quotes and escapes intact —
+        // so the joined field text is a JSON-compatible array literal
+        // that `build_field_vec` can hand straight to
+        // `serde_json::from_str`.
+        let elems = seq(
+            ids,
+            vec![
+                token(ids, "%str_raw"),
+                repeat(
+                    ids,
+                    seq(ids, vec![token(ids, ","), token(ids, "%str_raw")]),
+                    0,
+                    None,
+                ),
+            ],
+        );
+        Some(seq(
+            ids,
+            vec![
+                token(ids, "["),
+                repeat(ids, elems, 0, Some(1)),
+                token(ids, "]"),
+            ],
         ))
     } else {
         None
@@ -411,6 +508,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "value".into(),
                         ty: "i64".into(),
+                        optional: false,
                     }],
                     children: vec![],
                 },
@@ -420,10 +518,12 @@ mod tests {
                         FieldSchema {
                             name: "text".into(),
                             ty: "String".into(),
+                            optional: false,
                         },
                         FieldSchema {
                             name: "quoted".into(),
                             ty: "bool".into(),
+                            optional: false,
                         },
                     ],
                     children: vec![],
@@ -575,10 +675,12 @@ mod tests {
                     FieldSchema {
                         name: "policy".into(),
                         ty: "Option<JoinPolicy>".into(),
+                        optional: false,
                     },
                     FieldSchema {
                         name: "reducer".into(),
                         ty: "ReducerId".into(),
+                        optional: false,
                     },
                 ],
                 children: vec![],
@@ -606,10 +708,12 @@ mod tests {
                             name: "policy".into(),
                             // Token-stream spelling, as the derive extracts it.
                             ty: "Option < JoinPolicy >".into(),
+                            optional: false,
                         },
                         FieldSchema {
                             name: "reducer_id".into(),
                             ty: "Option < String >".into(),
+                            optional: false,
                         },
                     ],
                     children: vec![ChildSchema {
@@ -622,6 +726,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "label".into(),
                         ty: "String".into(),
+                        optional: false,
                     }],
                     children: vec![],
                 },
@@ -696,19 +801,119 @@ mod tests {
     #[test]
     fn unrelated_override_leaves_builtin_mapping_and_failure_intact() {
         // An override for some other type neither rescues the
-        // unsupported fields nor perturbs built-in ones.
+        // unsupported fields nor perturbs built-in ones. Note that
+        // `Option<String>` on `reducer_id` is now a built-in mapping
+        // (Layer 2 of the "built-in optional payload fields"
+        // contract), so only the `Option<JoinPolicy>` field on
+        // `policy` remains unmapped without a `SyntaxOverrides` entry.
         let overrides = SyntaxOverrides::new().for_type("Uuid", |ids| token(ids, "%str"));
         let err = grammar_from_schema_with(&par_schema(), &IdGen::new(), &overrides).unwrap_err();
-        assert_eq!(err.diagnostics.len(), 2, "both Par fields still unmapped");
+        assert_eq!(
+            err.diagnostics.len(),
+            1,
+            "policy is the only Par field still unmapped without overrides",
+        );
         assert!(
             err.diagnostics
                 .iter()
                 .all(|d| d.code == codes::UNSUPPORTED_FIELD)
         );
+        assert!(
+            err.diagnostics[0].message.contains("policy"),
+            "unmapped-field diagnostic points at `policy`",
+        );
         // Built-in demo schema is unaffected by the stray entry.
         let g = checked_grammar_from_schema_with(&demo_schema(), &IdGen::new(), &overrides)
             .expect("demo schema still generates");
         assert_eq!(g.parse("Lit(value: 7)").unwrap().variant, "Lit");
+    }
+
+    /// Layer 2: `Option<String>` payload maps to `none | %str` via the
+    /// built-in mapping (no `SyntaxOverrides` entry needed). Canonical
+    /// text parses both spellings and both build through the derive's
+    /// `build_field_optional` route.
+    #[test]
+    fn builtin_option_string_mapping_accepts_none_and_str() {
+        let schema = NodeSchema {
+            name: "Meta".into(),
+            variants: vec![VariantSchema {
+                name: "Row".into(),
+                fields: vec![FieldSchema {
+                    name: "description".into(),
+                    ty: "Option<String>".into(),
+                    optional: true,
+                }],
+                children: vec![],
+            }],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new())
+            .expect("Option<String> is a built-in mapping");
+        // `none` spelling.
+        let t1 = g.parse(r#"Row(description: none)"#).expect("none parses");
+        assert_eq!(
+            t1.field("description"),
+            Some(&RawValue::Text("none".into())),
+        );
+        // `%str` spelling.
+        let t2 = g
+            .parse(r#"Row(description: "hi")"#)
+            .expect("string parses");
+        assert_eq!(t2.field("description"), Some(&RawValue::Text("hi".into())));
+        // Omitted entirely (Layer 1 optional PEG wrap).
+        let t3 = g.parse(r#"Row()"#).expect("omitted parses");
+        assert!(t3.field("description").is_none());
+        // check_conformance is clean for all three.
+        for t in [&t1, &t2, &t3] {
+            assert!(
+                check_conformance(t, &schema).is_empty(),
+                "conformance clean for {t:?}",
+            );
+        }
+    }
+
+    /// Layer 2: `Vec<String>` payload maps to `[ %str ("," %str)* ]`
+    /// via the built-in mapping. Empty list, single item, and multi
+    /// item all parse; captured text is JSON-parsable so
+    /// `build_field_vec` reads it directly.
+    #[test]
+    fn builtin_vec_string_mapping_accepts_bracketed_list() {
+        let schema = NodeSchema {
+            name: "Meta".into(),
+            variants: vec![VariantSchema {
+                name: "Row".into(),
+                fields: vec![FieldSchema {
+                    name: "tags".into(),
+                    ty: "Vec<String>".into(),
+                    optional: true,
+                }],
+                children: vec![],
+            }],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new())
+            .expect("Vec<String> is a built-in mapping");
+        // Empty list.
+        let t1 = g.parse(r#"Row(tags: [])"#).expect("empty list parses");
+        assert_eq!(t1.field("tags"), Some(&RawValue::Text("[]".into())));
+        // Multi item. The PEG runtime's implicit whitespace-skip
+        // strips inter-token spaces from the captured text, so the
+        // field carries the compact form `["a","b"]` (still valid
+        // JSON — `serde_json::from_str` accepts it).
+        let t2 = g
+            .parse(r#"Row(tags: ["a", "b"])"#)
+            .expect("two items parses");
+        assert_eq!(
+            t2.field("tags"),
+            Some(&RawValue::Text(r#"["a","b"]"#.into())),
+        );
+        // Omitted.
+        let t3 = g.parse(r#"Row()"#).expect("omitted parses");
+        assert!(t3.field("tags").is_none());
+        for t in [&t1, &t2, &t3] {
+            assert!(
+                check_conformance(t, &schema).is_empty(),
+                "conformance clean for {t:?}",
+            );
+        }
     }
 
     #[test]

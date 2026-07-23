@@ -62,6 +62,13 @@
 //!   contributes is the **decoded inner content** (quotes stripped,
 //!   escapes resolved), so a `Field` wrapping `%str` binds the string
 //!   value directly.
+//! - `%str_raw` — same matching rules as `%str`, but the production
+//!   is the **raw source slice** (quotes and escape sequences kept
+//!   verbatim). Field authors use this when downstream consumers need
+//!   the JSON-compatible literal — typically the built-in
+//!   `Vec<String>` mapping in `schema_gen`, which relies on
+//!   `serde_json::from_str` in `build_field_vec` to reparse the
+//!   captured `["a", "b"]` text.
 //! - `%ws`    — `[ \t\r\n]+` (skip is disabled for this class)
 //! - `%kw:<word>` — literal `<word>` with a word-boundary guard: the
 //!   byte immediately after the match must not be a word char. This is
@@ -703,6 +710,25 @@ impl<'g, 'i> Interpreter<'g, 'i> {
                 Some(decoded) => {
                     let end = self.pos;
                     self.contribute_text(decoded, Span::new(start, end));
+                    Ok(())
+                }
+                None => {
+                    self.expected(pat);
+                    self.pos = start;
+                    Err(())
+                }
+            };
+        }
+        if pat == "%str_raw" {
+            // Same match as %str, but the contributed production is the
+            // raw source slice (quotes + escape sequences preserved).
+            // Used by the built-in `Vec<String>` production so the
+            // captured field text is JSON-parseable directly.
+            return match self.match_str() {
+                Some(_) => {
+                    let end = self.pos;
+                    let text = self.input[start..end].to_string();
+                    self.contribute_text(text, Span::new(start, end));
                     Ok(())
                 }
                 None => {

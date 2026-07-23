@@ -58,8 +58,10 @@ pub enum Flow {
         /// `{ shape: All, fail: FailFast }`.
         #[dsl_build(with = parse_policy)]
         policy: Option<JoinPolicy>,
-        /// Reducer id. `None` defaults to `reduce_all_ordered`.
-        #[dsl_build(with = parse_reducer_id)]
+        /// Reducer id. `None` defaults to `reduce_all_ordered`. The
+        /// field is `Option<String>`, so `#[derive(DslBuild)]` maps
+        /// it through the built-in `build_field_optional` route (no
+        /// hand-written converter needed).
         reducer_id: Option<String>,
     },
     /// Denotes an external effect; the engine yields a `Pending` and
@@ -157,13 +159,14 @@ const POLICY_SPELLINGS: &[(&str, JoinPolicy)] = &[
 ];
 
 /// [`SyntaxOverrides`] making `Flow::schema()` generatable by
-/// `schema_gen`: value productions for the two `Par` payload fields the
-/// built-in mapping rejects.
+/// `schema_gen`: value production for the one `Par` payload field the
+/// built-in mapping still rejects.
 ///
 /// - `policy` — `none` or one of the [`POLICY_SPELLINGS`] keywords.
-/// - `reducer_id` — `none` or the reducer name as a string literal.
-///   (The literal `"none"` is indistinguishable from the keyword after
-///   parsing and also maps to the default reducer.)
+///
+/// `reducer_id: Option<String>` used to require its own override entry
+/// but is now covered by the built-in mapping for `Option<String>`
+/// (Layer 2 of the "built-in optional payload fields" contract).
 pub fn flow_syntax_overrides() -> SyntaxOverrides {
     fn policy_value(ids: &IdGen) -> Peg {
         let mut arms = vec![token(ids, "%kw:none")];
@@ -174,11 +177,7 @@ pub fn flow_syntax_overrides() -> SyntaxOverrides {
         );
         choice(ids, arms)
     }
-    SyntaxOverrides::new()
-        .for_type("Option<JoinPolicy>", policy_value)
-        .for_type("Option<String>", |ids| {
-            choice(ids, vec![token(ids, "%kw:none"), token(ids, "%str")])
-        })
+    SyntaxOverrides::new().for_type("Option<JoinPolicy>", policy_value)
 }
 
 /// `#[dsl_build(with)]` converter for `Par::policy`: inverse of the
@@ -204,17 +203,6 @@ pub fn parse_policy(tree: &ParseTree, name: &str) -> Result<Option<JoinPolicy>, 
                 .with_span(tree.span),
             )
         })
-}
-
-/// `#[dsl_build(with)]` converter for `Par::reducer_id`: inverse of the
-/// `reducer_id` production in [`flow_syntax_overrides`].
-pub fn parse_reducer_id(tree: &ParseTree, name: &str) -> Result<Option<String>, BuildError> {
-    let text = field_text(tree, name)?;
-    Ok(if text == "none" {
-        None
-    } else {
-        Some(text.to_string())
-    })
 }
 
 /// Renders a `Flow` as an indented text tree using the derived

@@ -1,18 +1,22 @@
 //! End-to-end proof of the two per-field hooks on the DSL that
 //! motivated them — grammar layer and build layer as one contract:
 //!
-//! - `Flow`'s `Par` carries payload types the built-in canonical-syntax
-//!   mapping rejects (`Option<JoinPolicy>` / `Option<String>`), so
-//!   plain generation fails loudly; [`flow_syntax_overrides`] (the
-//!   crate's `schema_gen::SyntaxOverrides`) makes the derived schema
-//!   generate a check-clean grammar.
-//! - The same types have no `FromStr` route (orphan rule), so
-//!   `#[derive(DslBuild)]` maps them through
-//!   `#[dsl_build(with = parse_policy / parse_reducer_id)]`.
+//! - `Flow`'s `Par` carries a `policy: Option<JoinPolicy>` field whose
+//!   Rust type has no built-in canonical-syntax mapping, so plain
+//!   generation fails loudly; [`flow_syntax_overrides`] (the crate's
+//!   `schema_gen::SyntaxOverrides`) supplies the value production and
+//!   makes the derived schema generate a check-clean grammar.
+//! - `Option<JoinPolicy>` also has no `FromStr` route (orphan rule),
+//!   so `#[derive(DslBuild)]` maps it through
+//!   `#[dsl_build(with = parse_policy)]`.
+//! - `reducer_id: Option<String>` is covered by dsl-kit's built-in
+//!   `Option<String>` mapping (grammar + `build_field_optional`), so
+//!   no override and no `#[dsl_build(with = ...)]` are needed on this
+//!   crate's side.
 //!
 //! Together: canonical text → generated grammar → `ParseTree` → typed
 //! `Flow` → `Engine` + `drive` → joined value. The author wrote derives,
-//! two value productions, and two converter functions — no grammar and
+//! one value production, and one converter function — no grammar and
 //! no builder by hand.
 
 use dsl_kit::{
@@ -46,13 +50,22 @@ fn generated_grammar() -> dsl_kit_parse::peg::Grammar {
 
 #[test]
 fn flow_schema_fails_generation_without_overrides() {
+    // `policy: Option<JoinPolicy>` has no built-in canonical-syntax
+    // mapping — that's what `flow_syntax_overrides` supplies.
+    // `reducer_id: Option<String>` used to also reject, but is now
+    // covered by dsl-kit's built-in `Option<String>` mapping, so only
+    // `policy` remains unmapped when overrides are absent.
     let err = schema_gen::grammar_from_schema(&Flow::schema(), &IdGen::new())
-        .expect_err("Par's payload fields have no built-in mapping");
-    assert_eq!(err.diagnostics.len(), 2, "policy + reducer_id rejected");
+        .expect_err("Par's `policy` field has no built-in mapping");
+    assert_eq!(err.diagnostics.len(), 1, "only policy is rejected");
     assert!(
         err.diagnostics
             .iter()
             .all(|d| d.code == schema_gen::codes::UNSUPPORTED_FIELD)
+    );
+    assert!(
+        err.diagnostics[0].message.contains("policy"),
+        "unmapped-field diagnostic points at `policy`",
     );
 }
 
@@ -105,6 +118,40 @@ fn text_builds_a_typed_flow_via_dsl_build_converters() {
     assert_eq!(reducer_id.as_deref(), Some("reduce_all_ordered"));
 }
 
+/// Layer 1 + Layer 2 (JSON path): a `Par` document that omits the
+/// optional `policy` / `reducer_id` keys entirely — the AI-emit
+/// contract — builds to a typed `Flow::Par` with `None` / `None`.
+///
+/// This is the acceptance criterion the issue calls out first
+/// ("variant with `version: Option<String>` builds from JSON that omits
+/// the key entirely"), realised end-to-end against the real flow DSL.
+#[test]
+fn json_par_omitting_optional_keys_builds_to_none_defaults() {
+    let doc = serde_json::json!({
+        "type": "Par",
+        "children": [
+            { "type": "Call", "label": "x" },
+        ],
+        // NB: no `policy`, no `reducer_id`.
+    });
+    let tree = dsl_kit_parse::serde_bridge::from_json_value(&doc, &Flow::schema())
+        .expect("JSON without optional keys parses");
+    let flow = Flow::from_parse_tree(&tree, &IdGen::new())
+        .expect("typed build succeeds with the optional keys omitted");
+    let Flow::Par {
+        policy,
+        reducer_id,
+        children,
+        ..
+    } = &flow
+    else {
+        panic!("root is Par");
+    };
+    assert!(policy.is_none(), "absent policy → None");
+    assert!(reducer_id.is_none(), "absent reducer_id → None");
+    assert_eq!(children.len(), 1, "one child preserved");
+}
+
 #[test]
 fn none_spellings_build_to_typed_defaults() {
     let tree = generated_grammar()
@@ -146,10 +193,15 @@ fn synthesized_examples_cover_every_variant_and_build_typed() {
             )
         });
     }
+    // Every `Par` field is optional at grammar level (policy /
+    // reducer_id are Option, children is Vec), so `example_gen` picks
+    // the minimal-args form `Par()`. This still builds a fully typed
+    // `Flow::Par { children: vec![], policy: None, reducer_id: None }`
+    // through the derive.
     let par = examples.per_rule.iter().find(|e| e.rule == "Par").unwrap();
     assert_eq!(
-        par.text, "Par(policy: none, reducer_id: none, children: [])",
-        "override spellings fall out of the grammar walk"
+        par.text, "Par()",
+        "minimal-args form falls out of the grammar walk when every arg is optional",
     );
     let composite_tree = grammar
         .parse(&examples.composite)

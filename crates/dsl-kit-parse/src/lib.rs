@@ -522,8 +522,15 @@ fn check_fields(
         }
     }
 
-    // Missing declared fields.
+    // Missing declared fields. Optional fields (typically `Option<T>`
+    // / `Vec<T>` payloads recognised by `#[derive(DslSchema)]`) are
+    // skipped — their absence is a valid shape and the build layer's
+    // `build_field_optional` / `build_field_vec` helpers supply the
+    // default (`None` / empty vec).
     for f in &variant.fields {
+        if f.optional {
+            continue;
+        }
         if tree.field(&f.name).is_none() {
             out.push(
                 Diagnostic::error(
@@ -683,6 +690,12 @@ pub(crate) fn all_slot_names(variant: &VariantSchema) -> Vec<&str> {
 pub(crate) fn missing_slot_names<'a>(tree: &ParseTree, variant: &'a VariantSchema) -> Vec<&'a str> {
     let mut out = Vec::new();
     for f in &variant.fields {
+        // Optional fields are never "missing" for pair-hint purposes:
+        // their absence is a valid shape, so pointing at them from an
+        // unknown-slot suggestion would misdirect the reader.
+        if f.optional {
+            continue;
+        }
         if tree.field(&f.name).is_none() {
             out.push(f.name.as_str());
         }
@@ -835,6 +848,88 @@ where
     }
 }
 
+/// Extracts an optional payload field into `Option<T>`.
+///
+/// Companion to [`build_field`] for fields whose Rust type is
+/// `Option<T>` — the `#[derive(DslBuild)]` default path routes here
+/// automatically for payload `Option<T>` types (see the derive docs).
+///
+/// Resolution rules:
+///
+/// - Absent field → `Ok(None)` (this is the "AI-emit omits noise"
+///   contract — schema-level `optional: true` skips the
+///   `MISSING_FIELD` diagnostic so absence reaches here).
+/// - [`RawValue::Json`] with a `null` value → `Ok(None)`.
+/// - [`RawValue::Text`] whose text is the literal `"none"` (the
+///   canonical-syntax keyword produced by `schema_gen`) → `Ok(None)`.
+/// - Any other value → delegate to [`build_field`], wrap in `Some`.
+///
+/// `T` must satisfy the same `DeserializeOwned + FromStr` bounds as
+/// [`build_field`] because the delegate path uses it.
+pub fn build_field_optional<T>(tree: &ParseTree, name: &str) -> Result<Option<T>, BuildError>
+where
+    T: serde::de::DeserializeOwned + std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    match tree.field(name) {
+        None => Ok(None),
+        Some(RawValue::Json(Value::Null)) => Ok(None),
+        Some(RawValue::Text(s)) if s == "none" => Ok(None),
+        Some(_) => build_field::<T>(tree, name).map(Some),
+    }
+}
+
+/// Extracts a payload field into `Vec<T>`.
+///
+/// Companion to [`build_field`] for fields whose Rust type is
+/// `Vec<T>` — the `#[derive(DslBuild)]` default path routes here
+/// automatically for payload `Vec<T>` types (see the derive docs).
+///
+/// Resolution rules:
+///
+/// - Absent field → `Ok(vec![])` (schema-level `optional: true` skips
+///   the `MISSING_FIELD` diagnostic; missing = empty list).
+/// - [`RawValue::Json`] with a `null` value → `Ok(vec![])`.
+/// - [`RawValue::Json`] with an array → `serde_json::from_value`
+///   over the whole array.
+/// - [`RawValue::Text`] whose trimmed body is empty → `Ok(vec![])`.
+/// - [`RawValue::Text`] otherwise → parse the text as a JSON array
+///   (`serde_json::from_str::<Vec<T>>`). The canonical-syntax
+///   production for `Vec<String>` (`[ "a", "b" ]`) is JSON-parsable
+///   as-is; hand-authored value productions that follow the same
+///   bracketed shape work unchanged.
+///
+/// `T` must implement `serde::de::DeserializeOwned` — no `FromStr`
+/// bound is needed because the text path routes through
+/// `serde_json::from_str` rather than element-wise parsing.
+pub fn build_field_vec<T>(tree: &ParseTree, name: &str) -> Result<Vec<T>, BuildError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match tree.field(name) {
+        None => Ok(Vec::new()),
+        Some(RawValue::Json(Value::Null)) => Ok(Vec::new()),
+        Some(RawValue::Json(v)) => serde_json::from_value(v.clone()).map_err(|e| {
+            BuildError::single(
+                Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
+                    .with_span(tree.span),
+            )
+        }),
+        Some(RawValue::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(trimmed).map_err(|e| {
+                BuildError::single(
+                    Diagnostic::error(codes::FIELD_TYPE, format!("field `{name}`: {e}"))
+                        .with_span(tree.span),
+                )
+            })
+        }
+    }
+}
+
 /// Extracts a payload field's raw text production.
 ///
 /// Convenience for `#[dsl_build(with = ...)]` converter functions,
@@ -956,6 +1051,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "value".into(),
                         ty: "i64".into(),
+                        optional: false,
                     }],
                     children: vec![],
                 },
@@ -978,6 +1074,7 @@ mod tests {
                     fields: vec![FieldSchema {
                         name: "name".into(),
                         ty: "String".into(),
+                        optional: false,
                     }],
                     children: vec![
                         ChildSchema {
@@ -1058,10 +1155,12 @@ mod tests {
                     FieldSchema {
                         name: "target".into(),
                         ty: "String".into(),
+                        optional: false,
                     },
                     FieldSchema {
                         name: "count".into(),
                         ty: "u32".into(),
+                        optional: false,
                     },
                 ],
                 children: vec![],
@@ -1125,6 +1224,152 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, codes::MISSING_FIELD);
         assert!(diags[0].message.contains("value"));
+    }
+
+    /// Layer 1: absent optional field does NOT trigger `MISSING_FIELD`.
+    #[test]
+    fn optional_field_absent_is_conformant() {
+        let schema = NodeSchema {
+            name: "Meta".into(),
+            variants: vec![VariantSchema {
+                name: "Row".into(),
+                fields: vec![
+                    FieldSchema::required("id", "u32"),
+                    FieldSchema::optional("description", "Option<String>"),
+                    FieldSchema::optional("tags", "Vec<String>"),
+                ],
+                children: vec![],
+            }],
+        };
+        let mut tree = ParseTree::new("Row");
+        tree.fields.push(("id".into(), RawValue::Json(json!(1))));
+        // description + tags are absent — must not report MISSING_FIELD.
+        let diags = check_conformance(&tree, &schema);
+        assert!(
+            diags.is_empty(),
+            "optional fields absent should be clean: {diags:?}",
+        );
+    }
+
+    /// Layer 1 negative: absent REQUIRED field alongside absent
+    /// optional fields still reports only the required one.
+    #[test]
+    fn optional_field_absence_does_not_shadow_required_missing() {
+        let schema = NodeSchema {
+            name: "Meta".into(),
+            variants: vec![VariantSchema {
+                name: "Row".into(),
+                fields: vec![
+                    FieldSchema::required("id", "u32"),
+                    FieldSchema::optional("description", "Option<String>"),
+                ],
+                children: vec![],
+            }],
+        };
+        let tree = ParseTree::new("Row"); // absent id + absent description
+        let diags = check_conformance(&tree, &schema);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, codes::MISSING_FIELD);
+        assert!(
+            diags[0].message.contains("id"),
+            "only `id` is reported missing; got: {}",
+            diags[0].message,
+        );
+    }
+
+    /// Layer 1 wire contract: `to_json` emits `optional: true` only
+    /// when the field is optional, preserving the pre-0.3 layout for
+    /// required fields.
+    #[test]
+    fn field_schema_to_json_omits_optional_when_false() {
+        let required = FieldSchema::required("id", "u32").to_json();
+        assert_eq!(required, json!({ "name": "id", "type": "u32" }));
+        assert!(
+            required.get("optional").is_none(),
+            "required field omits the optional key entirely (pre-0.3 layout)",
+        );
+        let opt = FieldSchema::optional("description", "Option<String>").to_json();
+        assert_eq!(
+            opt,
+            json!({ "name": "description", "type": "Option<String>", "optional": true }),
+        );
+    }
+
+    /// Layer 2: `build_field_optional` returns `None` for every
+    /// canonical form of absence: missing field, JSON null, canonical
+    /// `none` keyword. Present values flow through `build_field`.
+    #[test]
+    fn build_field_optional_covers_every_absence_shape() {
+        let mut t = ParseTree::new("Row");
+        // Absent field.
+        assert_eq!(
+            build_field_optional::<String>(&t, "description").unwrap(),
+            None,
+        );
+        // JSON null.
+        t.fields
+            .push(("description".into(), RawValue::Json(Value::Null)));
+        assert_eq!(
+            build_field_optional::<String>(&t, "description").unwrap(),
+            None,
+        );
+        // Canonical "none" keyword (Text path).
+        let mut t2 = ParseTree::new("Row");
+        t2.fields
+            .push(("description".into(), RawValue::Text("none".into())));
+        assert_eq!(
+            build_field_optional::<String>(&t2, "description").unwrap(),
+            None,
+        );
+        // Present JSON string.
+        let mut t3 = ParseTree::new("Row");
+        t3.fields
+            .push(("description".into(), RawValue::Json(json!("hi"))));
+        assert_eq!(
+            build_field_optional::<String>(&t3, "description").unwrap(),
+            Some("hi".to_string()),
+        );
+    }
+
+    /// Layer 2: `build_field_vec` defaults to empty on absence, parses
+    /// JSON arrays natively, and parses canonical bracketed text
+    /// productions via `serde_json::from_str`.
+    #[test]
+    fn build_field_vec_covers_every_shape() {
+        // Absent → empty.
+        let t = ParseTree::new("Row");
+        assert_eq!(build_field_vec::<String>(&t, "tags").unwrap(), Vec::<String>::new());
+        // JSON null → empty.
+        let mut t2 = ParseTree::new("Row");
+        t2.fields.push(("tags".into(), RawValue::Json(Value::Null)));
+        assert_eq!(
+            build_field_vec::<String>(&t2, "tags").unwrap(),
+            Vec::<String>::new(),
+        );
+        // JSON array.
+        let mut t3 = ParseTree::new("Row");
+        t3.fields
+            .push(("tags".into(), RawValue::Json(json!(["a", "b"]))));
+        assert_eq!(
+            build_field_vec::<String>(&t3, "tags").unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+        // Canonical bracketed text (JSON-parsable as-is).
+        let mut t4 = ParseTree::new("Row");
+        t4.fields
+            .push(("tags".into(), RawValue::Text(r#"["a", "b"]"#.into())));
+        assert_eq!(
+            build_field_vec::<String>(&t4, "tags").unwrap(),
+            vec!["a".to_string(), "b".to_string()],
+        );
+        // Empty bracketed text.
+        let mut t5 = ParseTree::new("Row");
+        t5.fields
+            .push(("tags".into(), RawValue::Text("[]".into())));
+        assert_eq!(
+            build_field_vec::<String>(&t5, "tags").unwrap(),
+            Vec::<String>::new(),
+        );
     }
 
     #[test]
