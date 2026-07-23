@@ -120,10 +120,10 @@ cargo doc --open
 
 ## Status
 
-`0.1.0` — the kit is young and the API is still moving. The engine
-semantics (fan-out, cancellation, halt-before-spawn breakpoints) and
-the derive contracts are test-pinned; surface ergonomics may change
-between minor versions.
+The kit is young and the API is still moving. The engine semantics
+(fan-out, cancellation, halt-before-spawn breakpoints) and the derive
+contracts are test-pinned; surface ergonomics may change between minor
+versions. See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## License
 
