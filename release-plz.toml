@@ -1,0 +1,59 @@
+[workspace]
+changelog_update = false     # default off; only the representative crate updates the root CHANGELOG
+dependencies_update = false
+git_release_enable = true    # release-plz creates the GitHub Release (no cargo-dist here)
+git_tag_enable = false       # default off; only the representative crate tags
+git_tag_name = "v{{ version }}"  # unified tag name, also used for CHANGELOG compare links
+semver_check = true
+release_always = false       # publish only when the release PR is merged
+pr_labels = ["release"]
+
+# Keep all 9 crates in lockstep versioning under the `dsl-kit` group.
+# examples/**/Cargo.toml are `publish = false` and release-plz skips them automatically.
+
+[[package]]
+name = "dsl-kit-core"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-macros"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-schema"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-lint"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-parse"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-fuzzy"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-mcp"
+version_group = "dsl-kit"
+
+[[package]]
+name = "dsl-kit-cli"
+version_group = "dsl-kit"
+
+# Representative crate: creates the single unified tag v{version} and owns
+# the root CHANGELOG. release-plz assigns each commit to the crate whose
+# path it touches; a commit that only touches `crates/dsl-kit-*/…` never
+# lands in the representative crate's CHANGELOG. Since the whole workspace
+# ships lockstep under `version_group = "dsl-kit"`, tell release-plz to
+# fold every sibling crate's commits into the single unified root
+# CHANGELOG. Without this, feat/fix commits scoped to a sibling crate
+# disappear from every CHANGELOG.
+[[package]]
+name = "dsl-kit"
+version_group = "dsl-kit"
+changelog_update = true
+changelog_include = ["dsl-kit-core", "dsl-kit-macros", "dsl-kit-schema", "dsl-kit-lint", "dsl-kit-parse", "dsl-kit-fuzzy", "dsl-kit-mcp", "dsl-kit-cli"]
+git_tag_enable = true
