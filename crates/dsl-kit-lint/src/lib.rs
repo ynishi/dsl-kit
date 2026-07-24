@@ -34,7 +34,10 @@
 
 use std::collections::HashSet;
 
-use dsl_kit_core::{NodeId, Phase, SuggesterHandle, Walk, noop_handle};
+use dsl_kit_core::{
+    Applicability, ErrorCatalogEntry, FixSuggestion, NodeId, PatchPart, Phase, SuggesterHandle,
+    Walk, noop_handle,
+};
 use dsl_kit_schema::{DslSchema, Multiplicity};
 
 // ---------- Diagnostics -------------------------------------------------
@@ -61,6 +64,12 @@ pub struct Diagnostic {
     pub node: NodeId,
     /// Human-readable message.
     pub message: String,
+    /// Optional structured, auto-apply-aware fix. `None` for rules that
+    /// only report (the pre-suggestion default); `Some` when the rule
+    /// can propose a concrete [`FixSuggestion`] whose
+    /// [`Applicability`](dsl_kit_core::Applicability) tells a tool
+    /// whether the patch may be applied automatically.
+    pub suggestion: Option<FixSuggestion>,
 }
 
 /// Accumulator handed to each rule during a lint pass.
@@ -84,7 +93,8 @@ impl LintContext {
         self.diagnostics.push(diag);
     }
 
-    /// Convenience helper: builds a `Diagnostic` and records it.
+    /// Convenience helper: builds a suggestion-less `Diagnostic` and
+    /// records it.
     pub fn report(
         &mut self,
         rule: &'static str,
@@ -97,6 +107,27 @@ impl LintContext {
             severity,
             node,
             message: message.into(),
+            suggestion: None,
+        });
+    }
+
+    /// Convenience helper: builds a `Diagnostic` carrying a structured
+    /// [`FixSuggestion`] and records it. Use this over [`report`](Self::report)
+    /// when the rule can propose a concrete patch.
+    pub fn report_with_suggestion(
+        &mut self,
+        rule: &'static str,
+        severity: Severity,
+        node: NodeId,
+        message: impl Into<String>,
+        suggestion: FixSuggestion,
+    ) {
+        self.emit(Diagnostic {
+            rule,
+            severity,
+            node,
+            message: message.into(),
+            suggestion: Some(suggestion),
         });
     }
 
@@ -577,15 +608,177 @@ impl<A: Walk + DslSchema> Rule<A> for TypoHint<A> {
                 continue;
             }
             if let Some(hint) = self.suggester.enrich_unknown(&label, &names) {
-                ctx.report(
-                    Self::NAME,
-                    Severity::Info,
-                    node,
-                    format!("`{label}` looks like a schema variant name; {hint}"),
-                );
+                let message = format!("`{label}` looks like a schema variant name; {hint}");
+                // Build a concrete patch from the top-scored candidate.
+                // Fuzzy matches are never certain, so the applicability
+                // is MaybeIncorrect — surface it for confirmation, never
+                // auto-apply.
+                match self.suggester.suggest(&label, &names).first() {
+                    Some(top) => {
+                        let replacement = top.candidate;
+                        let suggestion = FixSuggestion::new(
+                            format!("replace `{label}` with `{replacement}`"),
+                            PatchPart::node(node, replacement),
+                            Applicability::MaybeIncorrect,
+                        );
+                        ctx.report_with_suggestion(
+                            Self::NAME,
+                            Severity::Info,
+                            node,
+                            message,
+                            suggestion,
+                        );
+                    }
+                    None => {
+                        // A custom suggester returned a hint but no raw
+                        // candidate; fall back to a suggestion-less diagnostic.
+                        ctx.report(Self::NAME, Severity::Info, node, message);
+                    }
+                }
             }
         }
     }
+}
+
+// ---------- Lint declaration registry -----------------------------------
+
+/// Category of a lint rule, mirroring Clippy's category axis but
+/// narrowed to the five that carry meaning for dsl-kit ASTs.
+///
+/// Clippy ships nine categories; `perf` / `pedantic` / `restriction` /
+/// `nursery` / `cargo` have no dsl-kit analogue, so they are omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LintCategory {
+    /// The AST is outright wrong — a bug the author almost certainly
+    /// wants to fix (e.g. duplicate node ids).
+    Correctness,
+    /// A shape that is probably a mistake but is not provably wrong
+    /// (e.g. a label that looks like a mistyped variant name).
+    Suspicious,
+    /// A stylistic preference with no correctness impact.
+    Style,
+    /// A complexity / maintainability smell (deep nesting, wide
+    /// fan-out, redundant wrapping).
+    Complexity,
+    /// A violation of a caller-imposed structural contract (e.g. a
+    /// configured depth ceiling).
+    Contract,
+}
+
+/// Declarative metadata for one lint rule, decoupled from its
+/// [`Rule`] implementation.
+///
+/// Following rustc's `declare_lint!` + `LintStore` split, the *what*
+/// (name, stable code, category, default severity, description) lives
+/// here as a `'static` record, while the *how* (the traversal that
+/// detects violations) lives in the `Rule` impl. Collecting the
+/// declarations alone is enough to drive a registry listing or an
+/// `explain`-style catalogue without instantiating any rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LintDecl {
+    /// Stable rule identifier, matching the rule's `NAME` const and the
+    /// `rule` field of every [`Diagnostic`] it emits.
+    pub name: &'static str,
+    /// Stable, machine-readable diagnostic code in the
+    /// `dsl_kit::lint::<snake_case_name>` form. Shares the
+    /// `dsl_kit::` namespace with engine error codes
+    /// (`dsl_kit::eval::aborted`, …) so a single `explain` catalogue
+    /// can resolve both.
+    pub code: &'static str,
+    /// Category axis of the rule.
+    pub category: LintCategory,
+    /// Severity the built-in rule reports at.
+    pub default_severity: Severity,
+    /// One-line description of what the rule flags.
+    pub desc: &'static str,
+}
+
+/// Central registry of every built-in lint rule's declaration.
+///
+/// Kept in lock-step with the `Rule` impls above by
+/// `lint_decls_cover_all_builtin_rules` — adding a built-in rule
+/// without a matching entry here (or vice versa) fails that test.
+pub static LINT_DECLS: &[LintDecl] = &[
+    LintDecl {
+        name: UniqueNodeIds::NAME,
+        code: "dsl_kit::lint::unique_node_ids",
+        category: LintCategory::Correctness,
+        default_severity: Severity::Error,
+        desc: "flags AST nodes that reuse a NodeId, which breaks breakpoint targeting and path resolution",
+    },
+    LintDecl {
+        name: MaxDepth::NAME,
+        code: "dsl_kit::lint::max_depth",
+        category: LintCategory::Contract,
+        default_severity: Severity::Error,
+        desc: "flags nodes nested deeper than a configured depth ceiling",
+    },
+    LintDecl {
+        name: MaxFanOut::NAME,
+        code: "dsl_kit::lint::max_fan_out",
+        category: LintCategory::Complexity,
+        default_severity: Severity::Warn,
+        desc: "flags nodes whose direct-child count exceeds a configured fan-out limit",
+    },
+    LintDecl {
+        name: NoEmptyManyChildren::NAME,
+        code: "dsl_kit::lint::no_empty_many_children",
+        category: LintCategory::Correctness,
+        default_severity: Severity::Error,
+        desc: "flags a variant that requires at least one child but was built with none",
+    },
+    LintDecl {
+        name: NoRedundantWrap::NAME,
+        code: "dsl_kit::lint::no_redundant_wrap",
+        category: LintCategory::Complexity,
+        default_severity: Severity::Warn,
+        desc: "flags a variant that wraps a single child of the same variant, adding no structure",
+    },
+    LintDecl {
+        name: DeadVariants::NAME,
+        code: "dsl_kit::lint::dead_variants",
+        category: LintCategory::Suspicious,
+        default_severity: Severity::Info,
+        desc: "reports schema variants that never appear in the AST (opt-in dead-code review)",
+    },
+    LintDecl {
+        // `TypoHint::NAME` lives on an `A: Walk`-bounded impl, so it
+        // can't be named in this non-generic const context. The literal
+        // is kept in sync with `TypoHint::<_>::NAME` by
+        // `lint_decls_cover_all_builtin_rules`.
+        name: "typo-hint",
+        code: "dsl_kit::lint::typo_hint",
+        category: LintCategory::Suspicious,
+        default_severity: Severity::Info,
+        desc: "flags labels that look like a mistyped schema variant name (opt-in, suggester-driven)",
+    },
+];
+
+/// Looks up a lint declaration by either its `name` (e.g.
+/// `"typo-hint"`) or its stable `code` (e.g.
+/// `"dsl_kit::lint::typo_hint"`). Returns `None` when neither matches.
+pub fn lint_decl(name_or_code: &str) -> Option<&'static LintDecl> {
+    LINT_DECLS
+        .iter()
+        .find(|d| d.name == name_or_code || d.code == name_or_code)
+}
+
+/// Projects [`LINT_DECLS`] into the shared
+/// [`ErrorCatalogEntry`](dsl_kit_core::ErrorCatalogEntry) shape so a
+/// diagnostic-`explain` surface can list and resolve lint codes in the
+/// same catalogue as engine error codes. The help text folds the rule's
+/// description together with its category and default severity.
+pub fn lint_catalog() -> Vec<ErrorCatalogEntry> {
+    LINT_DECLS
+        .iter()
+        .map(|d| ErrorCatalogEntry {
+            code: d.code.to_string(),
+            help: format!(
+                "{} [lint: category={:?}, default severity={:?}]",
+                d.desc, d.category, d.default_severity
+            ),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -938,6 +1131,94 @@ mod tests {
             "unexpected message: {}",
             diags[0].message
         );
+    }
+
+    #[test]
+    fn typo_hint_attaches_maybe_incorrect_fix_suggestion() {
+        use std::sync::Arc;
+        let ast = TwoVar::Alpha { id: NodeId(1) };
+        let rule = TypoHint::new(|_ast: &TwoVar| vec![(NodeId(1), "Alph".to_string())])
+            .with_suggester(Arc::new(FixedSuggester("Alpha")));
+        let diags = Linter::<TwoVar>::new().with_rule(rule).lint(&ast);
+        assert_eq!(diags.len(), 1);
+        let suggestion = diags[0]
+            .suggestion
+            .as_ref()
+            .expect("TypoHint must attach a FixSuggestion on a near-miss");
+        assert_eq!(suggestion.applicability, Applicability::MaybeIncorrect);
+        assert_eq!(suggestion.patch.len(), 1);
+        assert_eq!(suggestion.patch[0].node, NodeId(1));
+        assert_eq!(suggestion.patch[0].path, None);
+        assert_eq!(suggestion.patch[0].replacement, "Alpha");
+        assert!(
+            suggestion.message.contains("Alph") && suggestion.message.contains("Alpha"),
+            "unexpected suggestion message: {}",
+            suggestion.message
+        );
+    }
+
+    #[test]
+    fn lint_decls_cover_all_builtin_rules() {
+        // The full set of built-in rule NAMEs. Adding a rule without
+        // extending both this list and LINT_DECLS fails the len check.
+        let rule_names = [
+            UniqueNodeIds::NAME,
+            MaxDepth::NAME,
+            MaxFanOut::NAME,
+            NoEmptyManyChildren::NAME,
+            NoRedundantWrap::NAME,
+            DeadVariants::NAME,
+            TypoHint::<Tiny>::NAME,
+        ];
+
+        // Every built-in rule has a declaration, resolvable by name.
+        for name in rule_names {
+            let decl = lint_decl(name)
+                .unwrap_or_else(|| panic!("no LintDecl registered for rule `{name}`"));
+            assert_eq!(decl.name, name);
+            // And by its own code.
+            assert_eq!(lint_decl(decl.code).map(|d| d.name), Some(name));
+        }
+
+        // Every declaration points at a real built-in rule.
+        for decl in LINT_DECLS {
+            assert!(
+                rule_names.contains(&decl.name),
+                "LINT_DECLS entry `{}` does not match any built-in rule NAME",
+                decl.name
+            );
+            assert!(
+                decl.code.starts_with("dsl_kit::lint::"),
+                "lint code `{}` must live in the dsl_kit::lint:: namespace",
+                decl.code
+            );
+        }
+
+        // No stray / missing entries.
+        assert_eq!(LINT_DECLS.len(), rule_names.len());
+    }
+
+    #[test]
+    fn lint_catalog_folds_category_and_severity() {
+        let catalog = lint_catalog();
+        assert_eq!(catalog.len(), LINT_DECLS.len());
+        let typo = catalog
+            .iter()
+            .find(|e| e.code == "dsl_kit::lint::typo_hint")
+            .expect("typo_hint lint code in catalog");
+        assert!(typo.help.contains("category=Suspicious"));
+        assert!(typo.help.contains("default severity=Info"));
+    }
+
+    #[test]
+    fn report_leaves_suggestion_none_by_default() {
+        // Rules that only call `report` must not carry a suggestion.
+        let ast = leaf(1);
+        let diags = Linter::<Tiny>::new()
+            .with_rule(NoEmptyManyChildren)
+            .lint(&ast);
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].suggestion.is_none());
     }
 
     #[test]

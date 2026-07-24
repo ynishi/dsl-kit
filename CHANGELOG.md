@@ -9,7 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-core` — structured, Clippy-style fix suggestions in
+  `suggest`. `Applicability` (`MachineApplicable` / `MaybeIncorrect` /
+  `HasPlaceholders`, serde round-trippable, no `Unspecified` escape
+  hatch) gates auto-apply; only `MachineApplicable` may be applied
+  without review. `FixSuggestion` pairs a message with a multipart
+  `Vec<PatchPart>` patch (`PatchPart { node, path, replacement }`,
+  `NodeId`-anchored) and an `Applicability`. Immutable once built via
+  `FixSuggestion::new` / `with_part`. The string-only `Suggester` /
+  `Suggestion` contract is unchanged — this layer sits on top of it.
+- `dsl-kit-lint` — central lint declaration registry. `LintCategory`
+  (`Correctness` / `Suspicious` / `Style` / `Complexity` / `Contract`)
+  and `LintDecl { name, code, category, default_severity, desc }`
+  decouple rule metadata from the `Rule` impl (rustc `declare_lint!`
+  style). `LINT_DECLS` lists all seven built-ins; `lint_decl(name_or_code)`
+  looks one up; `lint_catalog()` projects them into
+  `ErrorCatalogEntry`. Lint codes use the `dsl_kit::lint::<name>` form,
+  sharing the `dsl_kit::` code space with engine error codes.
+
 ### Changed
+
+- `dsl-kit-lint` — `Diagnostic` gains an `Option<FixSuggestion>`
+  `suggestion` field (`None` for report-only rules; existing rules are
+  unchanged). New `LintContext::report_with_suggestion` helper.
+  `TypoHint` now attaches a `FixSuggestion` (`MaybeIncorrect`,
+  single-part patch replacing the label with the top fuzzy candidate)
+  on each near-miss. **Breaking:** struct-literal `Diagnostic { .. }`
+  callers must add `suggestion: None`.
+- `dsl-kit-mcp` — `dsl_kit_explain` now merges the built-in lint codes
+  (`dsl_kit_lint::lint_catalog`) into its catalogue alongside engine
+  error codes and host-contributed entries; the unknown-code
+  `did you mean` suggester runs over the merged code space. Adds a
+  `dsl-kit-lint` dependency.
 
 ### Deprecated
 

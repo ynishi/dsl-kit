@@ -41,7 +41,10 @@ mod engine;
 pub mod suggest;
 pub use drive::{AsyncEffectResolver, DriveOutcome, EffectResolver, drive, drive_async};
 pub use engine::{Ast, Engine, ExecError, LoopDecision, NodeKind};
-pub use suggest::{NoopSuggester, Suggester, SuggesterHandle, Suggestion, noop_handle};
+pub use suggest::{
+    Applicability, FixSuggestion, NoopSuggester, PatchPart, Suggester, SuggesterHandle, Suggestion,
+    noop_handle,
+};
 
 // ---------- Observation primitives --------------------------------------
 

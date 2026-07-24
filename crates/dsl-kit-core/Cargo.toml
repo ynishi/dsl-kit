@@ -15,6 +15,7 @@ description = "Engine primitives for dsl-kit: node ID, call frame, stepper, even
 [dependencies]
 miette      = { version = "7", features = ["fancy"] }
 thiserror   = "2"
+serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 smallvec    = "1"
 

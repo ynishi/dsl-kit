@@ -17,6 +17,7 @@ dsl-kit-fuzzy = { workspace = true }
 
 [dependencies]
 dsl-kit      = { workspace = true }
+dsl-kit-lint = { workspace = true }
 rmcp         = { version = "0.16", features = ["server", "transport-io", "macros"] }
 tokio        = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 serde        = { version = "1", features = ["derive"] }

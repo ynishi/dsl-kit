@@ -24,6 +24,10 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
+use crate::NodeId;
+
 /// One candidate returned by a [`Suggester`].
 ///
 /// `score` is normalised to `0.0..=1.0` where `1.0` is an exact match.
@@ -107,6 +111,128 @@ pub fn noop_handle() -> SuggesterHandle {
     Arc::new(NoopSuggester)
 }
 
+// ---------- Structured fix suggestion ----------------------------------
+
+/// How much confidence a tool may place in auto-applying a
+/// [`FixSuggestion`]'s patch.
+///
+/// Modelled on rustc / Clippy's `Applicability`, but deliberately
+/// closed at three levels — there is **no** `Unspecified` escape hatch.
+/// rustc keeps one, but "confidence unknown" is exactly the state that
+/// lets mis-tagged suggestions get auto-applied by accident, so the kit
+/// forces every producer to pick a real level.
+///
+/// # Auto-apply discipline
+///
+/// Only [`MachineApplicable`](Self::MachineApplicable) suggestions may
+/// be applied automatically (this mirrors the rustc-dev-guide rule that
+/// "only `MachineApplicable` suggestions are automatically applied by
+/// rustfix"). [`MaybeIncorrect`](Self::MaybeIncorrect) and
+/// [`HasPlaceholders`](Self::HasPlaceholders) suggestions must be
+/// surfaced for a human / agent to confirm before the patch is written
+/// back — never applied silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Applicability {
+    /// The patch is correct and complete; a tool may apply it without
+    /// human review. This is the only level eligible for auto-apply.
+    MachineApplicable,
+    /// The patch is a plausible fix but may be wrong (e.g. a fuzzy
+    /// match against a set of candidates). Present it for confirmation;
+    /// do not apply it automatically.
+    MaybeIncorrect,
+    /// The patch contains placeholder text the caller must fill in
+    /// before it compiles / parses (e.g. `<expr>`). Never auto-apply.
+    HasPlaceholders,
+}
+
+/// One span-anchored edit within a [`FixSuggestion`].
+///
+/// A suggestion's patch is always a `Vec<PatchPart>` (multipart from
+/// the start, mirroring rustc's `multipart_suggestion`) so a fix that
+/// spans several nodes never has to be retrofitted onto a single-span
+/// assumption.
+///
+/// dsl-kit anchors edits on [`NodeId`] rather than a byte span: a lint
+/// [`Diagnostic`](../../dsl_kit_lint/struct.Diagnostic.html) already
+/// identifies the site it fires on by node, and `path` narrows the edit
+/// to a sub-field of that node when the DSL needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchPart {
+    /// Node the edit is anchored to.
+    pub node: NodeId,
+    /// Optional path to a sub-field of `node` the edit targets (e.g.
+    /// `"label"`). `None` means the edit applies to the node as a
+    /// whole; the exact meaning is DSL-defined.
+    pub path: Option<String>,
+    /// Replacement text to write at the target.
+    pub replacement: String,
+}
+
+impl PatchPart {
+    /// Builds a whole-node patch (`path = None`).
+    pub fn node(node: NodeId, replacement: impl Into<String>) -> Self {
+        Self {
+            node,
+            path: None,
+            replacement: replacement.into(),
+        }
+    }
+
+    /// Builds a patch targeting a named sub-field of `node`.
+    pub fn field(node: NodeId, path: impl Into<String>, replacement: impl Into<String>) -> Self {
+        Self {
+            node,
+            path: Some(path.into()),
+            replacement: replacement.into(),
+        }
+    }
+}
+
+/// A structured, auto-apply-aware fix for a diagnostic.
+///
+/// This is the Clippy-style layer that sits *on top of* the string-only
+/// [`Suggester`] contract: a `Suggester` enumerates candidate strings,
+/// and a producer (a lint rule, an MCP tool) turns a chosen candidate
+/// into a [`FixSuggestion`] carrying the concrete [`patch`](Self::patch)
+/// and an [`Applicability`] gate. Enumerating candidates and deciding
+/// to apply one stay separate responsibilities — the suggester never
+/// mutates anything.
+///
+/// The value is immutable once built: construct it with [`Self::new`]
+/// (plus [`Self::with_part`] for extra edits) and pass it around
+/// unchanged, sidestepping the toggle-style lifecycle rustc's
+/// `Suggestions` enum carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixSuggestion {
+    /// Human-readable one-line description of the fix.
+    pub message: String,
+    /// The edit(s) that make up the fix. Always multipart.
+    pub patch: Vec<PatchPart>,
+    /// How confidently a tool may apply [`patch`](Self::patch).
+    pub applicability: Applicability,
+}
+
+impl FixSuggestion {
+    /// Builds a suggestion from a message, a single patch part, and an
+    /// applicability level. Use [`with_part`](Self::with_part) to add
+    /// further edits for a multipart fix.
+    pub fn new(message: impl Into<String>, part: PatchPart, applicability: Applicability) -> Self {
+        Self {
+            message: message.into(),
+            patch: vec![part],
+            applicability,
+        }
+    }
+
+    /// Appends another [`PatchPart`] and returns the suggestion, for
+    /// building a multipart fix fluently.
+    #[must_use]
+    pub fn with_part(mut self, part: PatchPart) -> Self {
+        self.patch.push(part);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +268,40 @@ mod tests {
     fn noop_handle_is_shared() {
         let h: SuggesterHandle = noop_handle();
         assert!(h.suggest("x", &["y"]).is_empty());
+    }
+
+    #[test]
+    fn applicability_serde_round_trips() {
+        for level in [
+            Applicability::MachineApplicable,
+            Applicability::MaybeIncorrect,
+            Applicability::HasPlaceholders,
+        ] {
+            let json = serde_json::to_string(&level).expect("serialize Applicability");
+            let back: Applicability =
+                serde_json::from_str(&json).expect("deserialize Applicability");
+            assert_eq!(level, back, "round-trip changed {level:?} via {json}");
+        }
+        // The wire form is the variant name verbatim (external tagging).
+        assert_eq!(
+            serde_json::to_string(&Applicability::MachineApplicable).unwrap(),
+            "\"MachineApplicable\""
+        );
+    }
+
+    #[test]
+    fn fix_suggestion_builds_multipart() {
+        let s = FixSuggestion::new(
+            "replace `Alph` with `Alpha`",
+            PatchPart::node(NodeId(1), "Alpha"),
+            Applicability::MaybeIncorrect,
+        )
+        .with_part(PatchPart::field(NodeId(2), "label", "Beta"));
+        assert_eq!(s.patch.len(), 2);
+        assert_eq!(s.applicability, Applicability::MaybeIncorrect);
+        assert_eq!(s.patch[0].node, NodeId(1));
+        assert_eq!(s.patch[0].path, None);
+        assert_eq!(s.patch[1].path.as_deref(), Some("label"));
+        assert_eq!(s.patch[1].replacement, "Beta");
     }
 }

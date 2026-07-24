@@ -451,6 +451,14 @@ impl DslMcpHandler {
 
     /// Look up the help text for a stable diagnostic code. When `code`
     /// is omitted, the full catalogue is returned (codes only).
+    ///
+    /// The catalogue merges three sources into one `dsl_kit::` code
+    /// space: the built-in engine error codes
+    /// ([`dsl_kit::engine_error_catalog`]), the built-in lint rule codes
+    /// ([`dsl_kit_lint::lint_catalog`]), and any host-contributed
+    /// entries ([`DslHost::catalog`](crate::DslHost::catalog)). The
+    /// unknown-code `did you mean` suggester runs over the merged code
+    /// list.
     #[tool(name = "dsl_kit_explain")]
     pub async fn dsl_kit_explain(
         &self,
@@ -458,6 +466,7 @@ impl DslMcpHandler {
     ) -> Result<String, String> {
         let guard = self.state.lock().await;
         let mut entries = dsl_kit::engine_error_catalog();
+        entries.extend(dsl_kit_lint::lint_catalog());
         entries.extend(guard.host.catalog());
 
         match params.code {
@@ -771,8 +780,99 @@ pub(crate) fn format_unknown_error_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsl_kit::noop_handle;
+    use crate::host::{EventCounts, HostSnapshot};
+    use dsl_kit::{BreakpointSet, noop_handle};
     use dsl_kit_fuzzy::FuzzySuggester;
+
+    /// Minimal call-less host: enough of the `DslHost` surface to build
+    /// a handler and exercise the DSL-neutral tools (`dsl_kit_explain`
+    /// in particular). Never suspends, never advances meaningfully.
+    struct StubHost;
+
+    #[async_trait::async_trait]
+    impl DslHost for StubHost {
+        fn dsl_name(&self) -> &str {
+            "stub"
+        }
+        fn root_node_id(&self) -> u64 {
+            0
+        }
+        fn root_summary(&self) -> String {
+            "Stub".into()
+        }
+        fn ast_size(&self) -> usize {
+            1
+        }
+        fn ast_pretty(&self) -> String {
+            "Stub".into()
+        }
+        fn snapshot(&self) -> HostSnapshot {
+            HostSnapshot {
+                depth: 0,
+                current_path: None,
+                suspended_call: None,
+                pending: Vec::new(),
+                results: Vec::new(),
+                events: EventCounts::default(),
+            }
+        }
+        async fn step_one(&mut self, _bps: &BreakpointSet) -> Result<HostOutcome, String> {
+            Ok(HostOutcome::Done)
+        }
+        async fn step_to_yield(&mut self, _bps: &BreakpointSet) -> Result<HostOutcome, String> {
+            Ok(HostOutcome::Done)
+        }
+        fn reset(&mut self) {}
+    }
+
+    fn stub_handler() -> DslMcpHandler {
+        DslMcpHandler::new(Box::new(StubHost))
+    }
+
+    #[tokio::test]
+    async fn explain_resolves_a_lint_code() {
+        let handler = stub_handler();
+        let out = handler
+            .dsl_kit_explain(Parameters(ExplainParams {
+                code: Some("dsl_kit::lint::typo_hint".into()),
+            }))
+            .await
+            .expect("lint code must resolve through explain");
+        let value: Value = serde_json::from_str(&out).expect("explain output is JSON");
+        assert_eq!(value["code"], "dsl_kit::lint::typo_hint");
+        assert!(
+            value["help"]
+                .as_str()
+                .expect("help is a string")
+                .contains("category=Suspicious"),
+            "help should fold in the lint category, got: {}",
+            value["help"]
+        );
+    }
+
+    #[tokio::test]
+    async fn explain_lists_lint_codes_alongside_engine_codes() {
+        let handler = stub_handler();
+        let out = handler
+            .dsl_kit_explain(Parameters(ExplainParams { code: None }))
+            .await
+            .expect("code-less explain lists the catalogue");
+        let value: Value = serde_json::from_str(&out).expect("explain output is JSON");
+        let codes: Vec<&str> = value["codes"]
+            .as_array()
+            .expect("codes array")
+            .iter()
+            .map(|c| c.as_str().expect("code string"))
+            .collect();
+        assert!(
+            codes.contains(&"dsl_kit::lint::unique_node_ids"),
+            "lint codes must appear in the merged catalogue"
+        );
+        assert!(
+            codes.contains(&"dsl_kit::eval::aborted"),
+            "engine codes must still appear in the merged catalogue"
+        );
+    }
 
     #[test]
     fn unknown_mode_defaults_to_noop_message() {
