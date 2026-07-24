@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.0] - 2026-07-24
+
+### Added
+
 - `dsl-kit-core` — structured, Clippy-style fix suggestions in
   `suggest`. `Applicability` (`MachineApplicable` / `MaybeIncorrect` /
   `HasPlaceholders`, serde round-trippable, no `Unspecified` escape

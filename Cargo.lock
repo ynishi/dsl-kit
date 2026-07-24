@@ -240,7 +240,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "custom-mcp-example"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dsl-kit",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-macros",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "miette",
  "serde",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-fuzzy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit-core",
  "strsim",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-lint"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-schema",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-parse"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit-core",
  "dsl-kit-fuzzy",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "dsl-kit-schema"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
 ]
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "expr-dsl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-core",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "expr-example"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "expr-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "expr-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dsl-kit-mcp",
@@ -470,7 +470,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flow-dsl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-core",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "flow-example"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dsl-kit",
  "dsl-kit-parse",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "flow-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dsl-kit",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "flow-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "dsl-kit-mcp",
