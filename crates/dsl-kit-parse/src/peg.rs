@@ -675,6 +675,12 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             variant: variant.to_string(),
             fields: node_sink.fields,
             children: node_sink.children,
+            // The PEG front-end has no keyed-slot production yet — the
+            // canonical text syntax for `Multiplicity::Map` lands with
+            // grammar generation (`schema_gen` still rejects Map
+            // schemas up front), so nothing can reach this builder
+            // carrying keyed children.
+            keyed_children: Vec::new(),
             span: Some(Span::new(start_pos, end_pos)),
         };
         self.contribute_tree(tree);

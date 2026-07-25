@@ -30,7 +30,7 @@
 //! AST value, minting fresh `NodeId`s from the caller's `IdGen`. It
 //! delegates payload deserialization to `dsl_kit_parse::build_field`
 //! and child-slot recursion to `build_child_one` / `build_child_optional`
-//! / `build_child_many`. Types deriving `DslBuild` must also derive
+//! / `build_child_many` / `build_child_map`. Types deriving `DslBuild` must also derive
 //! `DslSchema` (used for the level-scoped conformance check). Payload
 //! fields whose type has no `FromStr` route (e.g. `Option<T>`, which
 //! the orphan rule bars downstream crates from implementing) opt out of
@@ -557,8 +557,10 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 ///    payload fields only; annotating a recursive child field is a
 ///    compile error.
 /// 4. For each recursive child field, calls the appropriate helper
-///    (`build_child_one` / `_optional` / `_many`) and re-wraps the
-///    result in `Box` where the source field is boxed.
+///    (`build_child_one` / `_optional` / `_many` / `_map`) and
+///    re-wraps the result in `Box` where the source field is boxed.
+///    Keyed slots (`BTreeMap<String, T>`) read the tree's keyed half
+///    and keep their keys.
 /// 5. Constructs the variant with a fresh `NodeId` from the
 ///    caller-supplied `IdGen`.
 ///
@@ -691,24 +693,21 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                             .collect::<::std::vec::Vec<_>>()
                     },
                     // Keyed slots (`BTreeMap<String, T>` /
-                    // `BTreeMap<String, Box<T>>`) are recognised by
-                    // `DslNode` / `DslSchema` in cycle 2 but the
-                    // `ParseTree` extension for keyed children is
-                    // scheduled for cycle 3. Emit a runtime panic that
-                    // fires only when a caller actually invokes
-                    // `DslBuild::from_parse_tree` on a variant that
-                    // carries a keyed slot — enums that opt into
-                    // `#[derive(DslBuild)]` alongside keyed-slot
-                    // variants still compile, and non-keyed variants
-                    // build normally.
-                    Recursion::Map | Recursion::MapBoxed => quote! {
-                        ::std::unimplemented!(
-                            "DslBuild does not yet support keyed slots ({}::{}::{}); \
-                             tracking: https://github.com/ynishi/dsl-kit/issues/5",
-                            ::std::stringify!(#name),
-                            ::std::stringify!(#variant_ident),
-                            #ident_str
-                        )
+                    // `BTreeMap<String, Box<T>>`) read from the tree's
+                    // keyed half; `build_child_map` hands back a
+                    // `BTreeMap<String, T>` already keyed by the
+                    // front-end's keys.
+                    Recursion::Map => quote! {
+                        ::dsl_kit_parse::build_child_map::<#name>(tree, #ident_str, ids)?
+                    },
+                    // Same call, then re-box each value. Collected
+                    // back into a `BTreeMap` (not the `Vec` idiom used
+                    // by `ManyBoxed`) so the keys survive the rewrap.
+                    Recursion::MapBoxed => quote! {
+                        ::dsl_kit_parse::build_child_map::<#name>(tree, #ident_str, ids)?
+                            .into_iter()
+                            .map(|(k, v)| (k, ::std::boxed::Box::new(v)))
+                            .collect::<::std::collections::BTreeMap<_, _>>()
                     },
                 };
                 let_bindings.push(quote! { let #ident = #helper_call; });

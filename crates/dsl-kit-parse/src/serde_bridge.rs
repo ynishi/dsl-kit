@@ -22,7 +22,9 @@
 //!   [`Multiplicity`]:
 //!   - `One` → a single object (the child);
 //!   - `Optional` → `null` or a single object;
-//!   - `Many` → an array of objects (possibly empty).
+//!   - `Many` → an array of objects (possibly empty);
+//!   - `Map` → an object mapping keys to child objects (possibly
+//!     empty), landing in [`ParseTree::keyed_children`] sorted by key.
 //! - keys that name neither yield an [`codes::UNKNOWN_FIELD`]
 //!   diagnostic (or, when the key is a declared child slot placed as a
 //!   field / vice versa, the appropriate structural code).
@@ -68,15 +70,6 @@ pub mod serde_codes {
     /// A child slot's value shape did not match its
     /// [`Multiplicity`](dsl_kit_schema::Multiplicity) contract.
     pub const CHILD_SHAPE: &str = "dsl_kit::parse::serde::child_shape";
-    /// A child slot declared with
-    /// [`Multiplicity::Map`](dsl_kit_schema::Multiplicity::Map) was
-    /// encountered but the JSON ⇒ [`ParseTree`](crate::ParseTree)
-    /// bridge does not yet support keyed slots. Namespaced under
-    /// `serde` (rather than reusing the crate-level
-    /// [`crate::codes::MAP_NOT_IMPLEMENTED`]) so consumers can filter
-    /// by stage and retire each slug independently as runtime support
-    /// lands.
-    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::parse::serde::map_not_implemented";
 }
 
 /// Parses a JSON string into a [`ParseTree`], using `schema` to
@@ -204,16 +197,21 @@ fn build_tree(
         if let Some(_field) = variant.fields.iter().find(|f| &f.name == key) {
             tree.fields.push((key.clone(), RawValue::Json(val.clone())));
         } else if let Some(child) = variant.children.iter().find(|c| &c.name == key) {
-            let subtrees = build_child_slot(
-                child.multiplicity,
-                val,
-                variant,
-                key,
-                schema,
-                diags,
-                suggester,
-            );
-            tree.children.push((key.clone(), subtrees));
+            if child.multiplicity == Multiplicity::Map {
+                let entries = build_keyed_child_slot(val, variant, key, schema, diags, suggester);
+                tree.keyed_children.push((key.clone(), entries));
+            } else {
+                let subtrees = build_child_slot(
+                    child.multiplicity,
+                    val,
+                    variant,
+                    key,
+                    schema,
+                    diags,
+                    suggester,
+                );
+                tree.children.push((key.clone(), subtrees));
+            }
         } else {
             // Not a declared field, not a declared child — either a
             // shape mix-up (using a field name inside "children" via
@@ -304,20 +302,17 @@ fn build_child_slot(
             }
         },
         Multiplicity::Map => {
-            // Runtime JSON → ParseTree mapping for keyed slots requires
-            // extending [`ParseTree`] to store per-child keys (a keyed
-            // sibling to `children`). That extension is scoped to a
-            // follow-up cycle; for now the schema variant exists but
-            // the bridge surfaces `serde_codes::MAP_NOT_IMPLEMENTED` so
-            // callers who hand-roll a Map slot get a clear diagnostic
-            // (namespaced under `serde`, matching the sibling
-            // `CHILD_SHAPE` convention) instead of a silent empty child
-            // list.
+            // Keyed slots are routed to `build_keyed_child_slot` by
+            // `build_tree` before reaching here, because their result
+            // shape (`(key, tree)` pairs) does not fit this function's
+            // return type. Arriving in this arm means that dispatch
+            // lost sync with the schema — surface it rather than
+            // silently dropping every entry.
             diags.push(Diagnostic::error(
-                serde_codes::MAP_NOT_IMPLEMENTED,
+                serde_codes::CHILD_SHAPE,
                 format!(
-                    "child slot `{}` on variant `{}` declares Multiplicity::Map, \
-                     but the JSON → ParseTree bridge does not yet support keyed slots",
+                    "child slot `{}` on variant `{}` declares Multiplicity::Map but was \
+                     routed through the positional builder",
                     slot, variant.name
                 ),
             ));
@@ -342,6 +337,70 @@ fn build_child_slot(
             Vec::new()
         }
     }
+}
+
+/// Builds a keyed child slot ([`Multiplicity::Map`]) from a JSON
+/// object mapping keys to child node objects.
+///
+/// The pairs are sorted by key before returning so that
+/// [`ParseTree::keyed_children`] carries one canonical order
+/// regardless of how the JSON was written, and regardless of whether
+/// `serde_json` was built with the `preserve_order` feature (which
+/// swaps its object map from a sorted `BTreeMap` to an
+/// insertion-ordered one). Sorting here is what keeps the bridge on
+/// the right side of the ordering contract
+/// [`check_conformance`](crate::check_conformance) enforces
+/// ([`crate::codes::KEYED_SLOT_UNSORTED`]) — a JSON document can
+/// never trip it.
+///
+/// Duplicate keys cannot survive `serde_json`'s own object parsing
+/// (the later one wins before the bridge ever sees the document), so
+/// [`crate::codes::DUPLICATE_KEY`] is raised by hand-built trees and
+/// by future non-JSON front-ends, not here.
+fn build_keyed_child_slot(
+    val: &Value,
+    variant: &VariantSchema,
+    slot: &str,
+    schema: &NodeSchema,
+    diags: &mut Vec<Diagnostic>,
+    suggester: &dyn Suggester,
+) -> Vec<(String, ParseTree)> {
+    let Value::Object(map) = val else {
+        diags.push(Diagnostic::error(
+            serde_codes::CHILD_SHAPE,
+            format!(
+                "keyed child slot `{}` on variant `{}` requires an object mapping keys \
+                 to child objects, got {}",
+                slot,
+                variant.name,
+                kind(val)
+            ),
+        ));
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(map.len());
+    for (key, item) in map {
+        match item {
+            Value::Object(_) => {
+                if let Some(child) = build_tree(item, schema, diags, suggester) {
+                    out.push((key.clone(), child));
+                }
+            }
+            _ => diags.push(Diagnostic::error(
+                serde_codes::CHILD_SHAPE,
+                format!(
+                    "keyed child slot `{}` on variant `{}`: entry `{}` requires an object, got {}",
+                    slot,
+                    variant.name,
+                    key,
+                    kind(item)
+                ),
+            )),
+        }
+    }
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
+    out
 }
 
 fn kind(v: &Value) -> &'static str {

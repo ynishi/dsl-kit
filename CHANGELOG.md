@@ -14,30 +14,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (where `T` is the derived-on enum itself) as keyed self-recursive
   child slots. `Walk` / `WalkMut` iterate `.values()` /
   `.values_mut()` in the map's own (sorted-by-key) order; the schema
-  reports `Multiplicity::Map`. `#[derive(DslBuild)]` emits an
-  `unimplemented!` at the keyed-slot call site (JSON ⇔ AST for keyed
-  slots is scheduled for cycle 3); `#[derive(DslExec)]`
+  reports `Multiplicity::Map`. `#[derive(DslBuild)]` reads the tree's
+  keyed half through `build_child_map` and rebuilds the
+  `BTreeMap` with its keys intact; `#[derive(DslExec)]`
   collect-children treats keyed slots the same as `Vec<Box<T>>` for
   ordering. Non-`Box` keyed shapes (`Recursion::Map`) are supported
   for symmetry with the positional shapes.
+- `dsl-kit-parse` — keyed child slots are now a first-class part of
+  the parse trunk. `ParseTree::keyed_children` holds
+  `(slot, [(key, subtree)])` alongside the positional `children`, with
+  a `ParseTree::keyed_child_slot(name)` accessor; `build_child_map`
+  is the `DslBuild` helper that turns a keyed slot into a
+  `BTreeMap<String, T>`. `check_conformance` accepts zero-or-more
+  keyed entries and rejects the ways a tree can get keying wrong (see
+  the diagnostics below).
+  The JSON ⇒ `ParseTree` bridge reads a `Map` slot as an object
+  mapping keys to child objects (`{"entries": {"k": {…}}}`) and sorts
+  the entries by key on ingest, so documents that differ only in key
+  order produce identical trees regardless of how `serde_json` was
+  built.
+- `dsl-kit-parse` — three diagnostics guarding the keyed-slot
+  contract, all errors rather than silent recovery:
+  `codes::DUPLICATE_KEY` (`dsl_kit::parse::duplicate_key`) when a slot
+  carries the same key twice, which would otherwise drop a subtree the
+  author wrote; `codes::KEYED_SLOT_SHAPE`
+  (`dsl_kit::parse::keyed_slot_shape`) when a `Map` slot is supplied
+  as a positional list or a positional slot as keyed entries, which
+  would otherwise read as an empty slot; and
+  `codes::KEYED_SLOT_UNSORTED`
+  (`dsl_kit::parse::keyed_slot_unsorted`) when entries are not in
+  ascending key order, which would otherwise leave two front-ends
+  producing unequal trees for the same document. A slot found only in
+  the half it does not belong to is reported once, for the keying —
+  the arity check is stood down so it cannot also claim the slot is
+  empty.
 - `dsl-kit-schema` — new `Multiplicity::Map` variant marking a
   string-keyed child slot (`Map<String, V>` shape at the Rust level).
   `Multiplicity::as_str()` returns `"map"` and `NodeSchema::to_json`
   emits `"multiplicity": "map"`. Consumers can construct schemas with
   keyed slots today; the derive macro, PEG codegen, and JSON ⇔ AST
   bridge grow support incrementally per the tracking issue.
-- `dsl-kit-parse` — three per-stage diagnostic slugs for the keyed-slot
-  "not yet implemented" signal, each retirable independently as
-  runtime support lands:
-  - `codes::MAP_NOT_IMPLEMENTED` (`dsl_kit::parse::map_not_implemented`)
-    from `check_conformance`.
-  - `serde_bridge::serde_codes::MAP_NOT_IMPLEMENTED`
-    (`dsl_kit::parse::serde::map_not_implemented`) from the JSON ⇒
-    `ParseTree` bridge, matching the sibling `CHILD_SHAPE` convention.
-  - `schema_gen::codes::MAP_NOT_IMPLEMENTED`
-    (`dsl_kit::schema_gen::map_not_implemented`) from
-    `grammar_from_schema`, which now aborts up front instead of
-    reaching a bogus rule.
+- `dsl-kit-parse` — `schema_gen::codes::MAP_NOT_IMPLEMENTED`
+  (`dsl_kit::schema_gen::map_not_implemented`) from
+  `grammar_from_schema`, which aborts up front instead of reaching a
+  bogus rule. Grammar generation is the one stage that still refuses
+  keyed slots: the canonical *text* syntax for them is an open design
+  question, unlike the JSON and in-memory shapes which this release
+  settles. (The conformance and serde-bridge siblings of this slug
+  existed only within this unreleased window and are gone — those
+  stages carry real support now.)
 - `dsl-kit-parse` — `codes::UNKNOWN_MULTIPLICITY` /
   `schema_gen::codes::UNKNOWN_MULTIPLICITY` slugs backing the
   `#[non_exhaustive]` catch-all arms; surface a stable signal instead
@@ -53,6 +78,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tuple slots, …) land as minor bumps per RFC 2008. **Breaking** for
   out-of-workspace consumers that matched exhaustively on
   `Multiplicity` without a catch-all.
+- `dsl-kit-parse` — `ParseTree` gained the `keyed_children` field.
+  **Breaking** for front-ends that construct `ParseTree` with a struct
+  literal; `ParseTree::new(variant)` followed by field assignment is
+  the construction path that survives future additions. The struct is
+  deliberately left exhaustive (unlike `Multiplicity`) because
+  hand-building a tree is a primary use case for front-end authors.
+  One known open question rides on this: a keyed entry is a
+  `(String, ParseTree)` tuple, so the *key* has nowhere to carry a
+  source span. If the PEG front-end's keyed productions turn out to
+  need one, that entry shape changes — the decision belongs with the
+  canonical text syntax, which is still open.
 
 ### Deprecated
 

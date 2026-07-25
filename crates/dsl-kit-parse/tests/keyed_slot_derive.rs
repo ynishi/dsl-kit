@@ -1,11 +1,11 @@
-//! End-to-end derive coverage for the cycle 2 keyed-slot recognition
+//! Derive-side coverage for keyed-slot recognition
 //! (`BTreeMap<String, T>` and `BTreeMap<String, Box<T>>`).
 //!
-//! Cycle 2 lands macro-side recognition only: `#[derive(DslNode)]`
-//! generates walk / walk-mut iteration through `.values()`, and
-//! `#[derive(DslSchema)]` emits `Multiplicity::Map`. Parse-side
-//! keyed-slot support (JSON ⇒ ParseTree bridge, PEG codegen) remains
-//! `MAP_NOT_IMPLEMENTED` — those live in later cycles.
+//! Scope is the macro layer: `#[derive(DslNode)]` generates walk /
+//! walk-mut iteration through `.values()`, and `#[derive(DslSchema)]`
+//! emits `Multiplicity::Map`. The build side (JSON ⇒ ParseTree ⇒
+//! typed AST) lives in `keyed_slot_json.rs`; PEG codegen still
+//! refuses keyed slots outright, guarded by `map_not_implemented.rs`.
 //!
 //! These tests exercise a downstream-shaped enum that carries
 //! keyed-slot fields alongside the pre-existing recursion shapes, so
@@ -32,19 +32,13 @@ enum Cfg {
     /// Leaf.
     Leaf { id: NodeId, value: String },
     /// Positional child (`Box<Self>`).
-    Wrap {
-        id: NodeId,
-        inner: Box<Cfg>,
-    },
+    Wrap { id: NodeId, inner: Box<Cfg> },
     /// Positional list (`Vec<Box<Self>>`). The `Box` is intentional —
     /// it exercises the derive's `Recursion::ManyBoxed` arm, which
     /// exists precisely for enums whose value type is not `Sized` in
     /// its own storage. Suppresses `clippy::vec_box` for that reason.
     #[allow(clippy::vec_box)]
-    Seq {
-        id: NodeId,
-        items: Vec<Box<Cfg>>,
-    },
+    Seq { id: NodeId, items: Vec<Box<Cfg>> },
     /// Keyed slot with boxed self-recursion — the common shape.
     Env {
         id: NodeId,

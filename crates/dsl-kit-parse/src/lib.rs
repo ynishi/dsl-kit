@@ -14,7 +14,8 @@
 //! ## Architecture (layers)
 //!
 //! - [`ParseTree`] — untyped trunk. Variant name + field payloads +
-//!   named child slots + optional source [`Span`].
+//!   named child slots (positional lists, plus keyed entries for
+//!   [`Multiplicity::Map`] slots) + optional source [`Span`].
 //! - [`RawValue`] — per-field payload representation. `Text` keeps the
 //!   PEG front-end's matched source text; `Json` keeps the serde
 //!   front-end's typed value with no stringify round-trip.
@@ -31,6 +32,8 @@
 use dsl_kit_core::{IdGen, NodeId, Suggester, Suggestion};
 use dsl_kit_schema::{ChildSchema, Multiplicity, NodeSchema, VariantSchema};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub mod example_gen;
@@ -93,8 +96,15 @@ pub enum RawValue {
 ///
 /// The shape deliberately mirrors [`NodeSchema`] / [`VariantSchema`]:
 /// `variant` picks a variant by name; `fields` carries non-recursive
-/// payload; `children` carries named child slots each holding an
-/// ordered list of subtrees (matching the schema's [`Multiplicity`]).
+/// payload; `children` carries named **positional** child slots each
+/// holding an ordered list of subtrees; `keyed_children` carries named
+/// **keyed** child slots ([`Multiplicity::Map`]) holding `(key,
+/// subtree)` pairs.
+///
+/// A given slot name lives in exactly one of the two child vectors —
+/// whichever one its schema [`Multiplicity`] calls for. Putting it in
+/// the wrong one is a [`codes::KEYED_SLOT_SHAPE`] diagnostic at
+/// conformance time rather than a silent drop.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseTree {
     /// Variant name — must match a [`VariantSchema::name`] at
@@ -102,10 +112,27 @@ pub struct ParseTree {
     pub variant: String,
     /// Non-recursive payload fields, keyed by field name.
     pub fields: Vec<(String, RawValue)>,
-    /// Recursive child slots, keyed by slot name. Each slot's inner
+    /// Positional child slots, keyed by slot name. Each slot's inner
     /// [`Vec`] holds zero-or-more trees per the child's
-    /// [`Multiplicity`].
+    /// [`Multiplicity`] ([`One`](Multiplicity::One) /
+    /// [`Optional`](Multiplicity::Optional) /
+    /// [`Many`](Multiplicity::Many)).
     pub children: Vec<(String, Vec<ParseTree>)>,
+    /// Keyed child slots ([`Multiplicity::Map`]), by slot name. Each
+    /// slot holds `(key, subtree)` pairs.
+    ///
+    /// Front-ends must emit the pairs **sorted by key**, so that two
+    /// front-ends handed the same document produce equal trees. The
+    /// JSON bridge sorts on ingest; hand-built trees that do not are
+    /// rejected at conformance time with
+    /// [`codes::KEYED_SLOT_UNSORTED`] rather than quietly compared
+    /// unequal later.
+    ///
+    /// Duplicate keys within one slot are representable (the storage
+    /// is a [`Vec`], not a map) precisely so they can be *diagnosed* —
+    /// [`codes::DUPLICATE_KEY`] — instead of one entry silently
+    /// winning.
+    pub keyed_children: Vec<(String, Vec<(String, ParseTree)>)>,
     /// Source-range span, if the front-end tracks it.
     pub span: Option<Span>,
 }
@@ -117,6 +144,7 @@ impl ParseTree {
             variant: variant.into(),
             fields: Vec::new(),
             children: Vec::new(),
+            keyed_children: Vec::new(),
             span: None,
         }
     }
@@ -126,9 +154,22 @@ impl ParseTree {
         self.fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
 
-    /// Looks up a child slot by name.
+    /// Looks up a positional child slot by name.
     pub fn child_slot(&self, name: &str) -> Option<&[ParseTree]> {
         self.children
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Looks up a keyed child slot ([`Multiplicity::Map`]) by name.
+    ///
+    /// Returns the slot's `(key, subtree)` pairs in the order the
+    /// front-end emitted them. For a tree that passed
+    /// [`check_conformance`] that order is ascending by key; on an
+    /// unchecked tree it is whatever the producer wrote.
+    pub fn keyed_child_slot(&self, name: &str) -> Option<&[(String, ParseTree)]> {
+        self.keyed_children
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_slice())
@@ -386,13 +427,25 @@ pub mod codes {
     /// A payload field's value could not be converted to the target
     /// Rust type (serde deserialization failure or `FromStr` failure).
     pub const FIELD_TYPE: &str = "dsl_kit::parse::field_type";
-    /// A slot declared with [`crate::Multiplicity::Map`] was encountered
-    /// but runtime support (arity check / JSON ⇔ AST bridge / PEG
-    /// codegen) is not yet implemented at the site that raised it. The
-    /// schema variant exists so consumers can declare keyed slots today;
-    /// downstream cycles will retire this diagnostic per site as support
-    /// lands.
-    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::parse::map_not_implemented";
+    /// A keyed child slot ([`crate::Multiplicity::Map`]) carried the
+    /// same key more than once. The map the consumer asked for cannot
+    /// hold both, and picking a winner silently would make the parse
+    /// lossy — so the duplicate is an error at conformance time and at
+    /// [`crate::build_child_map`] time.
+    pub const DUPLICATE_KEY: &str = "dsl_kit::parse::duplicate_key";
+    /// A child slot was placed in the wrong half of the tree: a slot
+    /// declared [`crate::Multiplicity::Map`] appeared under
+    /// [`ParseTree::children`] (positional), or a slot declared
+    /// `One` / `Optional` / `Many` appeared under
+    /// [`ParseTree::keyed_children`].
+    pub const KEYED_SLOT_SHAPE: &str = "dsl_kit::parse::keyed_slot_shape";
+    /// A keyed child slot's entries were not in ascending key order.
+    /// [`ParseTree::keyed_children`] documents sorted-by-key as the
+    /// canonical form so that two front-ends producing the same
+    /// document produce equal trees; this is that contract enforced
+    /// rather than assumed. The JSON bridge sorts on ingest, so this
+    /// fires only for hand-built or hand-rolled front-end trees.
+    pub const KEYED_SLOT_UNSORTED: &str = "dsl_kit::parse::keyed_slot_unsorted";
     /// A child slot's multiplicity is a variant this build of
     /// `dsl-kit-parse` does not recognise. Emitted from the catch-all
     /// arm required by [`crate::Multiplicity`]'s `#[non_exhaustive]`
@@ -424,13 +477,21 @@ pub mod codes {
 /// - every declared child slot is present exactly once
 ///   ([`codes::DUPLICATE_CHILD`]) and honours its [`Multiplicity`]
 ///   ([`codes::ARITY_ONE`], [`codes::ARITY_OPTIONAL`]);
+/// - every child slot sits in the half its [`Multiplicity`] calls for
+///   — keyed slots under [`ParseTree::keyed_children`], positional
+///   ones under [`ParseTree::children`] ([`codes::KEYED_SLOT_SHAPE`]);
+/// - a keyed slot carries each key at most once
+///   ([`codes::DUPLICATE_KEY`]) and in ascending key order
+///   ([`codes::KEYED_SLOT_UNSORTED`]);
 /// - no undeclared child slot is present ([`codes::UNKNOWN_CHILD`],
 ///   or [`codes::FIELD_AS_CHILD`] when the extra name is actually a
 ///   declared payload field).
 ///
-/// [`Multiplicity::Many`] accepts zero-or-more children — the
-/// `NoEmptyManyChildren` lint rule is the place to complain about
-/// domain-level emptiness.
+/// [`Multiplicity::Many`] and [`Multiplicity::Map`] both accept
+/// zero-or-more children. For `Many`, the `NoEmptyManyChildren` lint
+/// rule is the place to complain about domain-level emptiness; that
+/// rule keys off `Multiplicity::Many` specifically, so an empty keyed
+/// slot currently has no lint watching it.
 pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnostic> {
     check_conformance_with(tree, schema, &BuiltinLevenshteinSuggester)
 }
@@ -605,10 +666,13 @@ fn check_children(
     out: &mut Vec<Diagnostic>,
     suggester: &dyn Suggester,
 ) {
-    // Duplicate child slot names.
-    for i in 0..tree.children.len() {
-        let (name, _) = &tree.children[i];
-        if tree.children[..i].iter().any(|(n, _)| n == name) {
+    // Duplicate child slot names. The two child vectors share one
+    // namespace — a slot appearing once positionally and once keyed is
+    // a duplicate, not two independent slots — so the scan walks them
+    // as a single sequence.
+    let mut seen: Vec<&str> = Vec::new();
+    for name in slot_names_in_tree(tree) {
+        if seen.contains(&name) {
             out.push(
                 Diagnostic::error(
                     codes::DUPLICATE_CHILD,
@@ -619,15 +683,47 @@ fn check_children(
                 )
                 .with_span(tree.span),
             );
+        } else {
+            seen.push(name);
         }
     }
 
-    // Declared children: arity check.
+    // Declared children: keying + arity check.
     for c in &variant.children {
-        let count = tree
-            .child_slot(&c.name)
-            .map(<[ParseTree]>::len)
-            .unwrap_or(0);
+        let positional = tree.child_slot(&c.name);
+        let keyed = tree.keyed_child_slot(&c.name);
+        let count = positional.map(<[ParseTree]>::len).unwrap_or(0);
+
+        // Keying mismatch: the slot exists, but in the half the schema
+        // did not ask for.
+        let is_map = c.multiplicity == Multiplicity::Map;
+        let wrong_half = if is_map {
+            positional.is_some()
+        } else {
+            keyed.is_some()
+        };
+        if wrong_half {
+            out.push(diag_keying(variant, c, is_map, tree.span));
+        }
+
+        // When the slot's *only* occurrence sits in the wrong half,
+        // skip the shape check below: it reads the right half, finds
+        // it empty, and would report "expects exactly one child but
+        // got 0" about a tree that supplied exactly one child. The
+        // keying diagnostic already says what went wrong; a second,
+        // untrue one only misdirects. A slot present in *both* halves
+        // still gets checked — `DUPLICATE_CHILD` covers the collision
+        // and the shape verdict on the right half stays meaningful.
+        let only_in_wrong_half = wrong_half
+            && if is_map {
+                keyed.is_none()
+            } else {
+                positional.is_none()
+            };
+        if only_in_wrong_half {
+            continue;
+        }
+
         match c.multiplicity {
             Multiplicity::One => {
                 if count != 1 {
@@ -649,22 +745,47 @@ fn check_children(
                 // Zero is fine at the shape level.
             }
             Multiplicity::Map => {
-                // Keyed-slot runtime support (arity + per-key uniqueness
-                // + JSON ⇔ AST) is scheduled for a follow-up cycle. The
-                // schema variant exists today so consumers can declare
-                // the slot; encountering one here surfaces a clear
-                // diagnostic instead of panicking.
-                out.push(
-                    Diagnostic::error(
-                        codes::MAP_NOT_IMPLEMENTED,
-                        format!(
-                            "child slot `{}` on variant `{}` declares Multiplicity::Map, \
-                             but keyed-slot runtime support is not yet implemented",
-                            c.name, variant.name
+                // Zero-or-more keyed entries is fine at the shape
+                // level (same as `Many`); what a map *cannot* carry is
+                // the same key twice.
+                //
+                // Walking adjacent pairs checks that in one linear
+                // pass — and the same pass verifies the sorted-by-key
+                // order [`ParseTree::keyed_children`] documents, so
+                // that contract is enforced rather than trusted. A
+                // front-end that emits out of order finds out here
+                // instead of shipping trees that compare unequal to
+                // every other front-end's for the same document.
+                let entries = keyed.unwrap_or(&[]);
+                for pair in entries.windows(2) {
+                    let (lhs, rhs) = (&pair[0].0, &pair[1].0);
+                    match lhs.cmp(rhs) {
+                        Ordering::Equal => out.push(
+                            Diagnostic::error(
+                                codes::DUPLICATE_KEY,
+                                format!(
+                                    "keyed child slot `{}` on variant `{}` carries key \
+                                     `{}` more than once",
+                                    c.name, variant.name, rhs
+                                ),
+                            )
+                            .with_span(tree.span),
                         ),
-                    )
-                    .with_span(tree.span),
-                );
+                        Ordering::Greater => out.push(
+                            Diagnostic::error(
+                                codes::KEYED_SLOT_UNSORTED,
+                                format!(
+                                    "keyed child slot `{}` on variant `{}` is not sorted by \
+                                     key (`{}` precedes `{}`); front-ends must emit keyed \
+                                     entries in key order",
+                                    c.name, variant.name, lhs, rhs
+                                ),
+                            )
+                            .with_span(tree.span),
+                        ),
+                        Ordering::Less => {}
+                    }
+                }
             }
             // `#[non_exhaustive]` catch-all: emitted when a future
             // Multiplicity variant lands in dsl-kit-schema before this
@@ -694,12 +815,13 @@ fn check_children(
     let missing = missing_slot_names(tree, variant);
     let all_slots = all_slot_names(variant);
 
-    // Unknown child slots.
-    for (name, _) in &tree.children {
-        if variant.children.iter().any(|c| &c.name == name) {
+    // Unknown child slots — both halves, since an undeclared name is
+    // equally unknown whether it arrived keyed or positional.
+    for name in slot_names_in_tree(tree) {
+        if variant.children.iter().any(|c| c.name == name) {
             continue;
         }
-        if variant.fields.iter().any(|f| &f.name == name) {
+        if variant.fields.iter().any(|f| f.name == name) {
             out.push(
                 Diagnostic::error(
                     codes::FIELD_AS_CHILD,
@@ -723,6 +845,45 @@ fn check_children(
             out.push(Diagnostic::error(codes::UNKNOWN_CHILD, msg).with_span(tree.span));
         }
     }
+}
+
+/// Every child slot name present on `tree`, positional slots first
+/// then keyed ones. The two vectors share a single namespace, so both
+/// the duplicate scan and the unknown-slot scan walk this sequence
+/// rather than either vector alone.
+fn slot_names_in_tree(tree: &ParseTree) -> impl Iterator<Item = &str> {
+    tree.children
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .chain(tree.keyed_children.iter().map(|(n, _)| n.as_str()))
+}
+
+/// Builds the [`codes::KEYED_SLOT_SHAPE`] diagnostic. `positional_seen`
+/// distinguishes the two directions: `true` = a `Map`-declared slot
+/// arrived under [`ParseTree::children`], `false` = a positional slot
+/// arrived under [`ParseTree::keyed_children`].
+fn diag_keying(
+    variant: &VariantSchema,
+    child: &ChildSchema,
+    positional_seen: bool,
+    span: Option<Span>,
+) -> Diagnostic {
+    let msg = if positional_seen {
+        format!(
+            "child slot `{}` on variant `{}` declares Multiplicity::Map — its children \
+             must be supplied as keyed entries, not as a positional list",
+            child.name, variant.name
+        )
+    } else {
+        format!(
+            "child slot `{}` on variant `{}` is positional ({}) — its children must be \
+             supplied as a plain list, not as keyed entries",
+            child.name,
+            variant.name,
+            child.multiplicity.as_str()
+        )
+    };
+    Diagnostic::error(codes::KEYED_SLOT_SHAPE, msg).with_span(span)
 }
 
 /// Names of every declared payload field and child slot on
@@ -755,11 +916,19 @@ pub(crate) fn missing_slot_names<'a>(tree: &ParseTree, variant: &'a VariantSchem
         }
     }
     for c in &variant.children {
-        let count = tree
+        // A slot counts as present when it carries entries in either
+        // half — a keyed slot supplied positionally (or vice versa)
+        // already earns its own `KEYED_SLOT_SHAPE` diagnostic, and
+        // listing it as "missing" on top of that would misdirect.
+        let positional = tree
             .child_slot(&c.name)
             .map(<[ParseTree]>::len)
             .unwrap_or(0);
-        if count == 0 {
+        let keyed = tree
+            .keyed_child_slot(&c.name)
+            .map(<[(String, ParseTree)]>::len)
+            .unwrap_or(0);
+        if positional + keyed == 0 {
             out.push(c.name.as_str());
         }
     }
@@ -777,12 +946,12 @@ fn diag_arity(
         Multiplicity::One => "exactly one child",
         Multiplicity::Optional => "at most one child",
         Multiplicity::Many => "zero or more children",
-        // `Map` never enters `diag_arity` in practice — its arity check
-        // in `check_children` short-circuits with `MAP_NOT_IMPLEMENTED`
-        // before reaching this helper. Kept explicit (rather than
-        // folded into the `_` arm) so a future change that routes Map
-        // through here gets a Map-shaped label instead of the generic
-        // "unknown multiplicity" fallback.
+        // `Map` never enters `diag_arity` in practice — keyed slots
+        // accept zero-or-more entries, so `check_children` has no
+        // arity complaint to raise for them (only `DUPLICATE_KEY`).
+        // Kept explicit (rather than folded into the `_` arm) so a
+        // future change that routes Map through here gets a Map-shaped
+        // label instead of the generic "unknown multiplicity" fallback.
         Multiplicity::Map => "any number of keyed children",
         // `#[non_exhaustive]` catch-all — see the sibling arm in
         // `check_children` for the versioning rationale.
@@ -1087,6 +1256,50 @@ pub fn build_child_many<T: DslBuild>(
     for child in slot {
         match T::from_parse_tree(child, ids) {
             Ok(v) => out.push(v),
+            Err(mut e) => diags.append(&mut e.diagnostics),
+        }
+    }
+    if diags.is_empty() {
+        Ok(out)
+    } else {
+        Err(BuildError::new(diags))
+    }
+}
+
+/// Builds every entry of a [`Multiplicity::Map`] slot into a
+/// [`BTreeMap`] keyed by the front-end's keys.
+///
+/// [`BTreeMap`] rather than `HashMap` on purpose: the consumer's
+/// iteration order is part of the observable AST (walks, re-emission,
+/// canonical text), so it has to be deterministic. The derive
+/// recognises `BTreeMap<String, T>` for the same reason.
+///
+/// Like [`build_child_many`], diagnostics from individual entries are
+/// collected across the whole slot before returning. A key appearing
+/// twice is a [`codes::DUPLICATE_KEY`] error rather than a silent
+/// last-one-wins overwrite — the parse would otherwise drop a subtree
+/// the author wrote.
+pub fn build_child_map<T: DslBuild>(
+    tree: &ParseTree,
+    name: &str,
+    ids: &IdGen,
+) -> Result<BTreeMap<String, T>, BuildError> {
+    let slot = tree.keyed_child_slot(name).unwrap_or(&[]);
+    let mut out = BTreeMap::new();
+    let mut diags = Vec::new();
+    for (key, child) in slot {
+        match T::from_parse_tree(child, ids) {
+            Ok(v) => {
+                if out.insert(key.clone(), v).is_some() {
+                    diags.push(
+                        Diagnostic::error(
+                            codes::DUPLICATE_KEY,
+                            format!("keyed child slot `{name}` carries key `{key}` more than once"),
+                        )
+                        .with_span(tree.span),
+                    );
+                }
+            }
             Err(mut e) => diags.append(&mut e.diagnostics),
         }
     }
