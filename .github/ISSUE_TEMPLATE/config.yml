@@ -1,0 +1,6 @@
+# GitHub Issue Template chooser.
+# `blank_issues_enabled: true` keeps the "open a blank issue" link so bug
+# reports and free-form questions do not have to fit the AST template's
+# checklist — the template is a gate for AST-shape features, not for
+# every issue.
+blank_issues_enabled: true
