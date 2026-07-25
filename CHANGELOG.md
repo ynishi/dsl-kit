@@ -9,7 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-schema` — new `Multiplicity::Map` variant marking a
+  string-keyed child slot (`Map<String, V>` shape at the Rust level).
+  `Multiplicity::as_str()` returns `"map"` and `NodeSchema::to_json`
+  emits `"multiplicity": "map"`. Consumers can construct schemas with
+  keyed slots today; the derive macro, PEG codegen, and JSON ⇔ AST
+  bridge grow support incrementally per the tracking issue.
+- `dsl-kit-parse` — three per-stage diagnostic slugs for the keyed-slot
+  "not yet implemented" signal, each retirable independently as
+  runtime support lands:
+  - `codes::MAP_NOT_IMPLEMENTED` (`dsl_kit::parse::map_not_implemented`)
+    from `check_conformance`.
+  - `serde_bridge::serde_codes::MAP_NOT_IMPLEMENTED`
+    (`dsl_kit::parse::serde::map_not_implemented`) from the JSON ⇒
+    `ParseTree` bridge, matching the sibling `CHILD_SHAPE` convention.
+  - `schema_gen::codes::MAP_NOT_IMPLEMENTED`
+    (`dsl_kit::schema_gen::map_not_implemented`) from
+    `grammar_from_schema`, which now aborts up front instead of
+    reaching a bogus rule.
+- `dsl-kit-parse` — `codes::UNKNOWN_MULTIPLICITY` /
+  `schema_gen::codes::UNKNOWN_MULTIPLICITY` slugs backing the
+  `#[non_exhaustive]` catch-all arms; surface a stable signal instead
+  of a panic when a future `Multiplicity` variant is added ahead of
+  parse-side support.
+
 ### Changed
+
+- `dsl-kit-schema` — `Multiplicity` is now `#[non_exhaustive]`.
+  Downstream out-of-crate matches on the enum must include a `_ =>`
+  arm; in-crate matches remain exhaustively checked. This bump costs
+  once so future variants (ordered sets, non-empty lists, fixed-arity
+  tuple slots, …) land as minor bumps per RFC 2008. **Breaking** for
+  out-of-workspace consumers that matched exhaustively on
+  `Multiplicity` without a catch-all.
 
 ### Deprecated
 

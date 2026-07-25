@@ -68,6 +68,15 @@ pub mod serde_codes {
     /// A child slot's value shape did not match its
     /// [`Multiplicity`](dsl_kit_schema::Multiplicity) contract.
     pub const CHILD_SHAPE: &str = "dsl_kit::parse::serde::child_shape";
+    /// A child slot declared with
+    /// [`Multiplicity::Map`](dsl_kit_schema::Multiplicity::Map) was
+    /// encountered but the JSON ⇒ [`ParseTree`](crate::ParseTree)
+    /// bridge does not yet support keyed slots. Namespaced under
+    /// `serde` (rather than reusing the crate-level
+    /// [`crate::codes::MAP_NOT_IMPLEMENTED`]) so consumers can filter
+    /// by stage and retire each slug independently as runtime support
+    /// lands.
+    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::parse::serde::map_not_implemented";
 }
 
 /// Parses a JSON string into a [`ParseTree`], using `schema` to
@@ -294,6 +303,44 @@ fn build_child_slot(
                 Vec::new()
             }
         },
+        Multiplicity::Map => {
+            // Runtime JSON → ParseTree mapping for keyed slots requires
+            // extending [`ParseTree`] to store per-child keys (a keyed
+            // sibling to `children`). That extension is scoped to a
+            // follow-up cycle; for now the schema variant exists but
+            // the bridge surfaces `serde_codes::MAP_NOT_IMPLEMENTED` so
+            // callers who hand-roll a Map slot get a clear diagnostic
+            // (namespaced under `serde`, matching the sibling
+            // `CHILD_SHAPE` convention) instead of a silent empty child
+            // list.
+            diags.push(Diagnostic::error(
+                serde_codes::MAP_NOT_IMPLEMENTED,
+                format!(
+                    "child slot `{}` on variant `{}` declares Multiplicity::Map, \
+                     but the JSON → ParseTree bridge does not yet support keyed slots",
+                    slot, variant.name
+                ),
+            ));
+            Vec::new()
+        }
+        // `#[non_exhaustive]` catch-all — see the sibling arm in
+        // `check_children` (crate::lib.rs) for the versioning
+        // rationale. Reuses the crate-level slug because the failure
+        // mode ("this build of parse doesn't know about that
+        // Multiplicity variant") is the same across all pipeline
+        // stages.
+        _ => {
+            diags.push(Diagnostic::error(
+                codes::UNKNOWN_MULTIPLICITY,
+                format!(
+                    "child slot `{}` on variant `{}` uses an unrecognised \
+                     Multiplicity variant (upgrade dsl-kit-parse to a version \
+                     that knows about it)",
+                    slot, variant.name
+                ),
+            ));
+            Vec::new()
+        }
     }
 }
 

@@ -188,10 +188,26 @@ impl ChildSchema {
 
 /// Recursion shape of a child field.
 ///
-/// Mirrors the four shapes recognised by `#[derive(DslNode)]`.
-/// `Box<T>` and `Vec<Box<T>>` are folded into their unboxed counterparts
+/// The first three variants (`One` / `Optional` / `Many`) mirror the
+/// shapes recognised by `#[derive(DslNode)]` for positional recursion:
+/// `T` or `Box<T>`, `Option<T>` or `Option<Box<T>>`, `Vec<T>` or
+/// `Vec<Box<T>>`. The `Box` is folded into its unboxed counterpart
 /// because the box is a storage detail invisible to schema consumers.
+///
+/// [`Multiplicity::Map`] marks a **keyed** child slot — a string-keyed
+/// collection of subtrees. The concrete Rust shape the derive
+/// recognises (`BTreeMap<String, T>`, `HashMap<String, Box<Self>>`, …)
+/// is deferred to follow-up work; this variant is defined at the
+/// schema layer so consumers can construct [`NodeSchema`] values that
+/// declare keyed slots today, and downstream code (derive, PEG
+/// codegen, JSON ⇔ AST bridge) can grow support incrementally.
+///
+/// The enum is `#[non_exhaustive]` so future primitives (ordered sets,
+/// fixed-arity tuple slots, non-empty lists, …) can be added as minor
+/// bumps. Out-of-crate matches must therefore include a `_ =>` arm;
+/// in-crate matches (this workspace) remain exhaustively checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Multiplicity {
     /// `T` or `Box<T>`. Exactly one child.
     One,
@@ -199,6 +215,17 @@ pub enum Multiplicity {
     Optional,
     /// `Vec<T>` or `Vec<Box<T>>`. Zero or more children in order.
     Many,
+    /// String-keyed collection of children (`Map<String, V>` shape).
+    ///
+    /// The schema layer only records that the slot is keyed; the value
+    /// shape (scalar / other-node / self-recursive) is inferred by the
+    /// derive macro from the underlying Rust type. Downstream runtime
+    /// support (derive, PEG codegen, JSON ⇔ AST bridge, lint) is not
+    /// yet implemented — sites that consume [`Multiplicity`] currently
+    /// emit a `MAP_NOT_IMPLEMENTED` diagnostic when they encounter a
+    /// [`Multiplicity::Map`] slot. See the tracking issue for the
+    /// staged rollout of the three shapes.
+    Map,
 }
 
 impl Multiplicity {
@@ -208,6 +235,57 @@ impl Multiplicity {
             Multiplicity::One => "one",
             Multiplicity::Optional => "optional",
             Multiplicity::Many => "many",
+            Multiplicity::Map => "map",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Every variant of [`Multiplicity`] has a wire-format string.
+    /// Locks the four canonical spellings so downstream consumers
+    /// (parsers / editors / MCP clients) can pattern-match on stable
+    /// literals.
+    #[test]
+    fn multiplicity_as_str_covers_all_variants() {
+        assert_eq!(Multiplicity::One.as_str(), "one");
+        assert_eq!(Multiplicity::Optional.as_str(), "optional");
+        assert_eq!(Multiplicity::Many.as_str(), "many");
+        assert_eq!(Multiplicity::Map.as_str(), "map");
+    }
+
+    /// A hand-authored [`NodeSchema`] carrying a
+    /// [`Multiplicity::Map`] child slot serializes with the expected
+    /// `"multiplicity": "map"` wire spelling. Guards against silent
+    /// drift of the JSON layout.
+    #[test]
+    fn to_json_emits_map_multiplicity() {
+        let schema = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![VariantSchema {
+                name: "Root".into(),
+                fields: vec![],
+                children: vec![ChildSchema {
+                    name: "entries".into(),
+                    multiplicity: Multiplicity::Map,
+                }],
+            }],
+        };
+        assert_eq!(
+            schema.to_json(),
+            json!({
+                "name": "Cfg",
+                "variants": [{
+                    "name": "Root",
+                    "fields": [],
+                    "children": [
+                        { "name": "entries", "multiplicity": "map" }
+                    ],
+                }],
+            })
+        );
     }
 }

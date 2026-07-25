@@ -73,6 +73,20 @@ pub mod codes {
     pub const UNSUPPORTED_FIELD: &str = "dsl_kit::schema_gen::unsupported_field";
     /// The schema declares no variants — there is nothing to parse.
     pub const EMPTY_SCHEMA: &str = "dsl_kit::schema_gen::empty_schema";
+    /// A child slot is declared with
+    /// [`Multiplicity::Map`](dsl_kit_schema::Multiplicity::Map) but the
+    /// canonical-syntax PEG for keyed slots is not yet implemented.
+    /// Grammar generation aborts up front so authors get a clear
+    /// diagnostic instead of a silently-missing rule; downstream cycles
+    /// will retire this once the keyed-slot spelling is designed.
+    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::schema_gen::map_not_implemented";
+    /// A child slot's multiplicity is a variant this build of
+    /// `dsl-kit-parse` does not recognise (added to the schema crate's
+    /// `#[non_exhaustive]` enum ahead of parse-side support). Emitted
+    /// by the pre-flight check in
+    /// [`grammar_from_schema_with`] so `child_arg_peg` never sees an
+    /// unknown variant.
+    pub const UNKNOWN_MULTIPLICITY: &str = "dsl_kit::schema_gen::unknown_multiplicity";
 }
 
 /// Name of the generated start rule.
@@ -189,11 +203,24 @@ pub fn grammar_from_schema_with(
         )));
     }
 
-    let mut bad_fields = Vec::new();
+    // Pre-flight: collect every diagnostic that must block rule
+    // generation, then return in one shot. A single pass means an
+    // author with both a bad payload type and a `Multiplicity::Map`
+    // slot sees both errors on the first build instead of paying two
+    // edit-compile cycles for one report.
+    //
+    // Grouping:
+    //   - `UNSUPPORTED_FIELD` for payload types with no canonical-syntax
+    //     mapping (and no `SyntaxOverrides` entry).
+    //   - `MAP_NOT_IMPLEMENTED` for child slots declared with
+    //     `Multiplicity::Map` — keyed-slot canonical syntax is
+    //     scheduled for a follow-up cycle; rejecting up front means
+    //     `child_arg_peg` never sees a Map slot.
+    let mut pre_flight = Vec::new();
     for v in &schema.variants {
         for f in &v.fields {
             if resolved_field_value_peg(&v.name, f, ids, overrides).is_none() {
-                bad_fields.push(Diagnostic::error(
+                pre_flight.push(Diagnostic::error(
                     codes::UNSUPPORTED_FIELD,
                     format!(
                         "variant `{}` field `{}`: type `{}` has no canonical-syntax \
@@ -204,9 +231,41 @@ pub fn grammar_from_schema_with(
                 ));
             }
         }
+        for c in &v.children {
+            match c.multiplicity {
+                // Positional shapes are the ones `child_arg_peg` knows
+                // how to emit today; let them through.
+                Multiplicity::One | Multiplicity::Optional | Multiplicity::Many => {}
+                Multiplicity::Map => {
+                    pre_flight.push(Diagnostic::error(
+                        codes::MAP_NOT_IMPLEMENTED,
+                        format!(
+                            "variant `{}` child slot `{}`: Multiplicity::Map has no \
+                             canonical-syntax PEG mapping yet",
+                            v.name, c.name
+                        ),
+                    ));
+                }
+                // `#[non_exhaustive]` catch-all: a future Multiplicity
+                // variant added to dsl-kit-schema before this crate is
+                // updated must also be rejected here — that's what
+                // keeps `child_arg_peg`'s `_ => unreachable!()` arm
+                // honest.
+                _ => {
+                    pre_flight.push(Diagnostic::error(
+                        codes::UNKNOWN_MULTIPLICITY,
+                        format!(
+                            "variant `{}` child slot `{}`: unrecognised Multiplicity \
+                             variant (upgrade dsl-kit-parse to a version that knows about it)",
+                            v.name, c.name
+                        ),
+                    ));
+                }
+            }
+        }
     }
-    if !bad_fields.is_empty() {
-        return Err(BuildError::new(bad_fields));
+    if !pre_flight.is_empty() {
+        return Err(BuildError::new(pre_flight));
     }
 
     let mut rules = Vec::with_capacity(schema.variants.len() + 1);
@@ -450,6 +509,29 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
                 ],
             )
         }
+        // Keyed slots are rejected in `grammar_from_schema_with` with
+        // `MAP_NOT_IMPLEMENTED` before rule generation runs, so this
+        // arm is genuinely unreachable in the current pipeline. Kept
+        // explicit (rather than folded into the `_` catch-all below)
+        // so a future caller that bypasses the pre-flight check gets
+        // a Map-shaped panic message instead of the generic one.
+        Multiplicity::Map => unreachable!(
+            "Multiplicity::Map slot `{}` reached child_arg_peg — the pre-flight \
+             check in grammar_from_schema_with should have rejected it upstream",
+            c.name
+        ),
+        // `#[non_exhaustive]` catch-all: a future Multiplicity variant
+        // added to dsl-kit-schema before this crate is updated would
+        // land here. The pre-flight check in
+        // `grammar_from_schema_with` should be extended in lockstep to
+        // reject unknown variants; if that extension is missed the
+        // panic here surfaces the omission loudly instead of emitting
+        // a silently-wrong grammar rule.
+        _ => unreachable!(
+            "child_arg_peg encountered an unrecognised Multiplicity variant on slot \
+             `{}` — extend the pre-flight check in grammar_from_schema_with to reject it",
+            c.name
+        ),
     }
 }
 

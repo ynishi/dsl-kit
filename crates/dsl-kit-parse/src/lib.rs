@@ -386,6 +386,22 @@ pub mod codes {
     /// A payload field's value could not be converted to the target
     /// Rust type (serde deserialization failure or `FromStr` failure).
     pub const FIELD_TYPE: &str = "dsl_kit::parse::field_type";
+    /// A slot declared with [`crate::Multiplicity::Map`] was encountered
+    /// but runtime support (arity check / JSON ⇔ AST bridge / PEG
+    /// codegen) is not yet implemented at the site that raised it. The
+    /// schema variant exists so consumers can declare keyed slots today;
+    /// downstream cycles will retire this diagnostic per site as support
+    /// lands.
+    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::parse::map_not_implemented";
+    /// A child slot's multiplicity is a variant this build of
+    /// `dsl-kit-parse` does not recognise. Emitted from the catch-all
+    /// arm required by [`crate::Multiplicity`]'s `#[non_exhaustive]`
+    /// contract when a future variant is added to the schema crate
+    /// ahead of parse-side support. Not reachable in practice within
+    /// the workspace (both crates are versioned in lockstep) but held
+    /// as a first-class diagnostic so out-of-workspace consumers see a
+    /// stable slug rather than a panic.
+    pub const UNKNOWN_MULTIPLICITY: &str = "dsl_kit::parse::unknown_multiplicity";
 }
 
 /// Validates `tree` against `schema` shallowly (this level only).
@@ -632,6 +648,44 @@ fn check_children(
             Multiplicity::Many => {
                 // Zero is fine at the shape level.
             }
+            Multiplicity::Map => {
+                // Keyed-slot runtime support (arity + per-key uniqueness
+                // + JSON ⇔ AST) is scheduled for a follow-up cycle. The
+                // schema variant exists today so consumers can declare
+                // the slot; encountering one here surfaces a clear
+                // diagnostic instead of panicking.
+                out.push(
+                    Diagnostic::error(
+                        codes::MAP_NOT_IMPLEMENTED,
+                        format!(
+                            "child slot `{}` on variant `{}` declares Multiplicity::Map, \
+                             but keyed-slot runtime support is not yet implemented",
+                            c.name, variant.name
+                        ),
+                    )
+                    .with_span(tree.span),
+                );
+            }
+            // `#[non_exhaustive]` catch-all: emitted when a future
+            // Multiplicity variant lands in dsl-kit-schema before this
+            // arm has been extended to handle it. Not reachable inside
+            // the workspace (both crates are versioned together) but
+            // required by the type contract and useful for
+            // out-of-workspace consumers pinned to an older parse.
+            _ => {
+                out.push(
+                    Diagnostic::error(
+                        codes::UNKNOWN_MULTIPLICITY,
+                        format!(
+                            "child slot `{}` on variant `{}` uses an unrecognised \
+                             Multiplicity variant (upgrade dsl-kit-parse to a version \
+                             that knows about it)",
+                            c.name, variant.name
+                        ),
+                    )
+                    .with_span(tree.span),
+                );
+            }
         }
     }
 
@@ -723,6 +777,16 @@ fn diag_arity(
         Multiplicity::One => "exactly one child",
         Multiplicity::Optional => "at most one child",
         Multiplicity::Many => "zero or more children",
+        // `Map` never enters `diag_arity` in practice — its arity check
+        // in `check_children` short-circuits with `MAP_NOT_IMPLEMENTED`
+        // before reaching this helper. Kept explicit (rather than
+        // folded into the `_` arm) so a future change that routes Map
+        // through here gets a Map-shaped label instead of the generic
+        // "unknown multiplicity" fallback.
+        Multiplicity::Map => "any number of keyed children",
+        // `#[non_exhaustive]` catch-all — see the sibling arm in
+        // `check_children` for the versioning rationale.
+        _ => "a shape this build of dsl-kit-parse does not recognise",
     };
     Diagnostic::error(
         code,
