@@ -2735,30 +2735,29 @@ impl<A: Ast> Stepper for Engine<A> {
                 let mut leave_ctx = Self::synthetic_ctx(node, path.clone());
                 leave_ctx.frame = Some(call_frame);
                 self.emit_event(&Event::FrameLeave { at: leave_ctx });
-                // Determine enclosing Par (if any) fail policy.
-                let mut enclosing_par_fail: Option<FailPolicy> = None;
+                // Determine the enclosing Par (if any): its fail policy
+                // plus the Par's direct child our leaf hangs off — the
+                // index the failure is recorded against.
+                let mut enclosing_par: Option<(FrameHandle, FrameHandle, FailPolicy)> = None;
                 let mut cur = h;
                 while let Some(&parent) = self.parent.get(&cur) {
                     if let InternalFrame::Par { policy, .. } = self.get(parent) {
-                        enclosing_par_fail = Some(policy.fail);
+                        enclosing_par = Some((parent, cur, policy.fail));
                         break;
                     }
                     cur = parent;
                 }
-                match enclosing_par_fail {
-                    Some(FailPolicy::CollectAll) => {
-                        // Record in Par failures + mark leaf Cancelled(SiblingFailed sentinel not appropriate;
-                        // Use a Value-like slot: leaf becomes Cancelled with a sentinel, Par sees Some(e) in failures).
-                        // Actually: leaf becomes an Cancelled-like state that won't trigger propagation.
-                        // Fill the Par's failures[idx].
-                        if let Some(&parent) = self.parent.get(&h) {
-                            if let InternalFrame::Par {
-                                children, failures, ..
-                            } = self.get_mut(parent)
-                            {
-                                if let Some(idx) = children.iter().position(|c| *c == h) {
-                                    failures[idx] = Some(e);
-                                }
+                match enclosing_par {
+                    Some((par, child_of_par, FailPolicy::CollectAll)) => {
+                        // Record the error against the Par's direct child
+                        // (which is `h` itself or an ancestor of it),
+                        // mirroring notify_par_slot on the success side.
+                        if let InternalFrame::Par {
+                            children, failures, ..
+                        } = self.get_mut(par)
+                        {
+                            if let Some(idx) = children.iter().position(|c| *c == child_of_par) {
+                                failures[idx] = Some(e);
                             }
                         }
                         // Mark leaf as Cancelled with a benign reason so it stops being live.
@@ -3558,6 +3557,38 @@ mod tests {
         let out = e.step().unwrap();
         assert!(matches!(&out, StepOutcome::Done(V::List(vs))
             if vs == &vec![V::S("A".into()), V::S("err:nope".into())]));
+    }
+
+    #[test]
+    fn collect_all_records_failure_from_nested_leaf() {
+        // The failing Call is NOT a direct child of the Par — it sits
+        // under a Seq. The error must be recorded against the Par's
+        // direct child (the Seq), mirroring notify_par_slot on the
+        // success side; otherwise the Par can never fire and the
+        // engine blocks with no pending suspensions.
+        let ast = N::Par {
+            children: vec![
+                N::Seq(vec![N::Call("ok".into())]),
+                N::Seq(vec![N::Call("bad".into())]),
+            ],
+            policy: all_ca(),
+            reducer: "collect_all",
+        };
+        let mut e = build(ast);
+        let out = e.step().unwrap();
+        let sids: Vec<SuspensionId> = match out {
+            StepOutcome::Blocked { newly_pending } => newly_pending.iter().map(|p| p.id).collect(),
+            _ => panic!(),
+        };
+        assert_eq!(sids.len(), 2);
+        e.resolve(sids[0], Ok(V::S("A".into()))).unwrap();
+        e.resolve(sids[1], Err(EE("nope".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(
+            matches!(&out, StepOutcome::Done(V::List(vs))
+                if vs == &vec![V::S("A".into()), V::S("err:nope".into())]),
+            "expected Done, got {out:?}"
+        );
     }
 
     #[test]
