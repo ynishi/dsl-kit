@@ -500,10 +500,11 @@ pub mod codes {
 ///   declared payload field).
 ///
 /// [`Multiplicity::Many`] and [`Multiplicity::Map`] both accept
-/// zero-or-more children. For `Many`, the `NoEmptyManyChildren` lint
-/// rule is the place to complain about domain-level emptiness; that
-/// rule keys off `Multiplicity::Many` specifically, so an empty keyed
-/// slot currently has no lint watching it.
+/// zero-or-more children — emptiness is a domain-level judgment, not a
+/// shape error, so the `no-empty-child-slots` lint rule is where it
+/// belongs. That rule covers both collection shapes and reports at
+/// `Warn`, since neither multiplicity promises a non-empty
+/// collection.
 pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnostic> {
     check_conformance_with(tree, schema, &BuiltinLevenshteinSuggester)
 }

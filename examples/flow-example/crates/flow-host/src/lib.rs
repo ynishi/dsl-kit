@@ -425,8 +425,8 @@ mod tests {
     }
 
     #[test]
-    fn lint_json_reports_empty_seq_via_no_empty_many_children() {
-        // Build a program with an empty inner Seq — NoEmptyManyChildren
+    fn lint_json_reports_empty_seq_via_no_empty_child_slots() {
+        // Build a program with an empty inner Seq — NoEmptyChildSlots
         // fires on it. NoRedundantWrap (R-24 default) also fires on the
         // outer Seq (single Seq child of same variant). Both must reach
         // the JSON envelope intact.
@@ -448,9 +448,9 @@ mod tests {
         // shape; other default rules may also fire (e.g. no-redundant-wrap).
         let empty_seq_diag = arr
             .iter()
-            .find(|d| d["rule"] == "no-empty-many-children")
-            .expect("no-empty-many-children entry present");
-        assert_eq!(empty_seq_diag["severity"], "Error");
+            .find(|d| d["rule"] == "no-empty-child-slots")
+            .expect("no-empty-child-slots entry present");
+        assert_eq!(empty_seq_diag["severity"], "Warn");
         assert_eq!(empty_seq_diag["node"], empty_seq_id.0);
     }
 }

@@ -118,6 +118,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `dsl-kit-lint` — `NoEmptyManyChildren` is now `NoEmptyChildSlots`
+  (`no-empty-many-children` → `no-empty-child-slots`,
+  `dsl_kit::lint::no_empty_many_children` →
+  `dsl_kit::lint::no_empty_child_slots`), reports at
+  `Suspicious` / `Warn` instead of `Correctness` / `Error`, and covers
+  `Multiplicity::Map` slots alongside `Many`.
+
+  The rule claimed to fire only on variants whose shape "guarantees at
+  least one child". No such guarantee exists: both collection
+  multiplicities mean *zero* or more, `check_conformance` accepts
+  empty, and the schema has no way to say "at least one". So a DSL
+  with a legitimately empty block or argument list got an `Error` from
+  a rule in the default bundle, with no way to express the intent
+  short of disabling the rule. What the rule really encodes is "a
+  variant that exists only to hold a collection, holding nothing, is
+  more often an oversight than an intention" — a heuristic, which is
+  what `Suspicious` / `Warn` is for.
+
+  **Breaking**: no alias is kept for the old type name. The rule's
+  behaviour changed along with its name, so an alias would let code
+  that matched on `Severity::Error` keep compiling while quietly
+  seeing different results.
 - `dsl-kit-schema` — `Multiplicity::Map`'s documentation claimed the
   derive recognises `HashMap<String, Box<Self>>` and that runtime
   support was unimplemented. Neither was true: only `BTreeMap` shapes

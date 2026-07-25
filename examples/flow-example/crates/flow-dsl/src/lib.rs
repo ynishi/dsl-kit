@@ -1838,7 +1838,7 @@ mod tests {
         assert_eq!(diags[0].rule, NoEmptyLabels::NAME);
     }
 
-    // ---------- R-22: variant_name + NoEmptyManyChildren -------------
+    // ---------- R-22: variant_name + NoEmptyChildSlots -------------
 
     #[test]
     fn variant_name_returns_source_ident_for_every_variant() {
@@ -1879,7 +1879,7 @@ mod tests {
 
     #[test]
     fn no_empty_many_children_fires_on_empty_seq_and_par() {
-        use dsl_kit_lint::{Linter, NoEmptyManyChildren, Severity};
+        use dsl_kit_lint::{Linter, NoEmptyChildSlots, Severity};
 
         let ids = IdGen::new();
         // Two many-only variants (Seq / Par) both empty. Nested inside
@@ -1902,11 +1902,11 @@ mod tests {
             ],
         };
         let diags = Linter::<Flow>::new()
-            .with_rule(NoEmptyManyChildren)
+            .with_rule(NoEmptyChildSlots)
             .lint(&program);
         assert_eq!(diags.len(), 2, "diags = {diags:?}");
-        assert!(diags.iter().all(|d| d.rule == "no-empty-many-children"));
-        assert!(diags.iter().all(|d| d.severity == Severity::Error));
+        assert!(diags.iter().all(|d| d.rule == "no-empty-child-slots"));
+        assert!(diags.iter().all(|d| d.severity == Severity::Warn));
         let hit: Vec<NodeId> = diags.iter().map(|d| d.node).collect();
         assert!(hit.contains(&empty_seq_id));
         assert!(hit.contains(&empty_par_id));
@@ -1914,7 +1914,7 @@ mod tests {
 
     #[test]
     fn no_empty_many_children_leaves_call_and_scope_and_maybe_alone() {
-        use dsl_kit_lint::{Linter, NoEmptyManyChildren};
+        use dsl_kit_lint::{Linter, NoEmptyChildSlots};
 
         let ids = IdGen::new();
         // Call is a leaf (no children fields at all) — must not fire.
@@ -1943,7 +1943,7 @@ mod tests {
             ],
         };
         let diags = Linter::<Flow>::new()
-            .with_rule(NoEmptyManyChildren)
+            .with_rule(NoEmptyChildSlots)
             .lint(&program);
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
@@ -1962,13 +1962,13 @@ mod tests {
             }],
         };
         let diags = Linter::<Flow>::with_defaults().lint(&program);
-        // NoEmptyManyChildren fires on the empty inner Seq.
+        // NoEmptyChildSlots fires on the empty inner Seq.
         // NoRedundantWrap (R-24) also fires on the outer Seq (single
         // Seq child of same variant). Both are expected under defaults.
         assert!(
             diags
                 .iter()
-                .any(|d| d.rule == "no-empty-many-children" && d.node == empty_seq_id),
+                .any(|d| d.rule == "no-empty-child-slots" && d.node == empty_seq_id),
             "expected no-empty-many-children on empty inner Seq, diags = {diags:?}",
         );
     }
