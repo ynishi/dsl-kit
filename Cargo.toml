@@ -58,3 +58,8 @@ expr-dsl       = { path = "examples/expr-example/crates/expr-dsl"  }
 expr-host      = { path = "examples/expr-example/crates/expr-host" }
 cfg-dsl        = { path = "examples/cfg-example/crates/cfg-dsl"    }
 cfg-host       = { path = "examples/cfg-example/crates/cfg-host"   }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -1,7 +1,7 @@
 [workspace]
 changelog_update = false     # default off; only the representative crate updates the root CHANGELOG
 dependencies_update = false
-git_release_enable = true    # release-plz creates the GitHub Release (no cargo-dist here)
+git_release_enable = false   # GitHub Release is created by cargo-dist
 git_tag_enable = false       # default off; only the representative crate tags
 git_tag_name = "v{{ version }}"  # unified tag name, also used for CHANGELOG compare links
 semver_check = true
