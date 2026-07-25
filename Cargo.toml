@@ -47,9 +47,14 @@ dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy",  version = "0.4.0" }
 dsl-kit        = { path = "crates/dsl-kit",        version = "0.4.0" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp",    version = "0.4.0" }
 dsl-kit-cli    = { path = "crates/dsl-kit-cli",    version = "0.4.0" }
-flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0.4.0" }
-flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.4.0" }
-expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.4.0" }
-expr-host      = { path = "examples/expr-example/crates/expr-host", version = "0.4.0" }
-cfg-dsl        = { path = "examples/cfg-example/crates/cfg-dsl",    version = "0.4.0" }
-cfg-host       = { path = "examples/cfg-example/crates/cfg-host",   version = "0.4.0" }
+# Example sub-crates are workspace-internal + publish = false.  A pinned
+# `version = "…"` here is a dead constraint on the registry side (they are
+# never published), and it actively blocks release-plz: when the workspace
+# bumps to 0.M.0 the pin still reads 0.4.0 and cargo update fails to
+# resolve the sub-crate.  Path-only.
+flow-dsl       = { path = "examples/flow-example/crates/flow-dsl"  }
+flow-host      = { path = "examples/flow-example/crates/flow-host" }
+expr-dsl       = { path = "examples/expr-example/crates/expr-dsl"  }
+expr-host      = { path = "examples/expr-example/crates/expr-host" }
+cfg-dsl        = { path = "examples/cfg-example/crates/cfg-dsl"    }
+cfg-host       = { path = "examples/cfg-example/crates/cfg-host"   }
