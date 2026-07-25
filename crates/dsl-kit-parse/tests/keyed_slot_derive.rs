@@ -3,9 +3,9 @@
 //!
 //! Scope is the macro layer: `#[derive(DslNode)]` generates walk /
 //! walk-mut iteration through `.values()`, and `#[derive(DslSchema)]`
-//! emits `Multiplicity::Map`. The build side (JSON ⇒ ParseTree ⇒
-//! typed AST) lives in `keyed_slot_json.rs`; PEG codegen still
-//! refuses keyed slots outright, guarded by `map_not_implemented.rs`.
+//! emits `Multiplicity::Map`. The build side lives in the two
+//! front-end suites — `keyed_slot_json.rs` (JSON ⇒ ParseTree ⇒ typed
+//! AST) and `keyed_slot_text.rs` (canonical text ⇒ ditto).
 //!
 //! These tests exercise a downstream-shaped enum that carries
 //! keyed-slot fields alongside the pre-existing recursion shapes, so

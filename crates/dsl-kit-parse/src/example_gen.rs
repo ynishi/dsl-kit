@@ -26,6 +26,7 @@
 //! accuracy, and machine-derived examples cannot drift from the
 //! grammar the way hand-written documentation does.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::peg::{Grammar, Peg};
@@ -121,6 +122,12 @@ struct Synth<'g> {
     rules_in_order: Vec<(String, &'g Peg)>,
     /// Shortest-derivation token count per rule (fixpoint result).
     costs: HashMap<String, u64>,
+    /// Running count of keyed entries emitted, so each one can be
+    /// given a distinct key. Interior mutability because emission
+    /// takes `&self` — the alternative, threading a counter through
+    /// every `emit` signature, would put keyed-slot bookkeeping in the
+    /// path of shapes that have nothing to do with it.
+    key_seq: Cell<u32>,
 }
 
 impl<'g> Synth<'g> {
@@ -159,6 +166,7 @@ impl<'g> Synth<'g> {
             by_name,
             rules_in_order,
             costs,
+            key_seq: Cell::new(0),
         })
     }
 
@@ -212,6 +220,57 @@ impl<'g> Synth<'g> {
             Peg::Rule { body, .. } | Peg::Node { body, .. } | Peg::Field { body, .. } => {
                 self.emit(body, rich_depth, out)
             }
+            // A keyed entry emits its key then its value, in that
+            // order — the same shape a two-item `Seq` would, since the
+            // primitive adds no syntax of its own (the separator and
+            // brackets around it live in the enclosing grammar).
+            //
+            // The key goes through `emit_key` so that repeated entries
+            // get *distinct* keys. Emitting the plain token text twice
+            // would synthesize `{ "example": …, "example": … }` — text
+            // the grammar accepts but the schema rejects as a
+            // duplicate key, which is precisely the drift this module
+            // exists to prevent.
+            Peg::KeyedEntry { key, value, .. } => {
+                let n = self.key_seq.get() + 1;
+                self.key_seq.set(n);
+                self.emit_key(key, n, rich_depth, out)?;
+                self.emit(value, rich_depth, out)
+            }
+        }
+    }
+
+    /// Emits a keyed entry's key with occurrence number `n` woven in,
+    /// so sibling entries in one map get distinct keys.
+    ///
+    /// Handles the shapes a key production is made of (tokens, `Seq`,
+    /// `Choice`). Anything richer falls through to the generic
+    /// emitter: keys may then collide, but a collision surfaces as a
+    /// `DUPLICATE_KEY` conformance error on the synthesized example
+    /// rather than being papered over here.
+    fn emit_key(
+        &self,
+        peg: &Peg,
+        n: u32,
+        rich_depth: u32,
+        out: &mut Vec<String>,
+    ) -> Result<(), BuildError> {
+        match peg {
+            Peg::Token { pat, .. } => {
+                out.push(keyed_token_input(pat, n));
+                Ok(())
+            }
+            Peg::Seq { items, .. } => {
+                for item in items {
+                    self.emit_key(item, n, rich_depth, out)?;
+                }
+                Ok(())
+            }
+            Peg::Choice { alts, .. } => {
+                let arm = self.pick_arm(alts, rich_depth)?;
+                self.emit_key(arm, n, rich_depth, out)
+            }
+            other => self.emit(other, rich_depth, out),
         }
     }
 
@@ -273,6 +332,29 @@ fn peg_cost(peg: &Peg, costs: &HashMap<String, u64>) -> u64 {
         Peg::Rule { body, .. } | Peg::Node { body, .. } | Peg::Field { body, .. } => {
             peg_cost(body, costs)
         }
+        // Sum of both halves, `INFINITE`-poisoned like `Seq`: an entry
+        // whose value has no finite derivation has none either.
+        Peg::KeyedEntry { key, value, .. } => {
+            let (k, v) = (peg_cost(key, costs), peg_cost(value, costs));
+            if k == INFINITE || v == INFINITE {
+                INFINITE
+            } else {
+                k.saturating_add(v)
+            }
+        }
+    }
+}
+
+/// Input text for a keyed entry's key token, occurrence `n`.
+///
+/// Only the two key spellings `schema_gen` emits are disambiguated;
+/// every other pattern (a literal separator like `:`) renders as
+/// usual.
+fn keyed_token_input(pat: &str, n: u32) -> String {
+    match pat {
+        "%str" => format!("\"key{n}\""),
+        "%ident" => format!("key{n}"),
+        other => token_input(other),
     }
 }
 
@@ -291,13 +373,13 @@ fn token_input(pat: &str) -> String {
 }
 
 /// Joins tokens with canonical-syntax spacing: no space before
-/// punctuation that closes or separates (`,` `)` `]` `:` `(`), no
-/// space after an opener (`(` `[`).
+/// punctuation that closes or separates (`,` `)` `]` `}` `:` `(`), no
+/// space after an opener (`(` `[` `{`).
 fn render(tokens: &[String]) -> String {
     let mut out = String::new();
     for t in tokens {
-        let tight_before = matches!(t.as_str(), "," | ")" | "]" | ":" | "(");
-        let tight_after_prev = out.ends_with('(') || out.ends_with('[');
+        let tight_before = matches!(t.as_str(), "," | ")" | "]" | "}" | ":" | "(");
+        let tight_after_prev = out.ends_with('(') || out.ends_with('[') || out.ends_with('{');
         if !out.is_empty() && !tight_before && !tight_after_prev {
             out.push(' ');
         }
@@ -376,6 +458,14 @@ mod tests {
                     }],
                 },
                 VariantSchema {
+                    name: "Env".into(),
+                    fields: vec![],
+                    children: vec![ChildSchema {
+                        name: "entries".into(),
+                        multiplicity: Multiplicity::Map,
+                    }],
+                },
+                VariantSchema {
                     name: "Unit".into(),
                     fields: vec![],
                     children: vec![],
@@ -394,7 +484,7 @@ mod tests {
     #[test]
     fn every_per_rule_example_parses_as_its_own_variant() {
         let (g, ex) = demo_examples();
-        assert_eq!(ex.per_rule.len(), 6, "one example per variant");
+        assert_eq!(ex.per_rule.len(), 7, "one example per variant");
         for e in &ex.per_rule {
             let tree = g.parse(&e.text).unwrap_or_else(|err| {
                 panic!(
@@ -434,7 +524,85 @@ mod tests {
             by_rule["List"], "List(items: [])",
             "Many minimal = empty list"
         );
+        assert_eq!(
+            by_rule["Env"], "Env(entries: {})",
+            "Map minimal = empty map, braces tight like the empty list"
+        );
         assert_eq!(by_rule["Unit"], "Unit()");
+    }
+
+    /// Rich mode expands a keyed slot to two entries; those entries
+    /// must carry *different* keys. Emitting the bare token text twice
+    /// would produce `{ "example": …, "example": … }` — accepted by the
+    /// grammar, rejected by the schema — which is exactly the
+    /// grammar/schema drift machine-derived examples exist to avoid.
+    #[test]
+    fn rich_keyed_map_example_uses_distinct_keys() {
+        let map_only = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![
+                VariantSchema {
+                    name: "Env".into(),
+                    fields: vec![],
+                    children: vec![ChildSchema {
+                        name: "entries".into(),
+                        multiplicity: Multiplicity::Map,
+                    }],
+                },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
+            ],
+        };
+        let g = checked_grammar_from_schema(&map_only, &IdGen::new()).expect("generates");
+        let ex = examples_from_grammar(&g).expect("synthesizes");
+
+        let tree = g.parse(&ex.composite).unwrap_or_else(|err| {
+            panic!(
+                "composite failed to parse: {:?}\n  text: {}",
+                err.diagnostics, ex.composite
+            )
+        });
+        let entries = tree
+            .keyed_child_slot("entries")
+            .expect("rich mode fills the keyed slot");
+        assert!(
+            entries.len() >= 2,
+            "rich mode should expand the map: {}",
+            ex.composite
+        );
+        let diags = check_conformance(&tree, &map_only);
+        assert!(
+            diags.is_empty(),
+            "synthesized example must conform: {diags:?}\n  text: {}",
+            ex.composite
+        );
+    }
+
+    /// A keyed entry whose value has no finite derivation poisons the
+    /// entry's cost, so the rule it sits in is reported as underivable
+    /// instead of sending synthesis into an endless expansion.
+    #[test]
+    fn keyed_entry_inherits_an_underivable_value() {
+        let ids = IdGen::new();
+        // `s` can only be written by writing an `s` inside a keyed
+        // entry: no finite string enters the rule.
+        use crate::peg::{keyed_entry, node, rule, rule_ref, token};
+        let entry = keyed_entry(&ids, "entries", token(&ids, "%ident"), rule_ref(&ids, "s"));
+        let g = Grammar::new(vec![rule(&ids, "s", node(&ids, "N", entry))], "s");
+        let err = examples_from_grammar(&g).expect_err("no finite derivation exists");
+        assert!(
+            err.diagnostics
+                .iter()
+                .any(|d| d.code == codes::NO_FINITE_DERIVATION),
+            "expected NO_FINITE_DERIVATION; got {:?}",
+            err.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

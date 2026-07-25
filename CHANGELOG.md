@@ -54,15 +54,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits `"multiplicity": "map"`. Consumers can construct schemas with
   keyed slots today; the derive macro, PEG codegen, and JSON ⇔ AST
   bridge grow support incrementally per the tracking issue.
-- `dsl-kit-parse` — `schema_gen::codes::MAP_NOT_IMPLEMENTED`
-  (`dsl_kit::schema_gen::map_not_implemented`) from
-  `grammar_from_schema`, which aborts up front instead of reaching a
-  bogus rule. Grammar generation is the one stage that still refuses
-  keyed slots: the canonical *text* syntax for them is an open design
-  question, unlike the JSON and in-memory shapes which this release
-  settles. (The conformance and serde-bridge siblings of this slug
-  existed only within this unreleased window and are gone — those
-  stages carry real support now.)
+- `dsl-kit-parse` — keyed slots have a canonical **text** syntax:
+  `name: { key: <node>, "other key": <node> }`. Braces (not the `Many`
+  idiom's brackets) mark the slot as keyed, matching the JSON bridge's
+  object spelling so one DSL reads the same way through either
+  front-end; a key is either a bare `%ident` or a `%str` literal, so
+  keys that are not identifiers stay writable. Entries may be written
+  in any order — the parser sorts them into canonical order — and an
+  empty map is valid. `grammar_from_schema` therefore no longer
+  refuses `Multiplicity::Map` schemas, and
+  `schema_gen::codes::MAP_NOT_IMPLEMENTED` is gone with the last of
+  its siblings.
+- `dsl-kit-parse` — `Peg::KeyedEntry { slot, key, value }` plus the
+  `peg::keyed_entry` constructor: the capture primitive behind the
+  syntax above. A separate primitive rather than a `Field` convention
+  because a `Field` binds one *fixed* name to its productions, which
+  cannot express a name the input supplies. `Peg::Node` sorts each
+  keyed slot before emitting, so hand-written grammars get the
+  canonical order without arranging for it. **Breaking** for
+  out-of-crate `match` on `Peg`, which is exhaustive. A key production
+  that yields no production at all is rejected (it would key every
+  entry on `""`), but a production that *is* empty — a quoted `""` —
+  is a legitimate key and parses, since both the AST and the JSON
+  front-end can hold one.
 - `dsl-kit-parse` — `codes::UNKNOWN_MULTIPLICITY` /
   `schema_gen::codes::UNKNOWN_MULTIPLICITY` slugs backing the
   `#[non_exhaustive]` catch-all arms; surface a stable signal instead
@@ -84,17 +98,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the construction path that survives future additions. The struct is
   deliberately left exhaustive (unlike `Multiplicity`) because
   hand-building a tree is a primary use case for front-end authors.
-  One known open question rides on this: a keyed entry is a
+  One known limitation rides on this: a keyed entry is a
   `(String, ParseTree)` tuple, so the *key* has nowhere to carry a
-  source span. If the PEG front-end's keyed productions turn out to
-  need one, that entry shape changes — the decision belongs with the
-  canonical text syntax, which is still open.
+  source span. The text front-end works without one, but it means a
+  duplicate-key diagnostic anchors on the enclosing node rather than
+  on the offending key. Giving keys their own span would change the
+  entry shape, so it is deferred rather than guessed at.
+- `dsl-kit-parse` — example synthesis gives each entry of a keyed slot
+  a distinct key (`key1`, `key2`, …). Reusing one token's text would
+  synthesize `{ "example": …, "example": … }`: grammar-legal, but
+  rejected by the schema as a duplicate key — the grammar/schema drift
+  machine-derived examples exist to rule out. Rendering also learned
+  `{` / `}` spacing, so an empty map prints `{}` like an empty list
+  prints `[]`.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- `dsl-kit-schema` — `Multiplicity::Map`'s documentation claimed the
+  derive recognises `HashMap<String, Box<Self>>` and that runtime
+  support was unimplemented. Neither was true: only `BTreeMap` shapes
+  are keyed slots (a map slot's iteration order is observable, so it
+  has to be deterministic), and every stage now carries support. An
+  author following the old text would have written a field the derive
+  silently treats as a non-recursive payload.
 
 ### Security
 

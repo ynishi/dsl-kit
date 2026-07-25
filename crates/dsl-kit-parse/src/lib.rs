@@ -122,11 +122,23 @@ pub struct ParseTree {
     /// slot holds `(key, subtree)` pairs.
     ///
     /// Front-ends must emit the pairs **sorted by key**, so that two
-    /// front-ends handed the same document produce equal trees. The
+    /// front-ends handed the same document produce equal entries. The
     /// JSON bridge sorts on ingest; hand-built trees that do not are
     /// rejected at conformance time with
     /// [`codes::KEYED_SLOT_UNSORTED`] rather than quietly compared
     /// unequal later.
+    ///
+    /// One shape is *not* pinned across front-ends: an **empty** map
+    /// may arrive either as a present-but-empty slot or as no slot at
+    /// all, depending on how the front-end spells emptiness (the JSON
+    /// bridge records the key it saw; the PEG interpreter has nothing
+    /// to record). Both mean the same thing everywhere it matters —
+    /// [`check_conformance`] accepts both and
+    /// [`build_child_map`] yields an empty map from both — so
+    /// consumers should read a slot through
+    /// [`ParseTree::keyed_child_slot`] rather than testing for its
+    /// presence. The positional [`ParseTree::children`] half has
+    /// carried the same asymmetry since it existed.
     ///
     /// Duplicate keys within one slot are representable (the storage
     /// is a [`Vec`], not a map) precisely so they can be *diagnosed* —

@@ -29,6 +29,13 @@
 //!   absent.)
 //! - **`Many` child** — `name: [<node>, <node>, ...]`, empty list
 //!   allowed.
+//! - **`Map` child** — `name: { <key>: <node>, <key>: <node> }`, empty
+//!   map allowed. Braces (not the `Many` brackets) mark the slot as
+//!   keyed, matching the JSON bridge's object spelling. A key is
+//!   either a `%str` literal or a bare `%ident`, so `"a b": …` and
+//!   `path: …` are both writable. Entries may be written in any
+//!   order — the parser sorts them into the canonical
+//!   ascending-by-key form the `ParseTree` requires.
 //! - **Payload fields** — by Rust type source text:
 //!   `String` → a `%str` literal; the integer types → `%int`;
 //!   `bool` → `true` / `false`. Any other payload type fails
@@ -62,7 +69,9 @@
 use std::collections::HashMap;
 
 use crate::grammar_check;
-use crate::peg::{Grammar, Peg, choice, field, node, repeat, rule, rule_ref, seq, token};
+use crate::peg::{
+    Grammar, Peg, choice, field, keyed_entry, node, repeat, rule, rule_ref, seq, token,
+};
 use crate::{BuildError, Diagnostic};
 use dsl_kit_core::IdGen;
 use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
@@ -73,13 +82,6 @@ pub mod codes {
     pub const UNSUPPORTED_FIELD: &str = "dsl_kit::schema_gen::unsupported_field";
     /// The schema declares no variants — there is nothing to parse.
     pub const EMPTY_SCHEMA: &str = "dsl_kit::schema_gen::empty_schema";
-    /// A child slot is declared with
-    /// [`Multiplicity::Map`](dsl_kit_schema::Multiplicity::Map) but the
-    /// canonical-syntax PEG for keyed slots is not yet implemented.
-    /// Grammar generation aborts up front so authors get a clear
-    /// diagnostic instead of a silently-missing rule; downstream cycles
-    /// will retire this once the keyed-slot spelling is designed.
-    pub const MAP_NOT_IMPLEMENTED: &str = "dsl_kit::schema_gen::map_not_implemented";
     /// A child slot's multiplicity is a variant this build of
     /// `dsl-kit-parse` does not recognise (added to the schema crate's
     /// `#[non_exhaustive]` enum ahead of parse-side support). Emitted
@@ -212,10 +214,9 @@ pub fn grammar_from_schema_with(
     // Grouping:
     //   - `UNSUPPORTED_FIELD` for payload types with no canonical-syntax
     //     mapping (and no `SyntaxOverrides` entry).
-    //   - `MAP_NOT_IMPLEMENTED` for child slots declared with
-    //     `Multiplicity::Map` — keyed-slot canonical syntax is
-    //     scheduled for a follow-up cycle; rejecting up front means
-    //     `child_arg_peg` never sees a Map slot.
+    //   - `UNKNOWN_MULTIPLICITY` for child slots whose multiplicity
+    //     this build does not know, which is what keeps
+    //     `child_arg_peg`'s catch-all arm from ever running.
     let mut pre_flight = Vec::new();
     for v in &schema.variants {
         for f in &v.fields {
@@ -233,19 +234,11 @@ pub fn grammar_from_schema_with(
         }
         for c in &v.children {
             match c.multiplicity {
-                // Positional shapes are the ones `child_arg_peg` knows
-                // how to emit today; let them through.
-                Multiplicity::One | Multiplicity::Optional | Multiplicity::Many => {}
-                Multiplicity::Map => {
-                    pre_flight.push(Diagnostic::error(
-                        codes::MAP_NOT_IMPLEMENTED,
-                        format!(
-                            "variant `{}` child slot `{}`: Multiplicity::Map has no \
-                             canonical-syntax PEG mapping yet",
-                            v.name, c.name
-                        ),
-                    ));
-                }
+                // Every shape `child_arg_peg` knows how to emit.
+                Multiplicity::One
+                | Multiplicity::Optional
+                | Multiplicity::Many
+                | Multiplicity::Map => {}
                 // `#[non_exhaustive]` catch-all: a future Multiplicity
                 // variant added to dsl-kit-schema before this crate is
                 // updated must also be rejected here — that's what
@@ -509,17 +502,53 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
                 ],
             )
         }
-        // Keyed slots are rejected in `grammar_from_schema_with` with
-        // `MAP_NOT_IMPLEMENTED` before rule generation runs, so this
-        // arm is genuinely unreachable in the current pipeline. Kept
-        // explicit (rather than folded into the `_` catch-all below)
-        // so a future caller that bypasses the pre-flight check gets
-        // a Map-shaped panic message instead of the generic one.
-        Multiplicity::Map => unreachable!(
-            "Multiplicity::Map slot `{}` reached child_arg_peg — the pre-flight \
-             check in grammar_from_schema_with should have rejected it upstream",
-            c.name
-        ),
+        // `name: { <key>: <node> ("," <key>: <node>)* }`, empty map
+        // allowed. Braces rather than the `Many` idiom's brackets so
+        // the two shapes are distinguishable at a glance, and matching
+        // the JSON bridge's object spelling so a DSL reads the same
+        // way in both front-ends.
+        //
+        // The key token is `%str | %ident`: keys are arbitrary strings
+        // at the `ParseTree` level, so a quoted form has to exist, but
+        // requiring quotes around every `PATH`-style key would be
+        // noise. `%str` is tried first — a quoted key is unambiguous,
+        // while `%ident` cannot start with `"` — and its production is
+        // the decoded content, so `"a b"` and `a` both arrive as plain
+        // key text.
+        Multiplicity::Map => {
+            //
+            // The `:` separator rides on the *value* half, not the
+            // key half: every token matched inside the key production
+            // contributes to the key text, so a `:` there would land
+            // in the key itself. On the value side it is dropped as
+            // syntactic noise, the same way the `Many` list's commas
+            // are.
+            let entry = |ids: &IdGen| -> Peg {
+                keyed_entry(
+                    ids,
+                    c.name.clone(),
+                    choice(ids, vec![token(ids, "%str"), token(ids, "%ident")]),
+                    seq(ids, vec![token(ids, ":"), rule_ref(ids, START_RULE)]),
+                )
+            };
+            let entries = seq(
+                ids,
+                vec![
+                    entry(ids),
+                    repeat(ids, seq(ids, vec![token(ids, ","), entry(ids)]), 0, None),
+                ],
+            );
+            seq(
+                ids,
+                vec![
+                    name_kw,
+                    colon,
+                    token(ids, "{"),
+                    repeat(ids, entries, 0, Some(1)),
+                    token(ids, "}"),
+                ],
+            )
+        }
         // `#[non_exhaustive]` catch-all: a future Multiplicity variant
         // added to dsl-kit-schema before this crate is updated would
         // land here. The pre-flight check in
@@ -636,6 +665,14 @@ mod tests {
                     }],
                 },
                 VariantSchema {
+                    name: "Env".into(),
+                    fields: vec![],
+                    children: vec![ChildSchema {
+                        name: "entries".into(),
+                        multiplicity: Multiplicity::Map,
+                    }],
+                },
+                VariantSchema {
                     name: "Unit".into(),
                     fields: vec![],
                     children: vec![],
@@ -726,6 +763,67 @@ mod tests {
         assert!(
             tree.child_slot("items").is_none_or(<[_]>::is_empty),
             "empty list = zero children"
+        );
+    }
+
+    #[test]
+    fn keyed_map_binds_entries_sorted_by_key() {
+        // Written deliberately out of order, with one quoted key that
+        // could not be spelled as a bare identifier: the parser is
+        // responsible for landing both in canonical order.
+        let tree = parse_ok(r#"Env(entries: { zeta: Unit(), "a b": Lit(value: 1) })"#);
+        let entries = tree.keyed_child_slot("entries").expect("keyed slot bound");
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a b", "zeta"]);
+        let variants: Vec<&str> = entries.iter().map(|(_, t)| t.variant.as_str()).collect();
+        assert_eq!(variants, ["Lit", "Unit"]);
+        assert!(
+            tree.children.is_empty(),
+            "keyed entries must not leak into the positional half: {:?}",
+            tree.children
+        );
+    }
+
+    #[test]
+    fn keyed_map_source_order_does_not_change_the_tree() {
+        let forward = parse_ok("Env(entries: { a: Unit(), b: Lit(value: 1) })");
+        let reversed = parse_ok("Env(entries: { b: Lit(value: 1), a: Unit() })");
+        // Spans differ (the two spellings put the subtrees at
+        // different offsets), so compare the keyed payload rather than
+        // the whole tree.
+        let keys = |t: &crate::ParseTree| -> Vec<String> {
+            t.keyed_child_slot("entries")
+                .unwrap()
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v.variant))
+                .collect()
+        };
+        assert_eq!(keys(&forward), keys(&reversed));
+    }
+
+    #[test]
+    fn keyed_map_empty_is_conformant() {
+        let tree = parse_ok("Env(entries: {})");
+        assert!(
+            tree.keyed_child_slot("entries").is_none_or(<[_]>::is_empty),
+            "empty map = zero entries"
+        );
+    }
+
+    #[test]
+    fn keyed_map_duplicate_key_parses_but_fails_conformance() {
+        // The grammar has no reason to reject it — duplicate detection
+        // is the schema's job, and `parse_ok` would hide the split, so
+        // this test drives the two stages apart deliberately.
+        let g = demo_grammar();
+        let tree = g
+            .parse("Env(entries: { k: Unit(), k: Lit(value: 1) })")
+            .expect("grammar accepts a repeated key");
+        let diags = check_conformance(&tree, &demo_schema());
+        assert!(
+            diags.iter().any(|d| d.code == crate::codes::DUPLICATE_KEY),
+            "expected DUPLICATE_KEY; got {:?}",
+            diags.iter().map(|d| d.code.as_str()).collect::<Vec<_>>()
         );
     }
 

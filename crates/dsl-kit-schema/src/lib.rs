@@ -195,12 +195,11 @@ impl ChildSchema {
 /// because the box is a storage detail invisible to schema consumers.
 ///
 /// [`Multiplicity::Map`] marks a **keyed** child slot — a string-keyed
-/// collection of subtrees. The concrete Rust shape the derive
-/// recognises (`BTreeMap<String, T>`, `HashMap<String, Box<Self>>`, …)
-/// is deferred to follow-up work; this variant is defined at the
-/// schema layer so consumers can construct [`NodeSchema`] values that
-/// declare keyed slots today, and downstream code (derive, PEG
-/// codegen, JSON ⇔ AST bridge) can grow support incrementally.
+/// collection of subtrees. The derive recognises exactly
+/// `BTreeMap<String, T>` and `BTreeMap<String, Box<T>>`; `HashMap` and
+/// friends are not keyed shapes here, because a map slot's iteration
+/// order is observable (walks, canonical text, JSON round-trips) and
+/// so has to be deterministic.
 ///
 /// The enum is `#[non_exhaustive]` so future primitives (ordered sets,
 /// fixed-arity tuple slots, non-empty lists, …) can be added as minor
@@ -215,16 +214,17 @@ pub enum Multiplicity {
     Optional,
     /// `Vec<T>` or `Vec<Box<T>>`. Zero or more children in order.
     Many,
-    /// String-keyed collection of children (`Map<String, V>` shape).
+    /// String-keyed collection of children
+    /// (`BTreeMap<String, V>` shape). Zero or more entries, each
+    /// reachable by its key.
     ///
     /// The schema layer only records that the slot is keyed; the value
-    /// shape (scalar / other-node / self-recursive) is inferred by the
-    /// derive macro from the underlying Rust type. Downstream runtime
-    /// support (derive, PEG codegen, JSON ⇔ AST bridge, lint) is not
-    /// yet implemented — sites that consume [`Multiplicity`] currently
-    /// emit a `MAP_NOT_IMPLEMENTED` diagnostic when they encounter a
-    /// [`Multiplicity::Map`] slot. See the tracking issue for the
-    /// staged rollout of the three shapes.
+    /// shape is inferred by the derive macro from the underlying Rust
+    /// type. Self-recursive values (`BTreeMap<String, Self>` /
+    /// `BTreeMap<String, Box<Self>>`) are supported end to end —
+    /// derive, conformance, the JSON bridge, generated grammars and
+    /// `DslBuild`. Keyed slots whose values are *another* AST type, or
+    /// scalars, are still being staged; see the tracking issue.
     Map,
 }
 

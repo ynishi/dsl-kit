@@ -288,6 +288,12 @@ fn is_nullable(peg: &Peg, nullable_rules: &HashMap<String, bool>) -> bool {
             alts.is_empty() || alts.iter().any(|a| is_nullable(a, nullable_rules))
         }
         Peg::Repeat { body, min, .. } => *min == 0 || is_nullable(body, nullable_rules),
+        // A keyed entry consumes whatever its key and value consume;
+        // it adds no syntax of its own, so it is nullable only if both
+        // halves are.
+        Peg::KeyedEntry { key, value, .. } => {
+            is_nullable(key, nullable_rules) && is_nullable(value, nullable_rules)
+        }
         Peg::RuleRef { name, .. } => nullable_rules.get(name).copied().unwrap_or(false),
         // Token classes (%ident / %int / %ws / %kw:<w>) all require ≥1
         // byte; a literal is nullable iff empty. Empty literals are a
@@ -353,6 +359,14 @@ fn collect_first(
                 collect_first(alt, nullable, first_rules, out);
             }
         }
+        // Same first-position logic as a two-item `Seq`: the value's
+        // first set only counts when the key can match empty.
+        Peg::KeyedEntry { key, value, .. } => {
+            collect_first(key, nullable, first_rules, out);
+            if is_nullable(key, nullable) {
+                collect_first(value, nullable, first_rules, out);
+            }
+        }
         Peg::RuleRef { name, .. } => {
             out.insert(name.clone());
             if let Some(f) = first_rules.get(name) {
@@ -387,6 +401,10 @@ fn walk_peg(peg: &Peg, f: &mut dyn FnMut(&Peg)) {
                 walk_peg(a, f);
             }
         }
+        Peg::KeyedEntry { key, value, .. } => {
+            walk_peg(key, f);
+            walk_peg(value, f);
+        }
         Peg::RuleRef { .. } | Peg::Token { .. } => {}
     }
 }
@@ -407,6 +425,7 @@ fn find_by_id(g: &Grammar, id: NodeId) -> Option<&Peg> {
             | Peg::Field { body, .. } => recurse(body, id),
             Peg::Seq { items, .. } => items.iter().find_map(|i| recurse(i, id)),
             Peg::Choice { alts, .. } => alts.iter().find_map(|a| recurse(a, id)),
+            Peg::KeyedEntry { key, value, .. } => recurse(key, id).or_else(|| recurse(value, id)),
             Peg::RuleRef { .. } | Peg::Token { .. } => None,
         }
     }
@@ -423,7 +442,8 @@ fn peg_id(p: &Peg) -> NodeId {
         | Peg::RuleRef { id, .. }
         | Peg::Token { id, .. }
         | Peg::Node { id, .. }
-        | Peg::Field { id, .. } => *id,
+        | Peg::Field { id, .. }
+        | Peg::KeyedEntry { id, .. } => *id,
     }
 }
 
@@ -438,7 +458,7 @@ fn _touch_nodeid(_: NodeId) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::peg::{choice, field, node, repeat, rule, rule_ref, seq, token};
+    use crate::peg::{choice, field, keyed_entry, node, repeat, rule, rule_ref, seq, token};
     use dsl_kit_core::IdGen;
     use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
 
@@ -644,6 +664,57 @@ mod tests {
         let diags = check_nullable_repeat(&g);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, peg_codes::NULLABLE_REPEAT);
+    }
+
+    #[test]
+    fn nullable_keyed_entry_repeat_body_is_detected() {
+        let ids = IdGen::new();
+        // Both halves of the entry nullable → the entry is nullable →
+        // repeating it would spin without consuming. The generated
+        // grammars never produce this shape, so only a hand-built one
+        // exercises the `KeyedEntry` arm of `is_nullable` in the
+        // direction that raises a diagnostic.
+        let entry = keyed_entry(&ids, "entries", seq(&ids, vec![]), seq(&ids, vec![]));
+        let rep = repeat(&ids, entry, 0, None);
+        let rep_id = peg_id(&rep);
+        let r = rule(&ids, "s", node(&ids, "N", rep));
+        let g = Grammar::new(vec![r], "s");
+        let diags = check_nullable_repeat(&g);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, peg_codes::NULLABLE_REPEAT);
+        assert_eq!(diags[0].location, Location::Node(rep_id));
+    }
+
+    #[test]
+    fn keyed_entry_with_a_consuming_half_is_not_nullable() {
+        let ids = IdGen::new();
+        // Only the key consumes; that is enough to make the entry a
+        // safe repeat body. Pins the `&&` in the `KeyedEntry` arm —
+        // an `||` there would flag this grammar as broken.
+        let entry = keyed_entry(&ids, "entries", token(&ids, "%ident"), seq(&ids, vec![]));
+        let rep = repeat(&ids, entry, 0, None);
+        let r = rule(&ids, "s", node(&ids, "N", rep));
+        let g = Grammar::new(vec![r], "s");
+        assert!(check_nullable_repeat(&g).is_empty());
+    }
+
+    #[test]
+    fn left_recursion_through_a_keyed_entry_key_is_detected() {
+        let ids = IdGen::new();
+        // `s` reaches itself at first position through the entry's key
+        // half, so the recursion is real and `collect_first` has to see
+        // through `KeyedEntry` to catch it.
+        let entry = keyed_entry(
+            &ids,
+            "entries",
+            rule_ref(&ids, "s"),
+            node(&ids, "N", token(&ids, "x")),
+        );
+        let r = rule(&ids, "s", entry);
+        let g = Grammar::new(vec![r], "s");
+        let diags = check_left_recursion(&g);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, peg_codes::LEFT_RECURSION);
     }
 
     #[test]

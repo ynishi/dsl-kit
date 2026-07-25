@@ -27,7 +27,7 @@
 //!
 //! # Capture model
 //!
-//! Two capture primitives:
+//! Three capture primitives:
 //!
 //! - [`Peg::Node`] `{ variant, body }` — opens a `ParseTree` scope with
 //!   the given variant name. Inside `body`, every [`Peg::Field`] binding
@@ -42,6 +42,18 @@
 //!   productions win (raw text is dropped as syntactic noise from
 //!   sub-Nodes' brackets etc.); empty → the Field silently no-ops.
 //!   G-3's `GrammarCheck` will surface Mixed as a grammar bug.
+//! - [`Peg::KeyedEntry`] `{ slot, key, value }` — one entry of a keyed
+//!   child slot (`Multiplicity::Map`). `key` produces the entry's key
+//!   text, `value` the entry's subtree, and the pair lands in
+//!   [`ParseTree::keyed_children`] under `slot`. A separate primitive
+//!   rather than a `Field` convention because a `Field` binds *one*
+//!   name to its productions, which cannot express a name the input
+//!   supplies; pairing adjacent text and tree productions inside a
+//!   `Field` instead would make the capture depend on production
+//!   order, which every backtracking path is free to disturb.
+//!   [`Peg::Node`] sorts each keyed slot by key before emitting, so
+//!   grammars need not care what order the source was written in —
+//!   the canonical order [`ParseTree`] requires falls out.
 //!
 //! # Whitespace policy (parser-design §3.5, decided in G-2)
 //!
@@ -165,6 +177,26 @@ pub enum Peg {
         name: String,
         /// Capture body.
         body: Box<Peg>,
+    },
+    /// Captures one `key → subtree` entry of a keyed child slot
+    /// ([`dsl_kit_schema::Multiplicity::Map`]) on the enclosing
+    /// [`Peg::Node`] scope.
+    ///
+    /// `key` must produce text (typically `%str` or `%ident`) and
+    /// `value` must produce exactly one tree (typically a `RuleRef`
+    /// reaching a [`Peg::Node`]). Anything else is a grammar bug: the
+    /// entry is dropped and the parse fails rather than contributing a
+    /// half-formed pair, because a keyed entry missing its key has
+    /// nowhere to go.
+    KeyedEntry {
+        /// Stable node id.
+        id: NodeId,
+        /// Keyed child-slot name on the enclosing Node.
+        slot: String,
+        /// Production for the entry's key.
+        key: Box<Peg>,
+        /// Production for the entry's subtree.
+        value: Box<Peg>,
     },
 }
 
@@ -329,6 +361,7 @@ struct FieldSink {
 struct NodeSink {
     fields: Vec<(String, RawValue)>,
     children: Vec<(String, Vec<ParseTree>)>,
+    keyed_children: Vec<(String, Vec<(String, ParseTree)>)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -547,6 +580,9 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             Peg::Token { pat, .. } => self.match_token(pat),
             Peg::Node { variant, body, .. } => self.run_node(variant, body),
             Peg::Field { name, body, .. } => self.run_field(name, body),
+            Peg::KeyedEntry {
+                slot, key, value, ..
+            } => self.run_keyed_entry(slot, key, value),
         }
     }
 
@@ -671,16 +707,21 @@ impl<'g, 'i> Interpreter<'g, 'i> {
         };
         body_result?;
         let end_pos = self.pos;
+        // Keyed entries arrive in source order; `ParseTree` requires
+        // ascending key order, and `check_conformance` enforces it.
+        // Sorting here — rather than asking every grammar author to
+        // write their maps pre-sorted — is what makes source order a
+        // surface detail, exactly as it is for the JSON bridge.
+        let mut keyed_children = node_sink.keyed_children;
+        for (_, entries) in &mut keyed_children {
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        }
+
         let tree = ParseTree {
             variant: variant.to_string(),
             fields: node_sink.fields,
             children: node_sink.children,
-            // The PEG front-end has no keyed-slot production yet — the
-            // canonical text syntax for `Multiplicity::Map` lands with
-            // grammar generation (`schema_gen` still rejects Map
-            // schemas up front), so nothing can reach this builder
-            // carrying keyed children.
-            keyed_children: Vec::new(),
+            keyed_children,
             span: Some(Span::new(start_pos, end_pos)),
         };
         self.contribute_tree(tree);
@@ -697,6 +738,91 @@ impl<'g, 'i> Interpreter<'g, 'i> {
         };
         body_result?;
         self.contribute_field(name, field_sink.productions);
+        Ok(())
+    }
+
+    /// Runs one keyed entry: `key` into its own sink, then `value` into
+    /// another, then pairs them onto the enclosing Node's keyed half.
+    ///
+    /// The two halves are captured separately rather than in one sink
+    /// because a single `FieldSink` would leave "which production was
+    /// the key" to positional luck. Failure of either half fails the
+    /// entry: a pair missing its key cannot be stored, and storing the
+    /// value under a fabricated key would invent data.
+    fn run_keyed_entry(&mut self, slot: &str, key: &'g Peg, value: &'g Peg) -> Result<(), ()> {
+        let key_text = {
+            self.sink_stack
+                .push(ActiveSink::Field(FieldSink::default()));
+            let result = self.run_peg(key);
+            let sink = match self.sink_stack.pop() {
+                Some(ActiveSink::Field(s)) => s,
+                _ => unreachable!("balanced push/pop of FieldSink"),
+            };
+            result?;
+            // A key half that matched without producing anything is a
+            // grammar bug (typically a nullable key production). Every
+            // such entry would key on the empty string and collide
+            // with its siblings, so fail instead — this is the check
+            // the `is_empty()` guard exists for. A production that is
+            // *present* but empty (`""` via `%str`) is a different
+            // thing: it is a key the AST and the JSON front-end can
+            // both hold, so the text syntax accepts it too.
+            if sink.productions.is_empty() {
+                self.expected("a text production for the keyed-entry key");
+                return Err(());
+            }
+            let mut text = String::new();
+            for production in &sink.productions {
+                match production {
+                    Production::Text(t, _) => text.push_str(t),
+                    // A tree where the key belongs is a grammar bug of
+                    // the same family — there is no text to key on.
+                    Production::Tree(_) => {
+                        self.expected("a text production for the keyed-entry key");
+                        return Err(());
+                    }
+                }
+            }
+            text
+        };
+
+        self.sink_stack
+            .push(ActiveSink::Field(FieldSink::default()));
+        let value_result = self.run_peg(value);
+        let value_sink = match self.sink_stack.pop() {
+            Some(ActiveSink::Field(s)) => s,
+            _ => unreachable!("balanced push/pop of FieldSink"),
+        };
+        value_result?;
+
+        let mut trees = value_sink.productions.into_iter().filter_map(|p| match p {
+            Production::Tree(t) => Some(t),
+            // Syntactic noise from the value's own brackets, dropped
+            // the same way `contribute_field`'s mixed arm drops it.
+            Production::Text(..) => None,
+        });
+        let Some(tree) = trees.next() else {
+            self.expected("a subtree production for the keyed-entry value");
+            return Err(());
+        };
+        if trees.next().is_some() {
+            self.expected("exactly one subtree for the keyed-entry value");
+            return Err(());
+        }
+
+        let Some(ActiveSink::Node(node_sink)) = self.sink_stack.last_mut() else {
+            // KeyedEntry outside a Node — silently ignored at runtime,
+            // matching `contribute_field`'s handling of the same
+            // grammar bug.
+            return Ok(());
+        };
+        if let Some(existing) = node_sink.keyed_children.iter_mut().find(|(n, _)| n == slot) {
+            existing.1.push((key_text, tree));
+        } else {
+            node_sink
+                .keyed_children
+                .push((slot.to_string(), vec![(key_text, tree)]));
+        }
         Ok(())
     }
 
@@ -976,6 +1102,19 @@ pub fn field(ids: &IdGen, name: impl Into<String>, body: Peg) -> Peg {
     }
 }
 
+/// Builds a [`Peg::KeyedEntry`] capture node with a fresh id.
+///
+/// `key` should produce text (e.g. `token(ids, "%str")`) and `value`
+/// exactly one subtree (e.g. `rule_ref(ids, "node")`).
+pub fn keyed_entry(ids: &IdGen, slot: impl Into<String>, key: Peg, value: Peg) -> Peg {
+    Peg::KeyedEntry {
+        id: ids.node(),
+        slot: slot.into(),
+        key: Box::new(key),
+        value: Box::new(value),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -996,9 +1135,26 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "Rule", "Seq", "Choice", "Repeat", "RuleRef", "Token", "Node", "Field"
+                "Rule",
+                "Seq",
+                "Choice",
+                "Repeat",
+                "RuleRef",
+                "Token",
+                "Node",
+                "Field",
+                "KeyedEntry"
             ]
         );
+        // `KeyedEntry`'s two `Box<Peg>` halves are both child slots;
+        // `slot` is the only payload field. Pins the derive's view of
+        // the newest variant alongside the older `Repeat` check below.
+        let keyed = s.variant("KeyedEntry").unwrap();
+        let keyed_children: Vec<&str> = keyed.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(keyed_children, vec!["key", "value"]);
+        let keyed_fields: Vec<&str> = keyed.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(keyed_fields, vec!["slot"]);
+
         let repeat = s.variant("Repeat").unwrap();
         // body -> one child; min / max -> fields.
         assert_eq!(repeat.children.len(), 1);
@@ -1016,6 +1172,224 @@ mod tests {
 
     fn one_rule_grammar(ids: &IdGen, start: &str, body: Peg) -> Grammar {
         Grammar::new(vec![rule(ids, start, body)], start)
+    }
+
+    // -- KeyedEntry primitive (hand-built grammars) --
+    //
+    // The generated grammars in `schema_gen` only ever build keyed
+    // entries in one shape, so the primitive's own contract — what it
+    // does with a malformed key half, a value half that yields the
+    // wrong number of trees, or an entry outside a Node — is only
+    // reachable from grammars written by hand, as below.
+
+    /// `{ key: <leaf> ... }`-style grammar over a single keyed slot,
+    /// with the key production supplied by the caller so the failure
+    /// branches can be driven individually.
+    fn keyed_grammar(ids: &IdGen, key: Peg, value: Peg) -> Grammar {
+        let entry = keyed_entry(ids, "entries", key, value);
+        one_rule_grammar(
+            ids,
+            "start",
+            node(
+                ids,
+                "Env",
+                seq(
+                    ids,
+                    vec![
+                        token(ids, "{"),
+                        repeat(
+                            ids,
+                            seq(ids, vec![entry, repeat(ids, token(ids, ","), 0, Some(1))]),
+                            0,
+                            None,
+                        ),
+                        token(ids, "}"),
+                    ],
+                ),
+            ),
+        )
+    }
+
+    /// A leaf value production: `: Lit(<int>)` wrapped in its own Node.
+    fn keyed_leaf_value(ids: &IdGen) -> Peg {
+        seq(
+            ids,
+            vec![
+                token(ids, ":"),
+                node(ids, "Lit", field(ids, "value", token(ids, "%int"))),
+            ],
+        )
+    }
+
+    #[test]
+    fn keyed_entry_pairs_key_with_subtree_and_sorts() {
+        let ids = IdGen::new();
+        let g = keyed_grammar(&ids, token(&ids, "%ident"), keyed_leaf_value(&ids));
+        let tree = parse_one(&g, "{ b: 2, a: 1 }").unwrap();
+        let entries = tree.keyed_child_slot("entries").expect("slot bound");
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["a", "b"], "Node emission sorts by key");
+        // Values travelled with their own keys, not just in order.
+        let values: Vec<&RawValue> = entries
+            .iter()
+            .map(|(_, t)| t.field("value").expect("leaf payload"))
+            .collect();
+        assert_eq!(values[0], &RawValue::Text("1".into()));
+        assert_eq!(values[1], &RawValue::Text("2".into()));
+    }
+
+    #[test]
+    fn keyed_entry_accepts_an_empty_string_key() {
+        let ids = IdGen::new();
+        // `""` is a key the AST and the JSON bridge can both hold, so
+        // the text side accepts it rather than leaving a `BTreeMap`
+        // value with no spelling.
+        let g = keyed_grammar(&ids, token(&ids, "%str"), keyed_leaf_value(&ids));
+        let tree = parse_one(&g, r#"{ "": 1 }"#).unwrap();
+        let entries = tree.keyed_child_slot("entries").expect("slot bound");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "");
+    }
+
+    #[test]
+    fn keyed_entry_rejects_a_key_half_that_produces_nothing() {
+        let ids = IdGen::new();
+        // A nullable key half — here an optional identifier that is
+        // absent — succeeds while contributing no production, so there
+        // is no text to key on. Every such entry would land on `""`
+        // and collide with its siblings, which is what separates this
+        // case from a genuinely empty `""` key (accepted above).
+        let g = keyed_grammar(
+            &ids,
+            repeat(&ids, token(&ids, "%ident"), 0, Some(1)),
+            keyed_leaf_value(&ids),
+        );
+        let err = parse_one(&g, "{ : 1 }").unwrap_err();
+        assert_eq!(err.diagnostics[0].code, codes::UNEXPECTED);
+    }
+
+    #[test]
+    fn keyed_entry_rejects_a_tree_where_the_key_belongs() {
+        let ids = IdGen::new();
+        let g = keyed_grammar(
+            &ids,
+            node(&ids, "Lit", field(&ids, "value", token(&ids, "%int"))),
+            keyed_leaf_value(&ids),
+        );
+        let err = parse_one(&g, "{ 1: 2 }").unwrap_err();
+        assert_eq!(err.diagnostics[0].code, codes::UNEXPECTED);
+    }
+
+    #[test]
+    fn keyed_entry_rejects_a_value_half_without_exactly_one_tree() {
+        let ids = IdGen::new();
+
+        // Zero trees: the value is a bare token, so nothing to store.
+        let none = keyed_grammar(
+            &ids,
+            token(&ids, "%ident"),
+            seq(&ids, vec![token(&ids, ":"), token(&ids, "%int")]),
+        );
+        assert!(parse_one(&none, "{ a: 1 }").is_err());
+
+        // Two trees: ambiguous — which one is the entry's value?
+        let leaf = |ids: &IdGen| node(ids, "Lit", field(ids, "value", token(ids, "%int")));
+        let two = keyed_grammar(
+            &ids,
+            token(&ids, "%ident"),
+            seq(&ids, vec![token(&ids, ":"), leaf(&ids), leaf(&ids)]),
+        );
+        assert!(parse_one(&two, "{ a: 1 2 }").is_err());
+    }
+
+    #[test]
+    fn keyed_entry_survives_backtracking_without_leaking_entries() {
+        let ids = IdGen::new();
+        // The first alternative parses one entry and then demands a
+        // `;` the input does not have, so it fails *after* writing to
+        // the enclosing Node's keyed half. If the sink snapshot did
+        // not cover `keyed_children`, the abandoned entry would still
+        // be there when the second alternative succeeds.
+        let entry_then_semi = seq(
+            &ids,
+            vec![
+                keyed_entry(
+                    &ids,
+                    "entries",
+                    token(&ids, "%ident"),
+                    keyed_leaf_value(&ids),
+                ),
+                token(&ids, ";"),
+            ],
+        );
+        let entry_then_end = seq(
+            &ids,
+            vec![
+                keyed_entry(
+                    &ids,
+                    "entries",
+                    token(&ids, "%ident"),
+                    keyed_leaf_value(&ids),
+                ),
+                token(&ids, "}"),
+            ],
+        );
+        let g = one_rule_grammar(
+            &ids,
+            "start",
+            node(
+                &ids,
+                "Env",
+                seq(
+                    &ids,
+                    vec![
+                        token(&ids, "{"),
+                        choice(&ids, vec![entry_then_semi, entry_then_end]),
+                    ],
+                ),
+            ),
+        );
+
+        let tree = parse_one(&g, "{ a: 1 }").unwrap();
+        let entries = tree.keyed_child_slot("entries").expect("slot bound");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the failed alternative's entry must be rolled back, not kept: {entries:?}"
+        );
+        assert_eq!(entries[0].0, "a");
+    }
+
+    #[test]
+    fn keyed_entry_outside_a_node_drops_the_entry() {
+        let ids = IdGen::new();
+        // No enclosing Node scope, so there is nowhere to bind the
+        // pair. Documented as a silent drop, matching how a stray
+        // `Field` behaves; pinned here so the behaviour is a decision
+        // rather than an accident.
+        let g = one_rule_grammar(
+            &ids,
+            "start",
+            seq(
+                &ids,
+                vec![
+                    keyed_entry(
+                        &ids,
+                        "entries",
+                        token(&ids, "%ident"),
+                        keyed_leaf_value(&ids),
+                    ),
+                    node(&ids, "Env", token(&ids, "!")),
+                ],
+            ),
+        );
+        let tree = parse_one(&g, "a: 1 !").unwrap();
+        assert_eq!(tree.variant, "Env");
+        assert!(
+            tree.keyed_children.is_empty(),
+            "a keyed entry with no enclosing Node has nowhere to land: {:?}",
+            tree.keyed_children
+        );
     }
 
     #[test]
