@@ -104,11 +104,15 @@ your own DSL as its own MCP server binary.
 ```sh
 cargo run -p expr-example   # expression DSL: text + JSON round trips, schema-generated grammar
 cargo run -p flow-example   # orchestration DSL: fan-out, value-gated Branch, breakpoints, drive layer, text round trip
+cargo run -p cfg-example    # configuration DSL: keyed child slots (BTreeMap), override folds, host-resolved references
 ```
 
 The examples double as reference implementations: `flow-dsl` shows the
 per-field hooks on a DSL with exotic payload types, `expr-dsl` shows
-the plain derive-only path end to end.
+the plain derive-only path end to end, and `cfg-dsl` shows keyed child
+slots — named children rather than positional ones — through both
+front-ends and over MCP (see
+[examples/cfg-example](examples/cfg-example/README.md)).
 
 ## Documentation
 

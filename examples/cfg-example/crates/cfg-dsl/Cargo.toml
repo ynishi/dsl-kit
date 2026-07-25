@@ -1,0 +1,17 @@
+[package]
+name = "cfg-dsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Third reference DSL for dsl-kit: a small configuration language built on keyed child slots (BTreeMap<String, T>). Example DSL, not part of the kit surface."
+
+[dependencies]
+dsl-kit        = { workspace = true }
+dsl-kit-core   = { workspace = true }
+dsl-kit-macros = { workspace = true }
+dsl-kit-schema = { workspace = true }
+dsl-kit-parse  = { workspace = true }
+
+[dev-dependencies]
+serde_json = "1"

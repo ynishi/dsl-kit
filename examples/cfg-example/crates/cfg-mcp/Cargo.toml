@@ -1,0 +1,20 @@
+[package]
+name = "cfg-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "MCP server binary (stdio) that serves cfg-host. The keyed-slot DSL on the same scaffolding as flow-mcp / expr-mcp."
+
+[[bin]]
+name = "cfg-mcp"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit-mcp = { workspace = true }
+cfg-host    = { workspace = true }
+rmcp        = { version = "0.16", features = ["server", "transport-io", "macros"] }
+tokio       = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow      = "1"

@@ -18,6 +18,10 @@ members = [
     "examples/expr-example/crates/expr-dsl",
     "examples/expr-example/crates/expr-host",
     "examples/expr-example/crates/expr-mcp",
+    "examples/cfg-example",
+    "examples/cfg-example/crates/cfg-dsl",
+    "examples/cfg-example/crates/cfg-host",
+    "examples/cfg-example/crates/cfg-mcp",
     "examples/custom-mcp-example",
 ]
 
@@ -47,3 +51,5 @@ flow-dsl       = { path = "examples/flow-example/crates/flow-dsl",  version = "0
 flow-host      = { path = "examples/flow-example/crates/flow-host", version = "0.4.0" }
 expr-dsl       = { path = "examples/expr-example/crates/expr-dsl",  version = "0.4.0" }
 expr-host      = { path = "examples/expr-example/crates/expr-host", version = "0.4.0" }
+cfg-dsl        = { path = "examples/cfg-example/crates/cfg-dsl",    version = "0.4.0" }
+cfg-host       = { path = "examples/cfg-example/crates/cfg-host",   version = "0.4.0" }

@@ -82,6 +82,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]` catch-all arms; surface a stable signal instead
   of a panic when a future `Multiplicity` variant is added ahead of
   parse-side support.
+- `examples/cfg-example` — new example crate (`cfg-dsl` / `cfg-host` /
+  `cfg-mcp` plus a stdout demo) demonstrating the keyed `Map`
+  primitive end to end. `Cfg` is a small configuration DSL whose
+  children are named rather than positional: `Env` carries
+  `BTreeMap<String, Box<Cfg>>` and `Overrides` carries
+  `BTreeMap<String, Cfg>`, so both derive arms (`MapBoxed` and `Map`)
+  stay covered by one DSL, while `Ref` suspends for a host-supplied
+  value and `Leaf` terminates. Tests pin the JSON front-end, the
+  schema-generated text grammar, a typed-AST → text → typed-AST round
+  trip, and the MCP tool surface (`dsl_kit_schema` reporting
+  `multiplicity: "map"`, `dsl_kit_load` accepting a keyed document,
+  `dsl_kit_step` / `dsl_kit_resolve` walking it). `cfg-mcp` installs
+  with `cargo install --path examples/cfg-example/crates/cfg-mcp`.
 
 ### Changed
 
