@@ -13,8 +13,11 @@
 //!
 //! - `DslNode` — returns the `id` field for each variant.
 //! - `Walk` — returns direct children by inspecting each variant's
-//!   field types. Any field of type `T`, `Box<T>`, `Option<T>`, or
-//!   `Vec<T>`, where `T` is the enum itself, is treated as a child.
+//!   field types. Any field of type `T`, `Box<T>`, `Option<T>`,
+//!   `Vec<T>`, or `BTreeMap<String, T>` (each in its `Box`-wrapped
+//!   form too), where `T` is the enum itself, is treated as a child.
+//!   Keyed slots iterate in the map's own (sorted-by-key) order —
+//!   keys themselves are not surfaced through the walk.
 //! - `WalkMut` — mutable counterpart of `Walk`.
 //!
 //! `#[derive(DslSchema)]` accepts the same shape and emits an
@@ -74,6 +77,15 @@ enum Recursion {
     Many,
     /// `Vec<Box<T>>`
     ManyBoxed,
+    /// `BTreeMap<String, T>` — self-recursive keyed slot with a bare
+    /// enum value. Rare in practice (recursive fields usually spell
+    /// the enum through `Box` to keep the enum object-safe), but
+    /// recognised for symmetry with [`Recursion::Direct`] /
+    /// [`Recursion::Many`].
+    Map,
+    /// `BTreeMap<String, Box<T>>` — the common self-recursive keyed
+    /// slot spelling.
+    MapBoxed,
 }
 
 /// Returns the last path segment of a `Type::Path`, if that's what `ty` is.
@@ -94,6 +106,37 @@ fn single_generic_type(seg: &syn::PathSegment) -> Option<&Type> {
         return None;
     };
     Some(inner)
+}
+
+/// If `seg` is `Wrapper<A, B>` (exactly two generic type arguments,
+/// both types), returns `(A, B)`. Used to unpack
+/// `BTreeMap<String, T>` and its siblings for keyed-slot
+/// recognition; returns `None` for any other arity or shape.
+fn two_generic_types(seg: &syn::PathSegment) -> Option<(&Type, &Type)> {
+    let PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 2 {
+        return None;
+    }
+    let mut iter = args.args.iter();
+    let (Some(GenericArgument::Type(a)), Some(GenericArgument::Type(b))) =
+        (iter.next(), iter.next())
+    else {
+        return None;
+    };
+    Some((a, b))
+}
+
+/// Returns true if `ty` is a `Type::Path` whose last segment is
+/// `String` (no generic arguments). Used to gate keyed-slot
+/// recognition — the first generic parameter of a keyed map must be
+/// a `String` key.
+fn is_string_type(ty: &Type) -> bool {
+    match last_segment(ty) {
+        Some(seg) => seg.ident == "String" && matches!(seg.arguments, PathArguments::None),
+        None => false,
+    }
 }
 
 /// Returns true if `ty` is a `Type::Path` whose last segment matches
@@ -151,6 +194,29 @@ fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
     }
 
     let seg = last_segment(ty)?;
+
+    // `BTreeMap<K, V>` takes two type parameters; try that shape first
+    // so the single-generic-type extraction below does not silently
+    // succeed on the first parameter alone.
+    if seg.ident == "BTreeMap" {
+        let (k, v) = two_generic_types(seg)?;
+        if !is_string_type(k) {
+            return None;
+        }
+        if matches_enum(v, enum_name) {
+            return Some(Recursion::Map);
+        }
+        if let Some(inner_seg) = last_segment(v)
+            && inner_seg.ident == "Box"
+        {
+            let inner_inner = single_generic_type(inner_seg)?;
+            if matches_enum(inner_inner, enum_name) {
+                return Some(Recursion::MapBoxed);
+            }
+        }
+        return None;
+    }
+
     let inner = single_generic_type(seg)?;
 
     match seg.ident.to_string().as_str() {
@@ -280,6 +346,15 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             Recursion::ManyBoxed => quote! {
                 _v.extend(#field_ident.iter().map(::std::convert::AsRef::as_ref));
             },
+            // `BTreeMap<String, T>` — iterate values in the map's
+            // (sorted) key order. Keys are traversal-invisible; a
+            // future keyed-walk API can expose them separately.
+            Recursion::Map => quote! { _v.extend(#field_ident.values()); },
+            // `BTreeMap<String, Box<T>>` — same iteration order, unbox
+            // each value on the way out.
+            Recursion::MapBoxed => quote! {
+                _v.extend(#field_ident.values().map(::std::convert::AsRef::as_ref));
+            },
         });
         let field_binds = recursive.iter().map(|(id, _)| quote!(#id));
         child_arms.push(quote! {
@@ -303,6 +378,10 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
             Recursion::Many => quote! { _v.extend(#field_ident.iter_mut()); },
             Recursion::ManyBoxed => quote! {
                 _v.extend(#field_ident.iter_mut().map(::std::convert::AsMut::as_mut));
+            },
+            Recursion::Map => quote! { _v.extend(#field_ident.values_mut()); },
+            Recursion::MapBoxed => quote! {
+                _v.extend(#field_ident.values_mut().map(::std::convert::AsMut::as_mut));
             },
         });
         let field_binds_mut = recursive.iter().map(|(id, _)| quote!(#id));
@@ -358,9 +437,11 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
 /// The `id: NodeId` field is stripped from the schema — it is an
 /// implementation detail of the observability layer, not part of the
 /// DSL's external shape. Recursive fields (`T` / `Box<T>` /
-/// `Option<T>` / `Option<Box<T>>` / `Vec<T>` / `Vec<Box<T>>` where `T`
-/// is the enum itself) become `ChildSchema` entries; every other named
-/// field becomes a `FieldSchema` carrying the Rust type source text.
+/// `Option<T>` / `Option<Box<T>>` / `Vec<T>` / `Vec<Box<T>>` /
+/// `BTreeMap<String, T>` / `BTreeMap<String, Box<T>>` where `T` is
+/// the enum itself) become `ChildSchema` entries; the two keyed-map
+/// shapes report `Multiplicity::Map`. Every other named field
+/// becomes a `FieldSchema` carrying the Rust type source text.
 #[proc_macro_derive(DslSchema)]
 pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -407,6 +488,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                     Recursion::Direct | Recursion::Boxed => quote!(One),
                     Recursion::Optional | Recursion::OptionalBoxed => quote!(Optional),
                     Recursion::Many | Recursion::ManyBoxed => quote!(Many),
+                    Recursion::Map | Recursion::MapBoxed => quote!(Map),
                 };
                 child_ctors.push(quote! {
                     ::dsl_kit_schema::ChildSchema {
@@ -607,6 +689,26 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                             .into_iter()
                             .map(::std::boxed::Box::new)
                             .collect::<::std::vec::Vec<_>>()
+                    },
+                    // Keyed slots (`BTreeMap<String, T>` /
+                    // `BTreeMap<String, Box<T>>`) are recognised by
+                    // `DslNode` / `DslSchema` in cycle 2 but the
+                    // `ParseTree` extension for keyed children is
+                    // scheduled for cycle 3. Emit a runtime panic that
+                    // fires only when a caller actually invokes
+                    // `DslBuild::from_parse_tree` on a variant that
+                    // carries a keyed slot — enums that opt into
+                    // `#[derive(DslBuild)]` alongside keyed-slot
+                    // variants still compile, and non-keyed variants
+                    // build normally.
+                    Recursion::Map | Recursion::MapBoxed => quote! {
+                        ::std::unimplemented!(
+                            "DslBuild does not yet support keyed slots ({}::{}::{}); \
+                             tracking: https://github.com/ynishi/dsl-kit/issues/5",
+                            ::std::stringify!(#name),
+                            ::std::stringify!(#variant_ident),
+                            #ident_str
+                        )
                     },
                 };
                 let_bindings.push(quote! { let #ident = #helper_call; });
@@ -881,6 +983,19 @@ pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
                 Recursion::ManyBoxed => quote! {
                     _children.extend(
                         #ident.iter().map(|c| ::dsl_kit_core::DslNode::node_id(c.as_ref())),
+                    );
+                },
+                // Keyed slots iterate in the map's own order
+                // (`BTreeMap` sorts by key) so the child sequence the
+                // engine sees is deterministic. Semantic choices
+                // (join policy, per-key dispatch, …) belong on the
+                // engine side; the derive only surfaces the children.
+                Recursion::Map => quote! {
+                    _children.extend(#ident.values().map(::dsl_kit_core::DslNode::node_id));
+                },
+                Recursion::MapBoxed => quote! {
+                    _children.extend(
+                        #ident.values().map(|c| ::dsl_kit_core::DslNode::node_id(c.as_ref())),
                     );
                 },
             });

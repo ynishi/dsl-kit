@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-macros` — `#[derive(DslNode)]` / `#[derive(DslSchema)]`
+  now recognise `BTreeMap<String, T>` and `BTreeMap<String, Box<T>>`
+  (where `T` is the derived-on enum itself) as keyed self-recursive
+  child slots. `Walk` / `WalkMut` iterate `.values()` /
+  `.values_mut()` in the map's own (sorted-by-key) order; the schema
+  reports `Multiplicity::Map`. `#[derive(DslBuild)]` emits an
+  `unimplemented!` at the keyed-slot call site (JSON ⇔ AST for keyed
+  slots is scheduled for cycle 3); `#[derive(DslExec)]`
+  collect-children treats keyed slots the same as `Vec<Box<T>>` for
+  ordering. Non-`Box` keyed shapes (`Recursion::Map`) are supported
+  for symmetry with the positional shapes.
 - `dsl-kit-schema` — new `Multiplicity::Map` variant marking a
   string-keyed child slot (`Map<String, V>` shape at the Rust level).
   `Multiplicity::as_str()` returns `"map"` and `NodeSchema::to_json`
