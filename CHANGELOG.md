@@ -45,6 +45,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside an expanded tree stay relative to the source that parsed
   that subtree with no per-subtree source attribution yet — loader
   diagnostics carry the resolution chain instead.
+- `dsl-kit-parse` / `dsl-kit-mcp` — the import graph as data, over
+  MCP. `Loaded::digest()` renders a stable FNV-1a 64 digest of the
+  linked tree + sorted dependency ids (span-insensitive change
+  detector in the spirit of Dhall's normalized hash; hand-rolled so
+  no hashing dependency enters the parse trunk).
+  `MapResolver::from_sources_json` consumes the wire-shape bundle
+  (`{"name": {"json": "…"} | {"text": "…"}}`, flavour always tagged,
+  problems collected as `import::bad_sources`). The `dsl_kit_load`
+  MCP tool takes an optional `sources` object: when present the load
+  routes through the new `DslHost::load_json_bundle` hook (default:
+  not supported) and the success envelope gains an `"imports"`
+  report — `{"dependencies": […], "digest": "…"}` — produced by the
+  host, so the handler stays a pure conduit with no parse-crate
+  dependency. `cfg-host` implements the hook end to end (JSON + text
+  sources through the schema-generated grammar with
+  `add_import_syntax`), and `cfg-example` gains an import-loader
+  demo section (root + 2 sources linked into one document).
 - `dsl-kit-schema` — new `ChildValueShape` enum (`Recursive` /
   `Scalar { ty }`, `#[non_exhaustive]`) plus a `value_shape` field on
   `ChildSchema` that pins what a keyed slot's values *are*, not just

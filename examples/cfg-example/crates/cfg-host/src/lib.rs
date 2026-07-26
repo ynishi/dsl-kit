@@ -283,6 +283,46 @@ impl DslHost for CfgHost {
         self.reset();
         Ok(())
     }
+
+    async fn load_json_bundle(
+        &mut self,
+        input: &str,
+        sources_json: &str,
+    ) -> Result<String, String> {
+        use dsl_kit_parse::DslBuild;
+        use dsl_kit_parse::import::{Loader, MapResolver, add_import_syntax};
+        use dsl_kit_parse::schema_gen::checked_grammar_from_schema;
+        use dsl_kit_schema::DslSchema;
+
+        let mut resolver =
+            MapResolver::from_sources_json(sources_json).map_err(|e| e.to_json().to_string())?;
+        let schema = Cfg::schema();
+        let ids = IdGen::new();
+        // Text sources spell imports as `@import "name"` — same
+        // schema-generated grammar the round-trip tests exercise, with
+        // the reserved spelling injected on top.
+        let mut grammar =
+            checked_grammar_from_schema(&schema, &ids).map_err(|e| e.to_json().to_string())?;
+        add_import_syntax(&mut grammar, &ids).map_err(|e| e.to_json().to_string())?;
+
+        let loaded = Loader::new(&schema)
+            .with_grammar(&grammar)
+            .load_json_str(input, &mut resolver)
+            .map_err(|e| e.to_json().to_string())?;
+        let document =
+            Cfg::from_parse_tree(&loaded.tree, &ids).map_err(|e| e.to_json().to_string())?;
+        self.document = document;
+        self.reset();
+        Ok(serde_json::json!({
+            "dependencies": loaded
+                .dependencies
+                .iter()
+                .map(|d| d.as_str())
+                .collect::<Vec<_>>(),
+            "digest": loaded.digest(),
+        })
+        .to_string())
+    }
 }
 
 fn step_outcome_to_host(outcome: StepOutcome<String>, pending: &[Pending]) -> HostOutcome {

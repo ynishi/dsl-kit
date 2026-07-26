@@ -97,6 +97,55 @@ fn run_schema_generated_grammar_demo() -> miette::Result<()> {
     Ok(())
 }
 
+/// Splits the demo across three sources — a JSON fragment, a text
+/// fragment, and a root that `$import`s both — and links them with the
+/// import loader. Same document as the other sections, assembled from
+/// pieces.
+fn run_import_demo() -> miette::Result<()> {
+    use dsl_kit_parse::import::{Loader, MapResolver, add_import_syntax};
+
+    let ids = IdGen::new();
+    let schema = Cfg::schema();
+    let mut grammar = schema_gen::checked_grammar_from_schema(&schema, &ids)
+        .map_err(|e| miette::miette!("grammar generation failed: {:?}", e.diagnostics))?;
+    add_import_syntax(&mut grammar, &ids)
+        .map_err(|e| miette::miette!("import injection failed: {:?}", e.diagnostics))?;
+
+    let mut resolver = MapResolver::new();
+    resolver.insert_text(
+        "app",
+        r#"Env(bindings: { name: Leaf(value: "dsl-kit"), port: Ref(name: "PORT") })"#,
+    );
+    resolver.insert(
+        "logging",
+        r#"{ "type": "Overrides", "entries": {
+            "10-base": { "type": "Leaf", "value": "info" },
+            "20-prod": { "type": "Leaf", "value": "warn" } } }"#,
+    );
+    let root = r#"Env(bindings: { app: @import "app", log: @import "logging" })"#;
+
+    let loaded = Loader::new(&schema)
+        .with_grammar(&grammar)
+        .load_text(root, &mut resolver)
+        .map_err(|e| miette::miette!("import load failed: {:?}", e.diagnostics))?;
+    let deps: Vec<&str> = loaded.dependencies.iter().map(|d| d.as_str()).collect();
+    println!(
+        "linked {} sources {:?}; graph digest {}",
+        deps.len(),
+        deps,
+        loaded.digest()
+    );
+
+    let document = Cfg::from_parse_tree(&loaded.tree, &IdGen::new())
+        .map_err(|e| miette::miette!("typed build failed: {:?}", e.diagnostics))?;
+    let value = resolve_all(&document, |name| match name {
+        "PORT" => Some("8080".to_string()),
+        _ => None,
+    })?;
+    println!("linked document resolves to {value:?}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     // ---- 1. The document, its keys, and a synchronous resolve ------
@@ -125,6 +174,10 @@ async fn main() -> miette::Result<()> {
     // ---- 3. Text round-trip via the schema-generated grammar -------
     println!("\n=== Schema-generated grammar (text -> typed AST -> resolve) ===");
     run_schema_generated_grammar_demo()?;
+
+    // ---- 3b. The same document assembled from imported sources -----
+    println!("\n=== Import loader (root + 2 sources -> one linked document) ===");
+    run_import_demo()?;
 
     // ---- 4. Driving the same document through DslHost --------------
     println!("\n=== DslHost run ===");

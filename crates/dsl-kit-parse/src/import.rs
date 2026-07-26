@@ -128,6 +128,12 @@ pub mod import_codes {
     /// has no [`Grammar`](crate::peg::Grammar) configured — call
     /// [`Loader::with_grammar`](super::Loader::with_grammar).
     pub const TEXT_UNSUPPORTED: &str = "dsl_kit::parse::import::text_unsupported";
+    /// A sources bundle handed to
+    /// [`MapResolver::from_sources_json`](super::MapResolver::from_sources_json)
+    /// is malformed: not a JSON object, an entry that is not a
+    /// single-key `{"json": "…"}` / `{"text": "…"}` object, or an
+    /// unknown front-end tag.
+    pub const BAD_SOURCES: &str = "dsl_kit::parse::import::bad_sources";
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +242,72 @@ impl MapResolver {
         self.sources
             .insert(name.into(), ImportSource::Text(text.into()));
     }
+
+    /// Builds a resolver from a JSON sources bundle — the wire shape
+    /// MCP-style hosts receive from a client:
+    ///
+    /// ```json
+    /// { "lib":  { "json": "{ \"type\": \"Leaf\", … }" },
+    ///   "frag": { "text": "Leaf(value: \"x\")" } }
+    /// ```
+    ///
+    /// Every entry must be a single-key object tagging the front-end
+    /// explicitly (`json` / `text`) with a string payload — the
+    /// flavour lives in the data, never inferred. Anything else is a
+    /// [`import_codes::BAD_SOURCES`] diagnostic; problems across
+    /// entries are collected before failing.
+    pub fn from_sources_json(sources_json: &str) -> Result<Self, BuildError> {
+        let value: Value = serde_json::from_str(sources_json).map_err(|e| {
+            BuildError::single(Diagnostic::error(
+                import_codes::BAD_SOURCES,
+                format!("sources bundle is not valid JSON: {e}"),
+            ))
+        })?;
+        let Value::Object(map) = value else {
+            return Err(BuildError::single(Diagnostic::error(
+                import_codes::BAD_SOURCES,
+                "sources bundle must be a JSON object mapping names to \
+                 single-key {\"json\": …} / {\"text\": …} objects",
+            )));
+        };
+
+        let mut resolver = Self::new();
+        let mut diags = Vec::new();
+        for (name, entry) in map {
+            let bad = |what: &str| {
+                Diagnostic::error(
+                    import_codes::BAD_SOURCES,
+                    format!(
+                        "source `{name}` {what} (expected a single-key \
+                         {{\"json\": \"…\"}} or {{\"text\": \"…\"}} object)"
+                    ),
+                )
+            };
+            let Value::Object(entry) = entry else {
+                diags.push(bad("is not an object"));
+                continue;
+            };
+            if entry.len() != 1 {
+                diags.push(bad("must carry exactly one front-end key"));
+                continue;
+            }
+            let (kind, payload) = entry.iter().next().expect("len checked");
+            let Value::String(payload) = payload else {
+                diags.push(bad("has a non-string payload"));
+                continue;
+            };
+            match kind.as_str() {
+                "json" => resolver.insert(name, payload.clone()),
+                "text" => resolver.insert_text(name, payload.clone()),
+                other => diags.push(bad(&format!("uses unknown front-end tag `{other}`"))),
+            }
+        }
+        if diags.is_empty() {
+            Ok(resolver)
+        } else {
+            Err(BuildError::new(diags))
+        }
+    }
 }
 
 impl SourceResolver for MapResolver {
@@ -296,6 +368,94 @@ pub struct Loaded {
     /// ascending and deduplicated. Empty when the root document has
     /// no imports.
     pub dependencies: Vec<SourceId>,
+}
+
+impl Loaded {
+    /// Stable digest of the resolved graph: the fully-linked tree's
+    /// content plus the sorted dependency ids, hashed with FNV-1a 64.
+    ///
+    /// Loads that link to the same tree content produce the same
+    /// digest — so "did anything change?" is a single string
+    /// comparison, in the spirit of Dhall's normalized-expression
+    /// hash. Spans are excluded (surface detail: reformatting a
+    /// source must not disturb the digest); field payloads are hashed
+    /// through their [`RawValue`], so the digest is sensitive to
+    /// which front-end parsed a payload (`Text` vs `Json`) — compare
+    /// digests produced by the same front-end mix. Non-cryptographic
+    /// — a change detector, not an integrity check.
+    pub fn digest(&self) -> String {
+        let mut h = Fnv1a::new();
+        feed_tree(&mut h, &self.tree);
+        for d in &self.dependencies {
+            h.write(b"\x1fdep\x1f");
+            h.write(d.as_str().as_bytes());
+        }
+        format!("{:016x}", h.finish())
+    }
+}
+
+/// FNV-1a 64-bit, hand-rolled so the digest is stable across Rust
+/// releases (`DefaultHasher` makes no such promise) without pulling a
+/// hashing dependency into the parse trunk.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Feeds a tree into the digest in a canonical order. `\x1f` (unit
+/// separator) delimits framing so `("ab", "c")` and `("a", "bc")`
+/// cannot collide by concatenation.
+fn feed_tree(h: &mut Fnv1a, tree: &ParseTree) {
+    h.write(b"\x1fnode\x1f");
+    h.write(tree.variant.as_bytes());
+    for (name, value) in &tree.fields {
+        h.write(b"\x1ffield\x1f");
+        h.write(name.as_bytes());
+        h.write(b"\x1f");
+        match value {
+            RawValue::Text(t) => {
+                h.write(b"t\x1f");
+                h.write(t.as_bytes());
+            }
+            // Default serde_json maps are BTree-backed, so `to_string`
+            // is deterministic for equal values.
+            RawValue::Json(v) => {
+                h.write(b"j\x1f");
+                h.write(v.to_string().as_bytes());
+            }
+        }
+    }
+    for (slot, children) in &tree.children {
+        h.write(b"\x1fslot\x1f");
+        h.write(slot.as_bytes());
+        for c in children {
+            feed_tree(h, c);
+        }
+    }
+    for (slot, entries) in &tree.keyed_children {
+        h.write(b"\x1fkeyed\x1f");
+        h.write(slot.as_bytes());
+        for (key, c) in entries {
+            h.write(b"\x1fkey\x1f");
+            h.write(key.as_bytes());
+            feed_tree(h, c);
+        }
+    }
+    h.write(b"\x1fend\x1f");
 }
 
 // ---------------------------------------------------------------------------

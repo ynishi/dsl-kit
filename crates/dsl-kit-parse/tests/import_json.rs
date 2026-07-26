@@ -404,3 +404,75 @@ fn parse_error_inside_import_carries_chain_context() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Graph digest + sources bundle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn digest_is_stable_across_loads_and_sensitive_to_content() {
+    let root = r#"{ "type": "Seq", "items": [ { "$import": "lib" } ] }"#;
+
+    let mut resolver = MapResolver::new();
+    resolver.insert("lib", r#"{ "type": "Leaf", "value": "v1" }"#);
+    let a = load(root, &mut resolver).expect("load a");
+    let b = load(root, &mut resolver).expect("load b");
+    assert_eq!(a.digest(), b.digest(), "identical loads must agree");
+    assert_eq!(a.digest().len(), 16, "FNV-1a 64 as 16 hex digits");
+
+    let mut resolver = MapResolver::new();
+    resolver.insert("lib", r#"{ "type": "Leaf", "value": "v2" }"#);
+    let c = load(root, &mut resolver).expect("load c");
+    assert_ne!(
+        a.digest(),
+        c.digest(),
+        "a changed imported source must move the digest"
+    );
+}
+
+#[test]
+fn digest_ignores_source_formatting() {
+    let mut resolver = MapResolver::new();
+    resolver.insert("lib", r#"{ "type": "Leaf", "value": "x" }"#);
+    let a = load(r#"{ "$import": "lib" }"#, &mut resolver).expect("load");
+
+    let mut resolver = MapResolver::new();
+    resolver.insert("lib", "{\n  \"type\": \"Leaf\",\n  \"value\": \"x\"\n}");
+    let b = load(r#"{ "$import": "lib" }"#, &mut resolver).expect("load");
+    assert_eq!(
+        a.digest(),
+        b.digest(),
+        "whitespace must not move the digest"
+    );
+}
+
+#[test]
+fn sources_bundle_parses_tagged_entries() {
+    let resolver = MapResolver::from_sources_json(
+        r#"{
+            "a": { "json": "{ \"type\": \"Leaf\", \"value\": \"1\" }" },
+            "b": { "text": "Leaf(value: \"2\")" }
+        }"#,
+    );
+    assert!(resolver.is_ok(), "{resolver:?}");
+}
+
+#[test]
+fn malformed_sources_bundle_collects_bad_sources_diagnostics() {
+    let err = MapResolver::from_sources_json(
+        r#"{
+            "not-object": 42,
+            "two-keys": { "json": "x", "text": "y" },
+            "bad-tag": { "toml": "x" },
+            "non-string": { "json": 42 }
+        }"#,
+    )
+    .expect_err("malformed bundle");
+    assert_eq!(err.diagnostics.len(), 4);
+    assert!(
+        err.diagnostics
+            .iter()
+            .all(|d| d.code == import_codes::BAD_SOURCES),
+        "{err}"
+    );
+}

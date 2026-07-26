@@ -383,6 +383,38 @@ pub trait DslHost: Send + Sync {
     async fn load_json(&mut self, _input: &str) -> Result<(), String> {
         Err("load_json not supported by this host".into())
     }
+
+    /// Like [`DslHost::load_json`], but with a named-sources bundle
+    /// for `$import` resolution (see `dsl-kit-parse`'s `import`
+    /// module).
+    ///
+    /// `sources_json` is a JSON object mapping source names to
+    /// single-key `{"json": "…"}` / `{"text": "…"}` objects — the
+    /// exact shape `dsl_kit_parse::import::MapResolver::from_sources_json`
+    /// consumes. Hosts that opt in typically:
+    ///
+    /// 1. Build a `MapResolver` from `sources_json`.
+    /// 2. Run `dsl_kit_parse::import::Loader` over `input` (wiring
+    ///    their grammar via `with_grammar` if text sources should be
+    ///    accepted).
+    /// 3. Build the typed AST from the linked tree, swap it in, reset
+    ///    the stepper.
+    ///
+    /// On success the returned string is a host-produced JSON report —
+    /// by convention `{"dependencies": [<id>, …], "digest": "<hex>"}`
+    /// from `Loaded::dependencies` / `Loaded::digest` — which the
+    /// [`dsl_kit_load`](crate::DslMcpHandler::dsl_kit_load) tool
+    /// embeds under `"imports"` in its success envelope. On failure
+    /// the same serialized-diagnostics contract as
+    /// [`DslHost::load_json`] applies. The handler stays a pure
+    /// conduit: it never parses sources itself.
+    async fn load_json_bundle(
+        &mut self,
+        _input: &str,
+        _sources_json: &str,
+    ) -> Result<String, String> {
+        Err("load_json_bundle not supported by this host".into())
+    }
 }
 
 #[cfg(test)]

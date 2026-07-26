@@ -139,7 +139,18 @@ pub struct LoadParams {
     /// The internally-tagged `"type"` convention selects the variant
     /// at every level; other keys map to declared fields / child slots
     /// per the DSL's schema (see `dsl-kit-parse::serde_bridge`).
+    /// `{"$import": "name"}` at a node position pulls in an entry
+    /// from `sources` (hosts that support bundles only).
     pub input: String,
+    /// Optional named sources for `$import` resolution: an object
+    /// mapping source names to single-key `{"json": "…"}` /
+    /// `{"text": "…"}` objects. When present, the load goes through
+    /// the host's bundle path (`DslHost::load_json_bundle`) and the
+    /// success envelope gains an `"imports"` report (dependencies +
+    /// digest). Hosts that have not opted in reply with a plain
+    /// `"not supported"` error.
+    #[serde(default)]
+    pub sources: Option<serde_json::Map<String, Value>>,
 }
 
 // ---------- Handler state -----------------------------------------------
@@ -529,16 +540,37 @@ impl DslMcpHandler {
         Parameters(params): Parameters<LoadParams>,
     ) -> Result<String, String> {
         let mut guard = self.state.lock().await;
-        match guard.host.load_json(&params.input).await {
-            Ok(()) => {
+        // With a sources bundle the host's import-aware path runs and
+        // its report (dependencies + digest) rides along; without one
+        // the plain path is byte-identical to the pre-bundle tool.
+        let outcome = match &params.sources {
+            Some(sources) => {
+                let sources_json = Value::Object(sources.clone()).to_string();
+                guard
+                    .host
+                    .load_json_bundle(&params.input, &sources_json)
+                    .await
+                    .map(Some)
+            }
+            None => guard.host.load_json(&params.input).await.map(|()| None),
+        };
+        match outcome {
+            Ok(report) => {
                 guard.breakpoints = BreakpointSet::new();
                 let host = &*guard.host;
-                let body = json!({
+                let mut body = json!({
                     "ok": true,
                     "dsl": host.dsl_name(),
                     "root": host.root_node_id(),
                     "ast_size": host.ast_size(),
                 });
+                if let Some(report) = report {
+                    // Host reports are JSON by contract; a prose report
+                    // still surfaces, as a string.
+                    let imports =
+                        serde_json::from_str::<Value>(&report).unwrap_or(Value::String(report));
+                    body["imports"] = imports;
+                }
                 Ok(body.to_string())
             }
             Err(msg) => {

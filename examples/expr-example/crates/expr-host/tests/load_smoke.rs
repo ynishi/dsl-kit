@@ -63,9 +63,12 @@ async fn load_then_lint_then_run_yields_sixteen() {
 
     // Load a fresh program via the tool surface.
     let load = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: program() }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: program(),
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     assert_eq!(load["ok"], true, "load should succeed, got {load}");
     assert_eq!(load["dsl"], "expr");
@@ -130,9 +133,12 @@ async fn load_of_bad_json_returns_diagnostics_envelope() {
     })
     .to_string();
     let out = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: bad }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: bad,
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     assert_eq!(out["ok"], false, "expected failure, got {out}");
     let diagnostics = out["diagnostics"]
@@ -157,16 +163,22 @@ async fn ids_restart_on_reload() {
     let h = handler();
 
     let a = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: program() }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: program(),
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     let root_a = a["root"].as_u64().unwrap();
 
     let b = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: program() }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: program(),
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     let root_b = b["root"].as_u64().unwrap();
 
@@ -181,7 +193,10 @@ async fn ids_restart_on_reload() {
 async fn resolve_after_load_records_result() {
     let h = handler();
     let _ = h
-        .dsl_kit_load(Parameters(LoadParams { input: program() }))
+        .dsl_kit_load(Parameters(LoadParams {
+            input: program(),
+            sources: None,
+        }))
         .await
         .unwrap();
 
@@ -205,4 +220,29 @@ async fn resolve_after_load_records_result() {
         .unwrap(),
     );
     assert_eq!(resolved["resolved"]["result"], "5");
+}
+
+#[tokio::test]
+async fn a_sources_bundle_on_a_non_bundle_host_is_a_plain_error() {
+    // ExprHost implements `load_json` but not `load_json_bundle`, so a
+    // request carrying `sources` lands on the trait default — pinned
+    // here so hosts that skip the import surface degrade loudly, not
+    // by silently ignoring the sources.
+    let h = handler();
+    let out = parse(
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: program(),
+            sources: Some(serde_json::Map::new()),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(out["ok"], false, "got {out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .expect("plain error string")
+            .contains("not supported"),
+        "got {out}"
+    );
 }

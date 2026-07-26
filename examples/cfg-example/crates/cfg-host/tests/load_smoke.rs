@@ -70,9 +70,12 @@ async fn load_accepts_a_keyed_document_and_the_ast_keeps_its_keys() {
     let h = handler();
 
     let load = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: document() }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: document(),
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     assert_eq!(load["ok"], true, "load should succeed, got {load}");
     assert_eq!(load["dsl"], "cfg");
@@ -94,7 +97,10 @@ async fn load_accepts_a_keyed_document_and_the_ast_keeps_its_keys() {
 async fn step_and_resolve_walk_a_keyed_document_to_its_value() {
     let h = handler();
     let _ = h
-        .dsl_kit_load(Parameters(LoadParams { input: document() }))
+        .dsl_kit_load(Parameters(LoadParams {
+            input: document(),
+            sources: None,
+        }))
         .await
         .unwrap();
 
@@ -149,9 +155,12 @@ async fn a_keyed_slot_given_a_list_fails_with_a_diagnostics_envelope() {
     .to_string();
 
     let out = parse(
-        &h.dsl_kit_load(Parameters(LoadParams { input: bad }))
-            .await
-            .unwrap(),
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: bad,
+            sources: None,
+        }))
+        .await
+        .unwrap(),
     );
     assert_eq!(out["ok"], false, "expected failure, got {out}");
     let diagnostics = out["diagnostics"].as_array().expect("diagnostics array");
@@ -178,6 +187,7 @@ async fn a_repeated_key_is_reported_rather_than_dropped() {
     let out = parse(
         &h.dsl_kit_load(Parameters(LoadParams {
             input: bad.to_string(),
+            sources: None,
         }))
         .await
         .unwrap(),
@@ -188,4 +198,97 @@ async fn a_repeated_key_is_reported_rather_than_dropped() {
     // difference between the two doors stays visible.
     assert_eq!(out["ok"], true, "got {out}");
     assert_eq!(out["ast_size"].as_u64().unwrap(), 2);
+}
+
+/// A root that pulls one JSON fragment and one canonical-text
+/// fragment through `$import`.
+fn bundle() -> (String, serde_json::Map<String, Value>) {
+    let input = json!({
+        "type": "Env",
+        "bindings": {
+            "app": { "$import": "app" },
+            "log": { "$import": "logging" },
+        },
+    })
+    .to_string();
+    let sources = json!({
+        "app": { "text": r#"Leaf(value: "from text")"# },
+        "logging": {
+            "json": json!({
+                "type": "Overrides",
+                "entries": { "10-base": { "type": "Leaf", "value": "info" } },
+            })
+            .to_string()
+        },
+    });
+    let Value::Object(sources) = sources else {
+        unreachable!("bundle sources are an object")
+    };
+    (input, sources)
+}
+
+#[tokio::test]
+async fn load_with_sources_expands_imports_and_reports_the_graph() {
+    let h = handler();
+    let (input, sources) = bundle();
+    let load = parse(
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input,
+            sources: Some(sources),
+        }))
+        .await
+        .unwrap(),
+    );
+
+    assert_eq!(load["ok"], true, "bundle load should succeed, got {load}");
+    // Graph as data: sorted canonical ids plus a 16-hex-digit digest.
+    assert_eq!(load["imports"]["dependencies"], json!(["app", "logging"]));
+    let digest = load["imports"]["digest"].as_str().expect("digest string");
+    assert_eq!(digest.len(), 16, "FNV-1a 64 hex digest, got {digest}");
+    // Env + 2 spliced subtrees (Leaf, Overrides+Leaf) = 4 nodes.
+    assert_eq!(load["ast_size"].as_u64().unwrap(), 4);
+}
+
+#[tokio::test]
+async fn bundle_digest_is_stable_across_identical_loads() {
+    let h = handler();
+    let (input, sources) = bundle();
+    let a = parse(
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: input.clone(),
+            sources: Some(sources.clone()),
+        }))
+        .await
+        .unwrap(),
+    );
+    let b = parse(
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input,
+            sources: Some(sources),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(a["imports"]["digest"], b["imports"]["digest"]);
+}
+
+#[tokio::test]
+async fn a_missing_bundle_source_reports_diagnostics() {
+    let h = handler();
+    let out = parse(
+        &h.dsl_kit_load(Parameters(LoadParams {
+            input: json!({ "$import": "nowhere" }).to_string(),
+            sources: Some(serde_json::Map::new()),
+        }))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(out["ok"], false, "got {out}");
+    let diagnostics = out["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == "dsl_kit::parse::import::fetch_failed"),
+        "got {out}"
+    );
 }
