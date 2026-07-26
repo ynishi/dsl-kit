@@ -249,28 +249,41 @@ pub fn grammar_from_schema_with(
                 Multiplicity::One | Multiplicity::Optional | Multiplicity::Many => {}
                 // Keyed slots come in two value shapes at derive
                 // level: recursive (`BTreeMap<String, Self>` /
-                // `BTreeMap<String, Box<Self>>`) is supported by the
-                // canonical text syntax; scalar
+                // `BTreeMap<String, Box<Self>>`) and scalar
                 // (`ChildValueShape::Scalar { .. }`, Shape 1 of the
-                // tracking issue) has not grown a text production
-                // yet — `child_arg_peg` would emit
-                // `key: <node>` for every entry, producing an
-                // unusable grammar. Fail loudly instead so the DSL
-                // author is directed to the JSON front-end.
+                // tracking issue). Both are supported by the
+                // canonical text syntax as of dsl-kit 0.7; scalar
+                // values reuse the built-in payload-type mapping
+                // (`field_value_peg`) — same names, same productions
+                // — so any type the payload path can spell
+                // (`String` / integer / `bool` / …) works in a keyed
+                // slot too. A scalar value with no built-in mapping
+                // is still an error here: `child_arg_peg`'s
+                // downstream `.expect(...)` would panic otherwise,
+                // and the DSL author needs a pointer to
+                // `SyntaxOverrides` or a real bug report either way.
                 Multiplicity::Map => {
                     if let ChildValueShape::Scalar { ty } = &c.value_shape {
-                        pre_flight.push(Diagnostic::error(
-                            codes::UNSUPPORTED_MAP_VALUE_SHAPE,
-                            format!(
-                                "variant `{}` child slot `{}`: keyed scalar values \
-                                 (`BTreeMap<String, {}>`) are recognised by the derive and \
-                                 the JSON front-end, but the canonical text syntax has no \
-                                 production for them yet — use the JSON front-end for \
-                                 scalar-map DSLs, or open the tracking issue if the text \
-                                 syntax is needed",
-                                v.name, c.name, ty
-                            ),
-                        ));
+                        let synthetic = FieldSchema {
+                            name: "value".into(),
+                            ty: ty.clone(),
+                            optional: false,
+                        };
+                        if field_value_peg(&synthetic, ids).is_none() {
+                            pre_flight.push(Diagnostic::error(
+                                codes::UNSUPPORTED_MAP_VALUE_SHAPE,
+                                format!(
+                                    "variant `{}` child slot `{}`: keyed scalar value type \
+                                     `{}` has no canonical-syntax mapping (supported: \
+                                     String, bool, the integer types, Option<String>, \
+                                     Vec<String>). Register a `SyntaxOverrides` value \
+                                     production for the surrounding payload field of the \
+                                     same type, or use the JSON front-end where scalar \
+                                     entries are dispatched through serde",
+                                    v.name, c.name, ty
+                                ),
+                            ));
+                        }
                     }
                 }
                 // `#[non_exhaustive]` catch-all: a future Multiplicity
@@ -557,12 +570,52 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
             // in the key itself. On the value side it is dropped as
             // syntactic noise, the same way the `Many` list's commas
             // are.
+            //
+            // The value half branches on `value_shape`:
+            //
+            // - `Recursive` (`BTreeMap<String, Self>` /
+            //   `BTreeMap<String, Box<Self>>`) → the value is a full
+            //   AST node, produced by `rule_ref(START_RULE)`.
+            //
+            // - `Scalar { ty }` (`BTreeMap<String, String>` /
+            //   `BTreeMap<String, i64>` / …) → the value is a scalar
+            //   payload wrapped in a synthetic leaf `Node` whose
+            //   single `Field` is named `value`. That matches the
+            //   canonical entry shape the JSON bridge emits (see
+            //   `serde_bridge::build_scalar_keyed_slot`) so
+            //   `build_scalar_map` reads `.field("value")` from each
+            //   entry regardless of front-end.
+            //
+            // The `_ =>` fallback keeps the recursive spelling for
+            // any future `ChildValueShape` variant this build does
+            // not yet know about; the pre-flight check in
+            // `grammar_from_schema_with` rejects those cases with
+            // `UNSUPPORTED_MAP_VALUE_SHAPE`, so `child_arg_peg` never
+            // sees an unrecognised shape at run time.
+            let value_prod = |ids: &IdGen| -> Peg {
+                match &c.value_shape {
+                    ChildValueShape::Recursive => rule_ref(ids, START_RULE),
+                    ChildValueShape::Scalar { ty } => {
+                        let synthetic = FieldSchema {
+                            name: "value".into(),
+                            ty: ty.clone(),
+                            optional: false,
+                        };
+                        let scalar = field_value_peg(&synthetic, ids).expect(
+                            "scalar-map value type rejected by pre-flight; \
+                             child_arg_peg must not see it",
+                        );
+                        node(ids, "", field(ids, "value", scalar))
+                    }
+                    _ => rule_ref(ids, START_RULE),
+                }
+            };
             let entry = |ids: &IdGen| -> Peg {
                 keyed_entry(
                     ids,
                     c.name.clone(),
                     choice(ids, vec![token(ids, "%str"), token(ids, "%ident")]),
-                    seq(ids, vec![token(ids, ":"), rule_ref(ids, START_RULE)]),
+                    seq(ids, vec![token(ids, ":"), value_prod(ids)]),
                 )
             };
             let entries = seq(
@@ -910,23 +963,48 @@ mod tests {
         );
     }
 
-    /// A scalar-valued keyed slot is recognised by the derive and
-    /// the JSON front-end, but the canonical text syntax has no
-    /// production for it yet — `grammar_from_schema` must fail
-    /// loudly with [`codes::UNSUPPORTED_MAP_VALUE_SHAPE`] rather
-    /// than silently emit a grammar that expects each entry's value
-    /// to be a full AST node. Pins the pre-flight guard so a
-    /// downstream feeding a Shape 1 schema through PEG generation
-    /// gets a clear pointer to the JSON front-end instead of an
-    /// opaque parse failure.
+    /// A scalar-valued keyed slot whose value type has a built-in
+    /// canonical-syntax mapping (`String`, integer, `bool`, …)
+    /// generates a grammar cleanly — the same built-in mapping the
+    /// payload path already uses is reused for the keyed-entry
+    /// value slot, wrapped in a synthetic leaf node carrying the
+    /// `value` field so `build_scalar_map` reads it back
+    /// canonically. Pins the "text syntax landed for Shape 1"
+    /// contract so a regression to the pre-0.7 "loud fail" spelling
+    /// is impossible to ship.
     #[test]
-    fn scalar_keyed_slot_fails_grammar_generation_loudly() {
+    fn scalar_keyed_slot_with_builtin_type_generates_grammar() {
         let schema = NodeSchema {
             name: "Cfg".into(),
             variants: vec![VariantSchema {
                 name: "Env".into(),
                 fields: vec![],
                 children: vec![ChildSchema::scalar_map("entries", "String")],
+            }],
+        };
+        grammar_from_schema(&schema, &IdGen::new()).expect(
+            "String is a built-in scalar; the pre-flight must accept it and \
+             child_arg_peg must emit a grammar rule that wraps each entry's \
+             value as a `value`-field leaf",
+        );
+    }
+
+    /// A scalar-valued keyed slot whose value type has no built-in
+    /// mapping (and no `SyntaxOverrides` entry — `child_arg_peg`
+    /// does not yet thread overrides into the keyed-entry value
+    /// slot) still fails loudly at grammar-generation time with
+    /// [`codes::UNSUPPORTED_MAP_VALUE_SHAPE`]. The diagnostic
+    /// message points the DSL author at the JSON front-end and the
+    /// override path so they never see the raw
+    /// `child_arg_peg` `.expect(...)` panic downstream.
+    #[test]
+    fn scalar_keyed_slot_with_unmapped_type_fails_grammar_generation_loudly() {
+        let schema = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![VariantSchema {
+                name: "Env".into(),
+                fields: vec![],
+                children: vec![ChildSchema::scalar_map("entries", "JoinPolicy")],
             }],
         };
         let err = grammar_from_schema(&schema, &IdGen::new()).unwrap_err();
@@ -938,7 +1016,7 @@ mod tests {
             err.diagnostics[0].message
         );
         assert!(
-            err.diagnostics[0].message.contains("String"),
+            err.diagnostics[0].message.contains("JoinPolicy"),
             "diagnostic mentions the scalar value type: {}",
             err.diagnostics[0].message
         );

@@ -205,6 +205,18 @@ pub fn check_schema_consistency_with(
     for r in &g.rules {
         walk_peg(r, &mut |p| {
             if let Peg::Node { id, variant, .. } = p {
+                // Empty-variant `Peg::Node` is a synthetic leaf
+                // wrapper (e.g. the scalar-keyed-entry envelope
+                // `child_arg_peg` emits so `build_scalar_map` can
+                // read `.field("value")` on each entry). Its variant
+                // name is a marker, not a real AST variant to match
+                // against the schema, so exclude it from the
+                // declared/unknown gate. Reachability of real
+                // variants is unaffected: the wrapper never
+                // stand-ins for a declared variant.
+                if variant.is_empty() {
+                    return;
+                }
                 referenced.insert(variant.clone());
                 if !declared.contains(variant.as_str()) {
                     let base = format!(

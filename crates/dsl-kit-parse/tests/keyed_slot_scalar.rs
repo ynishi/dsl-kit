@@ -19,13 +19,18 @@
 //!   [`codes::DUPLICATE_KEY`] rather than silently overwriting;
 //! - `NodeSchema::to_json` emits the new `value` object so external
 //!   consumers (editors / MCP clients) see the scalar shape without
-//!   having to guess.
+//!   having to guess;
+//! - the canonical **text** front-end routes scalar values through
+//!   the same `build_scalar_map` helper (via a synthetic
+//!   `value`-field leaf node) so a scalar-map DSL reads the same
+//!   way in JSON and in text, and the two front-ends land on
+//!   byte-identical `BTreeMap` results.
 
 use dsl_kit_core::{IdGen, NodeId};
 use dsl_kit_macros::{DslBuild, DslNode, DslSchema};
 use dsl_kit_parse::{
     DslBuild, ParseTree, RawValue, build_scalar_map, check_conformance, codes,
-    serde_bridge::from_json_value,
+    schema_gen::checked_grammar_from_schema, serde_bridge::from_json_value,
 };
 use dsl_kit_schema::{ChildValueShape, DslSchema, Multiplicity};
 use serde_json::json;
@@ -298,4 +303,134 @@ fn build_scalar_map_is_reachable_from_hand_written_impls() {
     let empty: BTreeMap<String, String> =
         build_scalar_map(&ParseTree::new("StringEnv"), "entries").expect("absent slot ok");
     assert!(empty.is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Canonical text front-end (PEG grammar generated from the schema)
+// -----------------------------------------------------------------------
+//
+// The tests below drive the *same* `EnvCfg` schema through the text
+// path — schema → `checked_grammar_from_schema` → parsed source →
+// `#[derive(DslBuild)]` — so the shape agreement between the two
+// front-ends is pinned instead of trusted. A DSL author writes the
+// Rust type once and gets JSON and text both landing on the same
+// `BTreeMap<String, V>`.
+
+/// Parses `input` with the schema-derived grammar and builds the AST,
+/// asserting conformance on the way through. Panics with the offending
+/// source on any failure so a text regression is easy to diagnose.
+fn build_from_text(input: &str) -> EnvCfg {
+    let schema = EnvCfg::schema();
+    let grammar = checked_grammar_from_schema(&schema, &IdGen::new()).expect(
+        "scalar-map schema generates a clean grammar (Shape 1 text path landed in dsl-kit 0.7)",
+    );
+    let tree = grammar
+        .parse(input)
+        .unwrap_or_else(|e| panic!("parse failed for {input:?}: {:?}", e.diagnostics));
+    let diags = check_conformance(&tree, &schema);
+    assert!(
+        diags.is_empty(),
+        "conformance clean for {input:?}: {diags:?}"
+    );
+    EnvCfg::from_parse_tree(&tree, &IdGen::new())
+        .unwrap_or_else(|e| panic!("build failed for {input:?}: {:?}", e.diagnostics))
+}
+
+/// A scalar string map written in canonical text lands as
+/// `BTreeMap<String, String>`, sorted, with both key spellings
+/// (bare `%ident` and quoted `%str`) accepted — same contract as the
+/// recursive keyed slot's text form, extended to scalar values.
+#[test]
+fn text_string_scalar_map_builds_through_to_typed_ast() {
+    let cfg = build_from_text(
+        r#"StringEnv(entries: { "PATH": "/usr/bin:/bin", HOME: "/home/dev", SHELL: "/bin/bash" })"#,
+    );
+    let EnvCfg::StringEnv { entries, .. } = cfg else {
+        panic!("expected StringEnv variant");
+    };
+    assert_eq!(entries.get("HOME").map(String::as_str), Some("/home/dev"));
+    assert_eq!(
+        entries.get("PATH").map(String::as_str),
+        Some("/usr/bin:/bin")
+    );
+    assert_eq!(entries.get("SHELL").map(String::as_str), Some("/bin/bash"));
+    assert_eq!(entries.len(), 3);
+}
+
+/// An integer scalar map exercises a non-`String` payload type so the
+/// grammar generator's built-in mapping (`%int`) is verified end to
+/// end — the derive picks the scalar branch, `child_arg_peg` reads
+/// the value type off `ChildValueShape::Scalar { ty }`, and
+/// `build_scalar_map::<i64>` deserializes each `value` field.
+#[test]
+fn text_integer_scalar_map_builds_through_to_typed_ast() {
+    let cfg = build_from_text("Knobs(entries: { max_retries: 3, timeout_ms: 5000 })");
+    let EnvCfg::Knobs { entries, .. } = cfg else {
+        panic!("expected Knobs variant");
+    };
+    assert_eq!(entries.get("max_retries").copied(), Some(3));
+    assert_eq!(entries.get("timeout_ms").copied(), Some(5000));
+    assert_eq!(entries.len(), 2);
+}
+
+/// An empty scalar map parses and lands as an empty `BTreeMap` — the
+/// keyed-entries repeat is `Some(1)`-optional exactly so this shape
+/// is legal at the grammar level, matching `Multiplicity::Map`'s
+/// zero-or-more semantics.
+#[test]
+fn text_empty_scalar_map_lands_as_empty_btreemap() {
+    let cfg = build_from_text("StringEnv(entries: {})");
+    let EnvCfg::StringEnv { entries, .. } = cfg else {
+        panic!("expected StringEnv variant");
+    };
+    assert!(
+        entries.is_empty(),
+        "empty text map must land as empty BTreeMap"
+    );
+}
+
+/// A scalar keyed slot and a recursive keyed slot coexist on the
+/// same enum: both text productions must generate without stepping
+/// on each other. Exercises the `value_shape` branch in
+/// `child_arg_peg` for both directions from a single grammar.
+#[test]
+fn text_recursive_and_scalar_keyed_slots_coexist() {
+    // Recursive path (contrast) — the JSON test above already covers
+    // build correctness for `Nested`, so here we just prove the
+    // grammar generator does not reject the mixed schema.
+    let schema = EnvCfg::schema();
+    checked_grammar_from_schema(&schema, &IdGen::new())
+        .expect("mixed scalar + recursive keyed schema generates cleanly");
+
+    // Round-trip a scalar slot to confirm the shared grammar routes
+    // scalar entries through the synthetic `value` leaf.
+    let cfg = build_from_text("StringEnv(entries: { a: \"1\" })");
+    let EnvCfg::StringEnv { entries, .. } = cfg else {
+        panic!("expected StringEnv variant");
+    };
+    assert_eq!(entries.get("a").map(String::as_str), Some("1"));
+}
+
+/// JSON and text front-ends land on byte-identical `BTreeMap`s for
+/// the same logical document. Pins the "one Rust type, two
+/// front-ends, one shape" contract that motivates the scalar-map
+/// text work in the first place.
+#[test]
+fn json_and_text_scalar_maps_agree_on_the_same_document() {
+    let json_cfg = {
+        let value = json!({
+            "type": "StringEnv",
+            "entries": { "HOME": "/h", "PATH": "/p" },
+        });
+        let tree = from_json_value(&value, &EnvCfg::schema()).expect("JSON parses");
+        EnvCfg::from_parse_tree(&tree, &IdGen::new()).expect("JSON builds")
+    };
+    let text_cfg = build_from_text(r#"StringEnv(entries: { HOME: "/h", PATH: "/p" })"#);
+
+    let (EnvCfg::StringEnv { entries: j, .. }, EnvCfg::StringEnv { entries: t, .. }) =
+        (&json_cfg, &text_cfg)
+    else {
+        panic!("expected both to be StringEnv");
+    };
+    assert_eq!(j, t, "JSON and text front-ends must land on identical maps");
 }

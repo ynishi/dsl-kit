@@ -51,13 +51,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `value`-field leaf so `build_scalar_map` can read it back
   canonically. Keys sorted on ingest so two spellings of the same map
   produce byte-identical trees, matching the recursive keyed path.
-  **Scope caveat:** the PEG grammar generator
-  (`schema_gen::grammar_from_schema`), canonical text syntax, example
-  generator, and `dsl-kit-lint` duplicate-key rule do **not** yet
-  route on the scalar shape — a scalar-map schema fed through those
-  paths currently produces a grammar that expects each entry's value
-  to be a full AST node. Use the JSON front-end for scalar-map DSLs
-  until the text-side surface catches up (tracked in gh #5).
+- `dsl-kit-parse` — canonical text syntax now covers scalar keyed
+  slots too. `schema_gen::grammar_from_schema` routes each
+  `ChildValueShape::Scalar { ty }` entry through the built-in
+  payload mapping (`String → %str`, integer → `%int`,
+  `bool → true|false`, and the `Option<String>` / `Vec<String>`
+  entries the payload path already recognises) and wraps the value
+  in a synthetic `value`-field leaf so `build_scalar_map` reads it
+  back the same way as the JSON path. `grammar_check` treats
+  empty-variant `Peg::Node` as the scalar-entry wrapper marker
+  rather than an unknown variant. Scalar value types outside the
+  built-in mapping still fail loudly at pre-flight with
+  `schema_gen::codes::UNSUPPORTED_MAP_VALUE_SHAPE`; register a
+  `SyntaxOverrides` value production for the same type on any
+  payload field to unlock them (Shape 2 = keyed slots whose values
+  are a *different* AST enum remains staged per gh #5).
 - `dsl-kit-macros` — `#[derive(DslNode)]` / `#[derive(DslSchema)]`
   now recognise `BTreeMap<String, T>` and `BTreeMap<String, Box<T>>`
   (where `T` is the derived-on enum itself) as keyed self-recursive
