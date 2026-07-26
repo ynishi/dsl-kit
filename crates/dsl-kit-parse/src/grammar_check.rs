@@ -217,6 +217,14 @@ pub fn check_schema_consistency_with(
                 if variant.is_empty() {
                     return;
                 }
+                // The reserved import placeholder (`$import`, injected
+                // by `crate::import::add_import_syntax`) is a load-phase
+                // marker, never a schema variant: the loader splices it
+                // away before conformance, so matching it against the
+                // schema would flag every import-enabled grammar.
+                if variant == crate::import::IMPORT_VARIANT {
+                    return;
+                }
                 referenced.insert(variant.clone());
                 if !declared.contains(variant.as_str()) {
                     let base = format!(

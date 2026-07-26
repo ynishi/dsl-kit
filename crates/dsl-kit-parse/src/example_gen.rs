@@ -93,6 +93,13 @@ pub fn examples_from_grammar(grammar: &Grammar) -> Result<GrammarExamples, Build
         if *name == grammar.start {
             continue;
         }
+        // The reserved import rule (`$import`, injected by
+        // `crate::import::add_import_syntax`) is load-phase plumbing:
+        // examples exist to teach the DSL itself, so `@import "…"`
+        // never appears in them.
+        if name == crate::import::IMPORT_VARIANT {
+            continue;
+        }
         let mut tokens = Vec::new();
         synth.emit(body, 0, &mut tokens)?;
         per_rule.push(RuleExample {
@@ -276,9 +283,14 @@ impl<'g> Synth<'g> {
 
     /// Chooses a choice arm: cheapest finite derivation in minimal
     /// mode, most expensive finite one in rich mode (ties: first).
+    ///
+    /// Arms reaching the reserved import rule are never picked —
+    /// `@import "…"` is load-phase plumbing, not the DSL the examples
+    /// teach (see `crate::import::add_import_syntax`).
     fn pick_arm<'p>(&self, alts: &'p [Peg], rich_depth: u32) -> Result<&'p Peg, BuildError> {
         let finite = alts
             .iter()
+            .filter(|a| !is_import_arm(a))
             .map(|a| (a, peg_cost(a, &self.costs)))
             .filter(|(_, c)| *c != INFINITE);
         let picked = if rich_depth > 0 {
@@ -292,6 +304,16 @@ impl<'g> Synth<'g> {
                 "choice has no finite alternative".to_string(),
             ))
         })
+    }
+}
+
+/// Whether a choice arm reaches the reserved `$import` rule / node
+/// (see `pick_arm`).
+fn is_import_arm(peg: &Peg) -> bool {
+    match peg {
+        Peg::RuleRef { name, .. } => name == crate::import::IMPORT_VARIANT,
+        Peg::Node { variant, .. } => variant == crate::import::IMPORT_VARIANT,
+        _ => false,
     }
 }
 

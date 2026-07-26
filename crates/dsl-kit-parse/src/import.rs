@@ -33,7 +33,9 @@
 //! Front-ends represent an import site as a [`ParseTree`] whose
 //! variant is [`IMPORT_VARIANT`] (`"$import"`) carrying a single
 //! [`IMPORT_SPEC_FIELD`] (`"spec"`) payload. The JSON bridge produces
-//! it from `{"$import": "name"}` at any node position. The loader
+//! it from `{"$import": "name"}` at any node position; the canonical
+//! text front-end spells the same placeholder `@import "name"` once
+//! [`add_import_syntax`] has been applied to the grammar. The loader
 //! replaces each placeholder with the parsed-and-expanded tree of the
 //! resolved source; placeholders never survive into conformance — a
 //! leftover one is a [`import_codes::UNEXPANDED`] diagnostic there.
@@ -41,6 +43,22 @@
 //! Sharing is by value: two sites importing the same source each
 //! receive a clone of the expanded tree. Node identity is minted later
 //! (by [`DslBuild`] via `IdGen`), so clones cannot collide.
+//!
+//! ## Front-ends and mixing
+//!
+//! A fetched source declares its front-end via [`ImportSource`]:
+//! `Json` parses through [`serde_bridge::from_json_str`], `Text`
+//! through the [`Loader`]'s configured [`Grammar`]. The two mix
+//! freely — a text root may import JSON sources and vice versa —
+//! because both land in the same [`ParseTree`] trunk before splicing.
+//! A `Text` source arriving at a [`Loader`] with no grammar is a
+//! loud [`import_codes::TEXT_UNSUPPORTED`] failure, not a fallback.
+//!
+//! One known limitation: [`ParseTree::span`]s inside an expanded tree
+//! are byte offsets **relative to the source that parsed that
+//! subtree**, and the tree does not record which source that is.
+//! Loader diagnostics carry the resolution chain instead; per-subtree
+//! source attribution is a planned follow-up.
 //!
 //! ## Example
 //!
@@ -56,7 +74,9 @@
 //!
 //! [`DslBuild`]: crate::DslBuild
 
+use crate::peg::{self, Grammar, Peg};
 use crate::{BuildError, Diagnostic, ParseTree, RawValue, serde_bridge};
+use dsl_kit_core::IdGen;
 use dsl_kit_schema::NodeSchema;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -103,6 +123,11 @@ pub mod import_codes {
     /// reached [`check_conformance`](crate::check_conformance) —
     /// the document was not run through the loader.
     pub const UNEXPANDED: &str = "dsl_kit::parse::import::unexpanded";
+    /// A [`ImportSource::Text`](super::ImportSource::Text) source was
+    /// fetched (or a text root was loaded) but the [`Loader`](super::Loader)
+    /// has no [`Grammar`](crate::peg::Grammar) configured — call
+    /// [`Loader::with_grammar`](super::Loader::with_grammar).
+    pub const TEXT_UNSUPPORTED: &str = "dsl_kit::parse::import::text_unsupported";
 }
 
 // ---------------------------------------------------------------------------
@@ -141,14 +166,19 @@ impl fmt::Display for SourceId {
 /// A fetched source document, tagged with the front-end that should
 /// parse it.
 ///
-/// `#[non_exhaustive]`: a `Text` arm (PEG front-end) is planned; match
-/// with a catch-all.
+/// `#[non_exhaustive]`: further front-ends may be added; match with a
+/// catch-all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ImportSource {
     /// A JSON document, parsed through
     /// [`serde_bridge::from_json_str`].
     Json(String),
+    /// A canonical-text document, parsed through the [`Loader`]'s
+    /// configured [`Grammar`]. Requires [`Loader::with_grammar`];
+    /// otherwise the fetch fails with
+    /// [`import_codes::TEXT_UNSUPPORTED`].
+    Text(String),
 }
 
 /// Host-supplied import IO: turns literal specifiers into canonical
@@ -178,7 +208,7 @@ pub trait SourceResolver {
 }
 
 /// The canonical sandboxed [`SourceResolver`]: a map of named
-/// in-memory JSON sources.
+/// in-memory sources.
 ///
 /// Specifiers are used verbatim as canonical ids. Nothing outside the
 /// map is reachable, which makes this the default-deny resolver shape
@@ -186,7 +216,7 @@ pub trait SourceResolver {
 /// inline.
 #[derive(Debug, Clone, Default)]
 pub struct MapResolver {
-    sources: BTreeMap<String, String>,
+    sources: BTreeMap<String, ImportSource>,
 }
 
 impl MapResolver {
@@ -197,7 +227,14 @@ impl MapResolver {
 
     /// Registers (or replaces) a named JSON source.
     pub fn insert(&mut self, name: impl Into<String>, json: impl Into<String>) {
-        self.sources.insert(name.into(), json.into());
+        self.sources
+            .insert(name.into(), ImportSource::Json(json.into()));
+    }
+
+    /// Registers (or replaces) a named canonical-text source.
+    pub fn insert_text(&mut self, name: impl Into<String>, text: impl Into<String>) {
+        self.sources
+            .insert(name.into(), ImportSource::Text(text.into()));
     }
 }
 
@@ -208,7 +245,7 @@ impl SourceResolver for MapResolver {
 
     fn fetch(&mut self, id: &SourceId) -> Result<ImportSource, String> {
         match self.sources.get(id.as_str()) {
-            Some(json) => Ok(ImportSource::Json(json.clone())),
+            Some(source) => Ok(source.clone()),
             None => Err(format!("no source registered under `{id}`")),
         }
     }
@@ -265,24 +302,124 @@ pub struct Loaded {
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Parses a root JSON document and expands its imports to a fixpoint.
+/// Import loader: a schema, an optional text [`Grammar`], and the
+/// expansion limits, bundled so every front-end entry point shares one
+/// configuration.
 ///
-/// The root is parsed with [`serde_bridge::from_json_str`], then every
-/// [`IMPORT_VARIANT`] placeholder — at any depth, in positional and
-/// keyed child slots alike — is resolved through `resolver`, parsed,
-/// recursively expanded, and spliced in place. Diagnostics from
-/// distinct import sites are collected before failing; diagnostics
-/// from *inside* an imported source are prefixed with an
-/// [`import_codes::IN_IMPORT`] context marker naming the source and
-/// the resolution chain.
+/// Every load walks the same pipeline: parse the root with its
+/// front-end, then resolve every [`IMPORT_VARIANT`] placeholder — at
+/// any depth, in positional and keyed child slots alike — through the
+/// caller's [`SourceResolver`], parse each fetched source with the
+/// front-end its [`ImportSource`] arm names, recursively expand, and
+/// splice in place. Diagnostics from distinct import sites are
+/// collected before failing; diagnostics from *inside* an imported
+/// source are prefixed with an [`import_codes::IN_IMPORT`] context
+/// marker naming the source and the resolution chain.
+#[derive(Debug, Clone)]
+pub struct Loader<'a> {
+    schema: &'a NodeSchema,
+    grammar: Option<&'a Grammar>,
+    limits: ImportLimits,
+}
+
+impl<'a> Loader<'a> {
+    /// Constructs a loader with default [`ImportLimits`] and no text
+    /// grammar (JSON sources only).
+    pub fn new(schema: &'a NodeSchema) -> Self {
+        Self {
+            schema,
+            grammar: None,
+            limits: ImportLimits::default(),
+        }
+    }
+
+    /// Enables the canonical text front-end: text roots and
+    /// [`ImportSource::Text`] sources parse through `grammar`.
+    ///
+    /// Pass a grammar that has been through [`add_import_syntax`],
+    /// otherwise text sources cannot spell `@import` themselves.
+    pub fn with_grammar(mut self, grammar: &'a Grammar) -> Self {
+        self.grammar = Some(grammar);
+        self
+    }
+
+    /// Replaces the default [`ImportLimits`].
+    pub fn with_limits(mut self, limits: ImportLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Loads a JSON root document and expands its imports to a
+    /// fixpoint.
+    pub fn load_json_str(
+        &self,
+        root: &str,
+        resolver: &mut dyn SourceResolver,
+    ) -> Result<Loaded, BuildError> {
+        let tree = serde_bridge::from_json_str(root, self.schema)?;
+        self.expand_root(tree, resolver)
+    }
+
+    /// [`Loader::load_json_str`] over an already-deserialized
+    /// [`serde_json::Value`].
+    pub fn load_json_value(
+        &self,
+        root: &Value,
+        resolver: &mut dyn SourceResolver,
+    ) -> Result<Loaded, BuildError> {
+        let tree = serde_bridge::from_json_value(root, self.schema)?;
+        self.expand_root(tree, resolver)
+    }
+
+    /// Loads a canonical-text root document and expands its imports
+    /// to a fixpoint. Requires [`Loader::with_grammar`].
+    pub fn load_text(
+        &self,
+        root: &str,
+        resolver: &mut dyn SourceResolver,
+    ) -> Result<Loaded, BuildError> {
+        let Some(grammar) = self.grammar else {
+            return Err(BuildError::single(Diagnostic::error(
+                import_codes::TEXT_UNSUPPORTED,
+                "cannot load a text root: this Loader has no grammar — \
+                 configure one with `Loader::with_grammar`",
+            )));
+        };
+        let tree = grammar.parse(root)?;
+        self.expand_root(tree, resolver)
+    }
+
+    fn expand_root(
+        &self,
+        tree: ParseTree,
+        resolver: &mut dyn SourceResolver,
+    ) -> Result<Loaded, BuildError> {
+        let mut state = LoadState {
+            resolver,
+            limits: &self.limits,
+            schema: self.schema,
+            grammar: self.grammar,
+            cache: BTreeMap::new(),
+            stack: Vec::new(),
+            total_bytes: 0,
+        };
+        let tree = expand(tree, None, 0, &mut state).map_err(BuildError::new)?;
+        let dependencies = state.cache.into_keys().collect();
+        Ok(Loaded { tree, dependencies })
+    }
+}
+
+/// Loads a JSON root document with default limits and no text
+/// front-end. Convenience wrapper over [`Loader`].
 pub fn load_json_str(
     root: &str,
     schema: &NodeSchema,
     resolver: &mut dyn SourceResolver,
     limits: &ImportLimits,
 ) -> Result<Loaded, BuildError> {
-    let tree = serde_bridge::from_json_str(root, schema)?;
-    expand_root(tree, schema, resolver, limits)
+    Loader::new(schema)
+        .with_limits(limits.clone())
+        .load_json_str(root, resolver)
 }
 
 /// [`load_json_str`] over an already-deserialized
@@ -293,27 +430,79 @@ pub fn load_json_value(
     resolver: &mut dyn SourceResolver,
     limits: &ImportLimits,
 ) -> Result<Loaded, BuildError> {
-    let tree = serde_bridge::from_json_value(root, schema)?;
-    expand_root(tree, schema, resolver, limits)
+    Loader::new(schema)
+        .with_limits(limits.clone())
+        .load_json_value(root, resolver)
 }
 
-fn expand_root(
-    tree: ParseTree,
-    schema: &NodeSchema,
-    resolver: &mut dyn SourceResolver,
-    limits: &ImportLimits,
-) -> Result<Loaded, BuildError> {
-    let mut state = LoadState {
-        resolver,
-        limits,
-        schema,
-        cache: BTreeMap::new(),
-        stack: Vec::new(),
-        total_bytes: 0,
+// ---------------------------------------------------------------------------
+// Text syntax injection
+// ---------------------------------------------------------------------------
+
+/// Adds the reserved `@import "name"` spelling to a text grammar.
+///
+/// Appends a rule named [`IMPORT_VARIANT`] whose body is
+/// `Node("$import", %kw:@import Field("spec", %str))`, and makes it an
+/// alternative of the grammar's start rule — for grammars generated by
+/// [`crate::schema_gen`], the start rule is the `node` choice that
+/// every child slot references, so the spelling becomes available at
+/// every node position. A start rule whose body is not a [`Peg::Choice`]
+/// is wrapped in one.
+///
+/// Opt-in by design: a grammar that never passes through this function
+/// accepts no import syntax, and the reserved rule is invisible to
+/// [`crate::example_gen`] (examples never spell `@import`) and exempt
+/// from [`crate::grammar_check`]'s schema-consistency pass.
+///
+/// Idempotent — a grammar that already carries the reserved rule is
+/// returned unchanged. Fails with [`crate::peg::codes::UNKNOWN_RULE`]
+/// if the start rule is not defined.
+pub fn add_import_syntax(grammar: &mut Grammar, ids: &IdGen) -> Result<(), BuildError> {
+    let already = grammar
+        .rules
+        .iter()
+        .any(|r| matches!(r, Peg::Rule { name, .. } if name == IMPORT_VARIANT));
+    if already {
+        return Ok(());
+    }
+
+    let start = grammar.start.clone();
+    let start_rule = grammar
+        .rules
+        .iter_mut()
+        .find(|r| matches!(r, Peg::Rule { name, .. } if *name == start));
+    let Some(Peg::Rule { body, .. }) = start_rule else {
+        return Err(BuildError::single(Diagnostic::error(
+            peg::codes::UNKNOWN_RULE,
+            format!("cannot add import syntax: start rule `{start}` is not defined"),
+        )));
     };
-    let tree = expand(tree, None, 0, &mut state).map_err(BuildError::new)?;
-    let dependencies = state.cache.into_keys().collect();
-    Ok(Loaded { tree, dependencies })
+
+    match body.as_mut() {
+        Peg::Choice { alts, .. } => alts.push(peg::rule_ref(ids, IMPORT_VARIANT)),
+        _ => {
+            let dummy = peg::token(ids, "");
+            let old = std::mem::replace(body.as_mut(), dummy);
+            **body = peg::choice(ids, vec![old, peg::rule_ref(ids, IMPORT_VARIANT)]);
+        }
+    }
+
+    grammar.rules.push(peg::rule(
+        ids,
+        IMPORT_VARIANT,
+        peg::node(
+            ids,
+            IMPORT_VARIANT,
+            peg::seq(
+                ids,
+                vec![
+                    peg::token(ids, "%kw:@import"),
+                    peg::field(ids, IMPORT_SPEC_FIELD, peg::token(ids, "%str")),
+                ],
+            ),
+        ),
+    ));
+    Ok(())
 }
 
 /// Per-load expansion state.
@@ -321,6 +510,7 @@ struct LoadState<'a> {
     resolver: &'a mut dyn SourceResolver,
     limits: &'a ImportLimits,
     schema: &'a NodeSchema,
+    grammar: Option<&'a Grammar>,
     /// Source cache keyed on canonical id. Both outcomes are memoised
     /// — a broken source stays broken for every later site instead of
     /// being re-fetched and re-parsed per importer.
@@ -477,23 +667,41 @@ fn resolve_import(
         }
     };
 
+    let source_len = match &fetched {
+        ImportSource::Json(text) | ImportSource::Text(text) => text.len(),
+    };
+    state.total_bytes += source_len;
+    if state.total_bytes > state.limits.max_total_bytes {
+        let diags = vec![Diagnostic::error(
+            import_codes::BYTE_LIMIT,
+            format!(
+                "import expansion exceeds max_total_bytes {} at `{id}` (chain: {})",
+                state.limits.max_total_bytes,
+                state.chain(None),
+            ),
+        )];
+        state.cache.insert(id, CacheEntry::Failed(diags.clone()));
+        return Err(diags);
+    }
+
     let parsed = match fetched {
-        ImportSource::Json(text) => {
-            state.total_bytes += text.len();
-            if state.total_bytes > state.limits.max_total_bytes {
+        ImportSource::Json(text) => serde_bridge::from_json_str(&text, state.schema),
+        ImportSource::Text(text) => match state.grammar {
+            Some(grammar) => grammar.parse(&text),
+            None => {
                 let diags = vec![Diagnostic::error(
-                    import_codes::BYTE_LIMIT,
+                    import_codes::TEXT_UNSUPPORTED,
                     format!(
-                        "import expansion exceeds max_total_bytes {} at `{id}` (chain: {})",
-                        state.limits.max_total_bytes,
+                        "import `{id}` is a text source but this Loader has no \
+                         grammar — configure one with `Loader::with_grammar` \
+                         (chain: {})",
                         state.chain(None),
                     ),
                 )];
                 state.cache.insert(id, CacheEntry::Failed(diags.clone()));
                 return Err(diags);
             }
-            serde_bridge::from_json_str(&text, state.schema)
-        }
+        },
     };
 
     let parsed = match parsed {

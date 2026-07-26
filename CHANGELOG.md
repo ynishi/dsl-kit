@@ -24,9 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dedicated diagnostic per bound; fetch/parse failures are cached and
   replayed per importing site with an `in_import` chain-context
   marker. A placeholder that skips the loader is rejected at
-  `check_conformance` (`import::unexpanded`). Canonical text (PEG)
-  syntax for imports is a planned follow-up (`ImportSource` is
-  `#[non_exhaustive]` for the `Text` arm).
+  `check_conformance` (`import::unexpanded`).
+- `dsl-kit-parse` — canonical-text spelling for imports:
+  `import::add_import_syntax(&mut grammar, &ids)` adds a reserved
+  `@import "name"` alternative to a grammar's start rule (for
+  schema-generated grammars that is the `node` choice every child
+  slot references, so the spelling works at every node position; a
+  non-`Choice` start rule is wrapped). Opt-in by design — untouched
+  grammars accept no import syntax, `example_gen` never spells
+  `@import` in synthesized examples, and `grammar_check`'s
+  schema-consistency pass exempts the reserved `$import` node. The
+  loader grows a builder form (`import::Loader::new(schema)
+  .with_grammar(&g).with_limits(l)`) with `load_text` /
+  `load_json_str` / `load_json_value` entry points;
+  `ImportSource::Text` sources parse through the configured grammar
+  and mix freely with JSON sources in one load (a text source
+  arriving with no grammar configured is a loud
+  `import::text_unsupported` failure). `MapResolver::insert_text`
+  registers named in-memory text sources. Known limitation: spans
+  inside an expanded tree stay relative to the source that parsed
+  that subtree with no per-subtree source attribution yet — loader
+  diagnostics carry the resolution chain instead.
 - `dsl-kit-schema` — new `ChildValueShape` enum (`Recursive` /
   `Scalar { ty }`, `#[non_exhaustive]`) plus a `value_shape` field on
   `ChildSchema` that pins what a keyed slot's values *are*, not just
