@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/ynishi/dsl-kit/compare/v0.6.1...v0.7.0) - 2026-07-26
+
+### Added
+
+- *(mcp)* import graph as data over MCP — sources bundle + digest
+- *(parse)* canonical text spelling for imports — @import via add_import_syntax
+- *(parse)* import load phase — $import placeholders + host-resolved SourceResolver
+
 ## [0.6.1](https://github.com/ynishi/dsl-kit/compare/v0.6.0...v0.6.1) - 2026-07-26
 
 ### Added
