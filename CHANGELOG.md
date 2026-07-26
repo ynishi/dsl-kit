@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-parse` — new `import` module: a load/link phase that lets a
+  document pull in other sources before conformance and `DslBuild`.
+  The JSON bridge reserves `{"$import": "name"}` at node positions as
+  an import placeholder; `import::load_json_str` /
+  `import::load_json_value` expand placeholders to a fixpoint through
+  a caller-supplied `SourceResolver` (the kit stays io-free — the
+  bundled `MapResolver` serves named in-memory sources, filesystem
+  access is a host-side impl). Specifiers are literal-only, so
+  `Loaded::dependencies` reports the full import graph without
+  executing anything. Cycles are detected via a `Pending` cache
+  sentinel and rendered as the full chain (`<root> → a → b → a`);
+  `ImportLimits` caps depth / source count / total bytes with a
+  dedicated diagnostic per bound; fetch/parse failures are cached and
+  replayed per importing site with an `in_import` chain-context
+  marker. A placeholder that skips the loader is rejected at
+  `check_conformance` (`import::unexpanded`). Canonical text (PEG)
+  syntax for imports is a planned follow-up (`ImportSource` is
+  `#[non_exhaustive]` for the `Text` arm).
 - `dsl-kit-schema` — new `ChildValueShape` enum (`Recursive` /
   `Scalar { ty }`, `#[non_exhaustive]`) plus a `value_shape` field on
   `ChildSchema` that pins what a keyed slot's values *are*, not just

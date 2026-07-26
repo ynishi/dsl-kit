@@ -33,6 +33,12 @@
 //! that a malformed document produces one bag of diagnostics rather
 //! than a chain of stop-at-first failures.
 //!
+//! One object shape is reserved: `{"$import": "name"}` at a node
+//! position produces an import placeholder for the load phase
+//! ([`crate::import`]) instead of a variant node. `$import` must be
+//! the object's only key and its value a literal string; anything else
+//! is a [`crate::import::import_codes::SPEC_SHAPE`] diagnostic.
+//!
 //! ## Example
 //!
 //! ```ignore
@@ -48,6 +54,7 @@
 //! assert_eq!(tree.variant, "Add");
 //! ```
 
+use crate::import::{self, import_codes};
 use crate::{BuildError, BuiltinLevenshteinSuggester, Diagnostic, ParseTree, RawValue, codes};
 use dsl_kit_core::Suggester;
 use dsl_kit_schema::{ChildValueShape, Multiplicity, NodeSchema, VariantSchema};
@@ -160,6 +167,44 @@ fn build_tree(
             return None;
         }
     };
+
+    // `{"$import": "spec"}` at a node position becomes an import
+    // placeholder for the load phase (`crate::import`). Checked before
+    // the `type` dispatch so a placeholder needs no `type` key.
+    if let Some(spec) = obj.get(import::IMPORT_VARIANT) {
+        if obj.len() != 1 {
+            diags.push(Diagnostic::error(
+                import_codes::SPEC_SHAPE,
+                format!(
+                    "`{}` must be the object's only key ({} other key(s) present)",
+                    import::IMPORT_VARIANT,
+                    obj.len() - 1
+                ),
+            ));
+            return None;
+        }
+        return match spec {
+            Value::String(_) => {
+                let mut tree = ParseTree::new(import::IMPORT_VARIANT);
+                tree.fields.push((
+                    import::IMPORT_SPEC_FIELD.to_string(),
+                    RawValue::Json(spec.clone()),
+                ));
+                Some(tree)
+            }
+            other => {
+                diags.push(Diagnostic::error(
+                    import_codes::SPEC_SHAPE,
+                    format!(
+                        "`{}` value must be a literal string, got {}",
+                        import::IMPORT_VARIANT,
+                        kind(other)
+                    ),
+                ));
+                None
+            }
+        };
+    }
 
     let variant_name = match obj.get("type") {
         None => {

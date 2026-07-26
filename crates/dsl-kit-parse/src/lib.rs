@@ -38,6 +38,7 @@ use std::fmt;
 
 pub mod example_gen;
 pub mod grammar_check;
+pub mod import;
 pub mod peg;
 pub mod schema_gen;
 pub mod serde_bridge;
@@ -524,6 +525,21 @@ pub fn check_conformance_with(
     suggester: &dyn Suggester,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+
+    if tree.variant == import::IMPORT_VARIANT {
+        out.push(
+            Diagnostic::error(
+                import::import_codes::UNEXPANDED,
+                format!(
+                    "unexpanded `{}` placeholder — run the document through \
+                     `import::load_json_str` / `import::load_json_value` before conformance",
+                    import::IMPORT_VARIANT
+                ),
+            )
+            .with_span(tree.span),
+        );
+        return out;
+    }
 
     let Some(variant) = schema.variant(&tree.variant) else {
         let msg = format_unknown_variant(&tree.variant, schema, suggester);
