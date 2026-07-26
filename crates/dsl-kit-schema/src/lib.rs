@@ -168,22 +168,115 @@ impl FieldSchema {
 }
 
 /// A recursive child field on a variant.
+///
+/// The value carried by the slot is described by
+/// [`ChildSchema::value_shape`]. For the historical shapes
+/// (`One` / `Optional` / `Many`, plus keyed slots whose values are
+/// `Self`) the value is recursive — the same AST enum — and the
+/// value shape is [`ChildValueShape::Recursive`]. Keyed slots
+/// ([`Multiplicity::Map`]) may also carry scalar values
+/// (`BTreeMap<String, String>`, `BTreeMap<String, i64>`, …); those
+/// report [`ChildValueShape::Scalar`] and carry the scalar's Rust
+/// type as source text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildSchema {
     /// Field name (e.g. `"children"`, `"body"`).
     pub name: String,
     /// Recursion shape.
     pub multiplicity: Multiplicity,
+    /// Value shape carried by the slot.
+    ///
+    /// Defaults to [`ChildValueShape::Recursive`] for the historical
+    /// shapes. Scalar-valued keyed slots (Shape 1 of the tracking
+    /// issue) set this to [`ChildValueShape::Scalar`] and carry the
+    /// value type as source text.
+    pub value_shape: ChildValueShape,
+}
+
+impl Default for ChildValueShape {
+    /// Historical shapes carry recursive values; this matches
+    /// pre-0.6 [`ChildSchema`] semantics so hand-written schemas
+    /// that used struct-update syntax
+    /// (`ChildSchema { name, multiplicity, ..Default::default() }`)
+    /// keep the same behaviour.
+    fn default() -> Self {
+        ChildValueShape::Recursive
+    }
 }
 
 impl ChildSchema {
-    /// Renders the child field as a JSON value.
-    pub fn to_json(&self) -> Value {
-        json!({
-            "name": self.name,
-            "multiplicity": self.multiplicity.as_str(),
-        })
+    /// Builds a child slot whose value is the same AST enum
+    /// (recursive shape). Convenience for hand-written schemas; the
+    /// derive macro uses this path for every historical shape.
+    pub fn recursive(name: impl Into<String>, multiplicity: Multiplicity) -> Self {
+        Self {
+            name: name.into(),
+            multiplicity,
+            value_shape: ChildValueShape::Recursive,
+        }
     }
+
+    /// Builds a keyed child slot whose values are scalars of Rust
+    /// type `ty`. The multiplicity is always [`Multiplicity::Map`];
+    /// non-`Map` scalar slots are not a recognised shape.
+    pub fn scalar_map(name: impl Into<String>, value_ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            multiplicity: Multiplicity::Map,
+            value_shape: ChildValueShape::Scalar {
+                ty: value_ty.into(),
+            },
+        }
+    }
+
+    /// Renders the child field as a JSON value.
+    ///
+    /// [`ChildValueShape::Recursive`] slots preserve the pre-0.6 JSON
+    /// layout (just `name` + `multiplicity`) so external consumers
+    /// that do not know about `value_shape` are unaffected. Scalar
+    /// slots gain a `"value"` object carrying the shape's kind and
+    /// scalar `type` string.
+    pub fn to_json(&self) -> Value {
+        match &self.value_shape {
+            ChildValueShape::Recursive => json!({
+                "name": self.name,
+                "multiplicity": self.multiplicity.as_str(),
+            }),
+            ChildValueShape::Scalar { ty } => json!({
+                "name": self.name,
+                "multiplicity": self.multiplicity.as_str(),
+                "value": { "kind": "scalar", "type": ty },
+            }),
+        }
+    }
+}
+
+/// Value shape carried by a [`ChildSchema`] slot.
+///
+/// [`Multiplicity`] describes cardinality (one / optional / many /
+/// keyed); `ChildValueShape` describes what each element *is*.
+///
+/// The enum is `#[non_exhaustive]` so future shapes (values from a
+/// distinct AST type — Shape 2 of the tracking issue — or other
+/// non-recursive value primitives) can be added as minor bumps.
+/// Out-of-crate matches must therefore include a `_ =>` arm; in-crate
+/// matches (this workspace) remain exhaustively checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChildValueShape {
+    /// The slot's value type is the enclosing AST enum itself.
+    /// Every historical shape (`One` / `Optional` / `Many`, plus
+    /// keyed slots spelled `BTreeMap<String, Self>` /
+    /// `BTreeMap<String, Box<Self>>`) reports `Recursive`.
+    Recursive,
+    /// The slot's value type is a scalar payload. Only valid in
+    /// combination with [`Multiplicity::Map`] — Shape 1 of the
+    /// tracking issue. Carries the value type as Rust source text
+    /// (e.g. `"String"`, `"i64"`, `"bool"`).
+    Scalar {
+        /// Rust source text of the scalar value type.
+        ty: String,
+    },
 }
 
 /// Recursion shape of a child field.
@@ -220,11 +313,21 @@ pub enum Multiplicity {
     ///
     /// The schema layer only records that the slot is keyed; the value
     /// shape is inferred by the derive macro from the underlying Rust
-    /// type. Self-recursive values (`BTreeMap<String, Self>` /
-    /// `BTreeMap<String, Box<Self>>`) are supported end to end —
-    /// derive, conformance, the JSON bridge, generated grammars and
-    /// `DslBuild`. Keyed slots whose values are *another* AST type, or
-    /// scalars, are still being staged; see the tracking issue.
+    /// type via [`ChildSchema::value_shape`]. Self-recursive values
+    /// (`BTreeMap<String, Self>` / `BTreeMap<String, Box<Self>>`) are
+    /// supported end to end — derive, conformance, the JSON bridge,
+    /// generated grammars and `DslBuild`. Scalar values
+    /// (`BTreeMap<String, T>` where `T` is a scalar payload type —
+    /// Shape 1 of the tracking issue) are recognised by the derive
+    /// (`ChildValueShape::Scalar { ty }`), the JSON ⇔ ParseTree
+    /// bridge, and `DslBuild` via `build_scalar_map`; the PEG
+    /// grammar generator and canonical text syntax do **not** yet
+    /// route on the scalar shape, so a scalar-map schema fed through
+    /// `schema_gen::grammar_from_schema` produces a grammar that
+    /// expects each entry's value to be a full AST node — use the
+    /// JSON front-end for scalar-map DSLs until PEG catches up.
+    /// Keyed slots whose values are *another* AST type (Shape 2) are
+    /// still being staged.
     Map,
 }
 
@@ -271,6 +374,7 @@ mod tests {
                 children: vec![ChildSchema {
                     name: "entries".into(),
                     multiplicity: Multiplicity::Map,
+                    value_shape: ChildValueShape::Recursive,
                 }],
             }],
         };

@@ -1279,6 +1279,57 @@ pub fn build_child_many<T: DslBuild>(
     }
 }
 
+/// Builds every entry of a scalar-valued [`Multiplicity::Map`] slot
+/// (Shape 1 of the tracking issue) into a [`BTreeMap`] keyed by the
+/// front-end's keys.
+///
+/// Each entry in the tree's [`ParseTree::keyed_children`] slot is
+/// expected to be a leaf [`ParseTree`] whose single payload field is
+/// named `"value"` — the front-end wraps every scalar value in that
+/// canonical shape. The convention gives `build_scalar_map` a stable
+/// spot to fetch the payload from without the derive having to know
+/// about the wrapping.
+///
+/// Like [`build_child_map`], duplicate keys emit a
+/// [`codes::DUPLICATE_KEY`] diagnostic rather than a silent
+/// last-one-wins overwrite. Missing `"value"` fields inside an entry
+/// surface as [`codes::MISSING_FIELD`] and payload type errors as
+/// [`codes::FIELD_TYPE`] — the same envelope as [`build_field`].
+///
+/// `V` must satisfy `serde::de::DeserializeOwned + FromStr` so both
+/// front-ends (JSON payload / PEG text) can convert values without
+/// element-wise divergence.
+pub fn build_scalar_map<V>(tree: &ParseTree, name: &str) -> Result<BTreeMap<String, V>, BuildError>
+where
+    V: serde::de::DeserializeOwned + std::str::FromStr,
+    <V as std::str::FromStr>::Err: std::fmt::Display,
+{
+    let slot = tree.keyed_child_slot(name).unwrap_or(&[]);
+    let mut out = BTreeMap::new();
+    let mut diags = Vec::new();
+    for (key, entry) in slot {
+        match build_field::<V>(entry, "value") {
+            Ok(v) => {
+                if out.insert(key.clone(), v).is_some() {
+                    diags.push(
+                        Diagnostic::error(
+                            codes::DUPLICATE_KEY,
+                            format!("keyed child slot `{name}` carries key `{key}` more than once"),
+                        )
+                        .with_span(tree.span),
+                    );
+                }
+            }
+            Err(mut e) => diags.append(&mut e.diagnostics),
+        }
+    }
+    if diags.is_empty() {
+        Ok(out)
+    } else {
+        Err(BuildError::new(diags))
+    }
+}
+
 /// Builds every entry of a [`Multiplicity::Map`] slot into a
 /// [`BTreeMap`] keyed by the front-end's keys.
 ///
@@ -1330,7 +1381,9 @@ pub fn build_child_map<T: DslBuild>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
+    use dsl_kit_schema::{
+        ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+    };
 
     fn schema_add_lit() -> NodeSchema {
         NodeSchema {
@@ -1352,10 +1405,12 @@ mod tests {
                         ChildSchema {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },
@@ -1370,10 +1425,12 @@ mod tests {
                         ChildSchema {
                             name: "value".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "body".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },

@@ -50,7 +50,7 @@
 
 use crate::{BuildError, BuiltinLevenshteinSuggester, Diagnostic, ParseTree, RawValue, codes};
 use dsl_kit_core::Suggester;
-use dsl_kit_schema::{Multiplicity, NodeSchema, VariantSchema};
+use dsl_kit_schema::{ChildValueShape, Multiplicity, NodeSchema, VariantSchema};
 use serde_json::Value;
 
 /// Additional diagnostic codes emitted specifically by the serde
@@ -198,7 +198,34 @@ fn build_tree(
             tree.fields.push((key.clone(), RawValue::Json(val.clone())));
         } else if let Some(child) = variant.children.iter().find(|c| &c.name == key) {
             if child.multiplicity == Multiplicity::Map {
-                let entries = build_keyed_child_slot(val, variant, key, schema, diags, suggester);
+                let entries = match &child.value_shape {
+                    ChildValueShape::Scalar { .. } => {
+                        build_scalar_keyed_slot(val, variant, key, diags)
+                    }
+                    ChildValueShape::Recursive => {
+                        build_keyed_child_slot(val, variant, key, schema, diags, suggester)
+                    }
+                    // `#[non_exhaustive]` catch-all: a future
+                    // `ChildValueShape` variant added to the schema
+                    // crate before this bridge is extended lands
+                    // here. Falls back to the recursive path
+                    // (`build_keyed_child_slot`) so the front-end
+                    // stays usable, but records the shape as
+                    // unknown so the drift is visible in
+                    // diagnostics rather than silent misroute.
+                    _ => {
+                        diags.push(Diagnostic::error(
+                            codes::UNKNOWN_MULTIPLICITY,
+                            format!(
+                                "keyed child slot `{}` on variant `{}` declares a \
+                                 ChildValueShape variant this build does not recognise \
+                                 (upgrade dsl-kit-parse to a version that knows about it)",
+                                key, variant.name
+                            ),
+                        ));
+                        build_keyed_child_slot(val, variant, key, schema, diags, suggester)
+                    }
+                };
                 tree.keyed_children.push((key.clone(), entries));
             } else {
                 let subtrees = build_child_slot(
@@ -403,6 +430,59 @@ fn build_keyed_child_slot(
     out
 }
 
+/// Builds a keyed child slot ([`Multiplicity::Map`]) whose values are
+/// scalars (Shape 1 of the tracking issue). Each entry is wrapped as
+/// a leaf [`ParseTree`] carrying its payload under the well-known
+/// `"value"` field, so [`build_scalar_map`](crate::build_scalar_map)
+/// can read it back with the same `build_field` route the rest of the
+/// derive already uses.
+///
+/// JSON scalars land as [`RawValue::Json`] wholesale — `serde_json`
+/// distinguishes strings, numbers, booleans, and null on its own, and
+/// the build layer's [`build_field`](crate::build_field) delegates to
+/// `serde_json::from_value` for that arm. That means a `String` /
+/// `i64` / `bool` scalar type all deserialize without a stringify
+/// round-trip. Nested arrays or objects on the value side are handed
+/// straight through so a scalar map declared as
+/// `BTreeMap<String, Vec<String>>` (still a scalar shape at the
+/// schema level — the value is a payload type, not another AST) also
+/// deserializes cleanly.
+///
+/// Sorted by key on emit, matching `build_keyed_child_slot` so both
+/// arms feed [`ParseTree::keyed_children`] on the same canonical
+/// ordering contract enforced by
+/// [`check_conformance`](crate::check_conformance).
+fn build_scalar_keyed_slot(
+    val: &Value,
+    variant: &VariantSchema,
+    slot: &str,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<(String, ParseTree)> {
+    let Value::Object(map) = val else {
+        diags.push(Diagnostic::error(
+            serde_codes::CHILD_SHAPE,
+            format!(
+                "scalar keyed child slot `{}` on variant `{}` requires an object mapping keys \
+                 to scalar values, got {}",
+                slot,
+                variant.name,
+                kind(val)
+            ),
+        ));
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(map.len());
+    for (key, item) in map {
+        let mut leaf = ParseTree::new("");
+        leaf.fields
+            .push(("value".into(), RawValue::Json(item.clone())));
+        out.push((key.clone(), leaf));
+    }
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
+    out
+}
+
 fn kind(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -422,7 +502,9 @@ fn kind(v: &Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::{check_conformance, codes};
-    use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
+    use dsl_kit_schema::{
+        ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+    };
     use serde_json::json;
 
     fn schema() -> NodeSchema {
@@ -445,10 +527,12 @@ mod tests {
                         ChildSchema {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },
@@ -463,10 +547,12 @@ mod tests {
                         ChildSchema {
                             name: "value".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "body".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },
@@ -476,6 +562,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "items".into(),
                         multiplicity: Multiplicity::Many,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -484,6 +571,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "inner".into(),
                         multiplicity: Multiplicity::Optional,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
             ],

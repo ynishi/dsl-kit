@@ -74,7 +74,9 @@ use crate::peg::{
 };
 use crate::{BuildError, Diagnostic};
 use dsl_kit_core::IdGen;
-use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
+use dsl_kit_schema::{
+    ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+};
 
 /// Diagnostic codes emitted by grammar generation.
 pub mod codes {
@@ -89,6 +91,15 @@ pub mod codes {
     /// [`grammar_from_schema_with`] so `child_arg_peg` never sees an
     /// unknown variant.
     pub const UNKNOWN_MULTIPLICITY: &str = "dsl_kit::schema_gen::unknown_multiplicity";
+    /// A keyed child slot declares a value shape the canonical text
+    /// syntax has not yet grown a production for. Emitted by the
+    /// pre-flight check so a scalar-valued keyed slot fails loudly
+    /// at grammar-generation time rather than silently producing a
+    /// grammar that expects each entry's value to be a full AST
+    /// node — the shape mismatch would otherwise surface as an
+    /// opaque parse failure on the DSL author's first document.
+    pub const UNSUPPORTED_MAP_VALUE_SHAPE: &str =
+        "dsl_kit::schema_gen::unsupported_map_value_shape";
 }
 
 /// Name of the generated start rule.
@@ -235,10 +246,33 @@ pub fn grammar_from_schema_with(
         for c in &v.children {
             match c.multiplicity {
                 // Every shape `child_arg_peg` knows how to emit.
-                Multiplicity::One
-                | Multiplicity::Optional
-                | Multiplicity::Many
-                | Multiplicity::Map => {}
+                Multiplicity::One | Multiplicity::Optional | Multiplicity::Many => {}
+                // Keyed slots come in two value shapes at derive
+                // level: recursive (`BTreeMap<String, Self>` /
+                // `BTreeMap<String, Box<Self>>`) is supported by the
+                // canonical text syntax; scalar
+                // (`ChildValueShape::Scalar { .. }`, Shape 1 of the
+                // tracking issue) has not grown a text production
+                // yet — `child_arg_peg` would emit
+                // `key: <node>` for every entry, producing an
+                // unusable grammar. Fail loudly instead so the DSL
+                // author is directed to the JSON front-end.
+                Multiplicity::Map => {
+                    if let ChildValueShape::Scalar { ty } = &c.value_shape {
+                        pre_flight.push(Diagnostic::error(
+                            codes::UNSUPPORTED_MAP_VALUE_SHAPE,
+                            format!(
+                                "variant `{}` child slot `{}`: keyed scalar values \
+                                 (`BTreeMap<String, {}>`) are recognised by the derive and \
+                                 the JSON front-end, but the canonical text syntax has no \
+                                 production for them yet — use the JSON front-end for \
+                                 scalar-map DSLs, or open the tracking issue if the text \
+                                 syntax is needed",
+                                v.name, c.name, ty
+                            ),
+                        ));
+                    }
+                }
                 // `#[non_exhaustive]` catch-all: a future Multiplicity
                 // variant added to dsl-kit-schema before this crate is
                 // updated must also be rejected here — that's what
@@ -601,6 +635,7 @@ pub fn checked_grammar_from_schema_with(
 mod tests {
     use super::*;
     use crate::{RawValue, check_conformance};
+    use dsl_kit_schema::ChildValueShape;
 
     /// Expr-flavoured schema exercising every supported shape: int /
     /// string / bool fields, One / Optional / Many children, and a
@@ -641,10 +676,12 @@ mod tests {
                         ChildSchema {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },
@@ -654,6 +691,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "body".into(),
                         multiplicity: Multiplicity::Optional,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -662,6 +700,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "items".into(),
                         multiplicity: Multiplicity::Many,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -670,6 +709,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "entries".into(),
                         multiplicity: Multiplicity::Map,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -870,6 +910,63 @@ mod tests {
         );
     }
 
+    /// A scalar-valued keyed slot is recognised by the derive and
+    /// the JSON front-end, but the canonical text syntax has no
+    /// production for it yet — `grammar_from_schema` must fail
+    /// loudly with [`codes::UNSUPPORTED_MAP_VALUE_SHAPE`] rather
+    /// than silently emit a grammar that expects each entry's value
+    /// to be a full AST node. Pins the pre-flight guard so a
+    /// downstream feeding a Shape 1 schema through PEG generation
+    /// gets a clear pointer to the JSON front-end instead of an
+    /// opaque parse failure.
+    #[test]
+    fn scalar_keyed_slot_fails_grammar_generation_loudly() {
+        let schema = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![VariantSchema {
+                name: "Env".into(),
+                fields: vec![],
+                children: vec![ChildSchema::scalar_map("entries", "String")],
+            }],
+        };
+        let err = grammar_from_schema(&schema, &IdGen::new()).unwrap_err();
+        assert_eq!(err.diagnostics.len(), 1);
+        assert_eq!(err.diagnostics[0].code, codes::UNSUPPORTED_MAP_VALUE_SHAPE);
+        assert!(
+            err.diagnostics[0].message.contains("entries"),
+            "diagnostic mentions the slot name: {}",
+            err.diagnostics[0].message
+        );
+        assert!(
+            err.diagnostics[0].message.contains("String"),
+            "diagnostic mentions the scalar value type: {}",
+            err.diagnostics[0].message
+        );
+    }
+
+    /// Recursive keyed slots still generate cleanly — the scalar
+    /// gate must not accidentally reject the pre-0.6 keyed shape.
+    #[test]
+    fn recursive_keyed_slot_still_generates_grammar() {
+        let schema = NodeSchema {
+            name: "Cfg".into(),
+            variants: vec![
+                VariantSchema {
+                    name: "Env".into(),
+                    fields: vec![],
+                    children: vec![ChildSchema::recursive("entries", Multiplicity::Map)],
+                },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
+            ],
+        };
+        grammar_from_schema(&schema, &IdGen::new())
+            .expect("recursive keyed shape still supported end-to-end in the text front-end");
+    }
+
     /// Flow-shaped schema whose `Par` payload fields the built-in
     /// mapping rejects — the override motivating case.
     fn par_schema() -> NodeSchema {
@@ -894,6 +991,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "children".into(),
                         multiplicity: Multiplicity::Many,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {

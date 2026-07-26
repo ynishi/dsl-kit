@@ -188,6 +188,44 @@ fn payload_shape(ty: &Type, enum_name: &Ident) -> (PayloadShape, Option<Type>) {
     }
 }
 
+/// If `ty` is a `BTreeMap<String, V>` whose value type `V` is **not**
+/// the enclosing enum (nor `Box<Self>`), returns the value type. This
+/// is Shape 1 of the tracking issue — scalar-valued keyed slots
+/// (`BTreeMap<String, String>`, `BTreeMap<String, i64>`, etc.).
+///
+/// `HashMap` and other keyed containers are deliberately not matched:
+/// the schema layer commits to deterministic iteration order for
+/// keyed slots, and only `BTreeMap` provides it structurally.
+///
+/// The self-recursive keyed shapes (`BTreeMap<String, Self>` /
+/// `BTreeMap<String, Box<Self>>`) are handled by
+/// [`detect_recursion`] and never reach this helper — the derive
+/// checks recursion first.
+fn detect_scalar_map(ty: &Type, enum_name: &Ident) -> Option<Type> {
+    let seg = last_segment(ty)?;
+    if seg.ident != "BTreeMap" {
+        return None;
+    }
+    let (k, v) = two_generic_types(seg)?;
+    if !is_string_type(k) {
+        return None;
+    }
+    // `Self` and `Box<Self>` are the recursive shapes — leave them
+    // to `detect_recursion`.
+    if matches_enum(v, enum_name) {
+        return None;
+    }
+    if let Some(inner_seg) = last_segment(v)
+        && inner_seg.ident == "Box"
+    {
+        let inner_inner = single_generic_type(inner_seg)?;
+        if matches_enum(inner_inner, enum_name) {
+            return None;
+        }
+    }
+    Some(v.clone())
+}
+
 fn detect_recursion(ty: &Type, enum_name: &Ident) -> Option<Recursion> {
     if matches_enum(ty, enum_name) {
         return Some(Recursion::Direct);
@@ -439,9 +477,15 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
 /// DSL's external shape. Recursive fields (`T` / `Box<T>` /
 /// `Option<T>` / `Option<Box<T>>` / `Vec<T>` / `Vec<Box<T>>` /
 /// `BTreeMap<String, T>` / `BTreeMap<String, Box<T>>` where `T` is
-/// the enum itself) become `ChildSchema` entries; the two keyed-map
-/// shapes report `Multiplicity::Map`. Every other named field
-/// becomes a `FieldSchema` carrying the Rust type source text.
+/// the enum itself) become `ChildSchema` entries with
+/// `ChildValueShape::Recursive`; the two keyed-map shapes report
+/// `Multiplicity::Map`. Scalar-valued keyed maps
+/// (`BTreeMap<String, V>` where `V` is a payload type such as
+/// `String` / `i64` / `bool` — Shape 1 of the tracking issue) also
+/// become `ChildSchema` entries with `Multiplicity::Map` and
+/// `ChildValueShape::Scalar { ty }`; the value type is captured as
+/// Rust source text. Every remaining named field becomes a
+/// `FieldSchema` carrying the Rust type source text.
 #[proc_macro_derive(DslSchema)]
 pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -494,6 +538,24 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                     ::dsl_kit_schema::ChildSchema {
                         name: #ident_str.to_string(),
                         multiplicity: ::dsl_kit_schema::Multiplicity::#mult,
+                        value_shape: ::dsl_kit_schema::ChildValueShape::Recursive,
+                    }
+                });
+            } else if let Some(value_ty) = detect_scalar_map(&f.ty, &name) {
+                // Shape 1: `BTreeMap<String, ScalarType>` — keyed
+                // slot whose values are non-recursive payloads.
+                // Reported as `Multiplicity::Map` with
+                // `ChildValueShape::Scalar { ty }`; the value type is
+                // stored as Rust source text so schema consumers can
+                // dispatch on it without a semantic type system.
+                let value_ty_src = normalize_type_str(&value_ty.to_token_stream().to_string());
+                child_ctors.push(quote! {
+                    ::dsl_kit_schema::ChildSchema {
+                        name: #ident_str.to_string(),
+                        multiplicity: ::dsl_kit_schema::Multiplicity::Map,
+                        value_shape: ::dsl_kit_schema::ChildValueShape::Scalar {
+                            ty: #value_ty_src.to_string(),
+                        },
                     }
                 });
             } else {
@@ -711,6 +773,17 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                     },
                 };
                 let_bindings.push(quote! { let #ident = #helper_call; });
+                ctor_fields.push(quote! { #ident });
+            } else if let Some(value_ty) = detect_scalar_map(&f.ty, &name) {
+                // Shape 1: `BTreeMap<String, ScalarType>` — keyed
+                // slot whose values are scalar payloads. Reads from
+                // the tree's keyed half via
+                // `build_scalar_map`, which deserializes each entry's
+                // payload with `build_field`'s FromStr / serde route.
+                let_bindings.push(quote! {
+                    let #ident =
+                        ::dsl_kit_parse::build_scalar_map::<#value_ty>(tree, #ident_str)?;
+                });
                 ctor_fields.push(quote! { #ident });
             } else {
                 let ty = &f.ty;

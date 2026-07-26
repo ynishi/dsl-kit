@@ -460,7 +460,9 @@ mod tests {
     use super::*;
     use crate::peg::{choice, field, keyed_entry, node, repeat, rule, rule_ref, seq, token};
     use dsl_kit_core::IdGen;
-    use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
+    use dsl_kit_schema::{
+        ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+    };
 
     // -- helpers --
 
@@ -484,10 +486,12 @@ mod tests {
                         ChildSchema {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },

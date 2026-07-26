@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Keyed child slots gain a scalar-valued shape
+  (`BTreeMap<String, String>`, `BTreeMap<String, i64>`, …). See the
+  workspace `CHANGELOG.md` and gh issue #5 for the full breakdown
+  across `dsl-kit-schema` / `dsl-kit-macros` / `dsl-kit-parse`. The
+  recursive keyed shape (`BTreeMap<String, Box<Self>>`) is unchanged.
+
+### Breaking
+
+- `dsl_kit_schema::ChildSchema` gains a `value_shape:
+  ChildValueShape` field. Hand-written struct literals must supply
+  it. The recommended migration is to switch to
+  `ChildSchema::recursive(name, mult)` for the historical shapes
+  (`One` / `Optional` / `Many`, plus keyed slots whose values are
+  the same enum), or `ChildSchema::scalar_map(name, ty)` for the
+  new scalar-value keyed shape. Both constructors default the
+  `value_shape` to the correct variant, so callers do not have to
+  reference `ChildValueShape` directly.
+
 ## [0.5.1](https://github.com/ynishi/dsl-kit/compare/v0.5.0...v0.5.1) - 2026-07-26
 
 ### Fixed

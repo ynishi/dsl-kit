@@ -854,6 +854,7 @@ mod tests {
                     children: vec![dsl_kit_schema::ChildSchema {
                         name: "kids".into(),
                         multiplicity: Multiplicity::Many,
+                        value_shape: dsl_kit_schema::ChildValueShape::Recursive,
                     }],
                 }],
             }
@@ -1044,6 +1045,7 @@ mod tests {
                         children: vec![dsl_kit_schema::ChildSchema {
                             name: "entries".into(),
                             multiplicity: Multiplicity::Map,
+                            value_shape: dsl_kit_schema::ChildValueShape::Recursive,
                         }],
                     }],
                 }

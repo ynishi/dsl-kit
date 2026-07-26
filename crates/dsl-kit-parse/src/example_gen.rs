@@ -394,7 +394,9 @@ mod tests {
     use crate::check_conformance;
     use crate::schema_gen::checked_grammar_from_schema;
     use dsl_kit_core::IdGen;
-    use dsl_kit_schema::{ChildSchema, FieldSchema, Multiplicity, NodeSchema, VariantSchema};
+    use dsl_kit_schema::{
+        ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+    };
 
     /// Same shape matrix as the schema_gen demo: int / string / bool
     /// fields, One / Optional / Many children, zero-argument variant.
@@ -434,10 +436,12 @@ mod tests {
                         ChildSchema {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
+                            value_shape: ChildValueShape::Recursive,
                         },
                     ],
                 },
@@ -447,6 +451,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "body".into(),
                         multiplicity: Multiplicity::Optional,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -455,6 +460,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "items".into(),
                         multiplicity: Multiplicity::Many,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -463,6 +469,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "entries".into(),
                         multiplicity: Multiplicity::Map,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -547,6 +554,7 @@ mod tests {
                     children: vec![ChildSchema {
                         name: "entries".into(),
                         multiplicity: Multiplicity::Map,
+                        value_shape: ChildValueShape::Recursive,
                     }],
                 },
                 VariantSchema {
@@ -636,6 +644,7 @@ mod tests {
                 children: vec![ChildSchema {
                     name: "inner".into(),
                     multiplicity: Multiplicity::One,
+                    value_shape: ChildValueShape::Recursive,
                 }],
             }],
         };

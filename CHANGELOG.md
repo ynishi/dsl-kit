@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-schema` — new `ChildValueShape` enum (`Recursive` /
+  `Scalar { ty }`, `#[non_exhaustive]`) plus a `value_shape` field on
+  `ChildSchema` that pins what a keyed slot's values *are*, not just
+  their cardinality. Historical shapes (`One` / `Optional` / `Many`,
+  plus keyed slots spelled `BTreeMap<String, Self>` /
+  `BTreeMap<String, Box<Self>>`) report `Recursive` and keep the
+  pre-0.6 `NodeSchema::to_json` layout — no `value` key emitted — so
+  external consumers that do not know about the new field are
+  unaffected. Scalar keyed slots (Shape 1 of the tracking issue) tag
+  themselves with `Scalar { ty: "String" }` etc. and the JSON layout
+  gains a `"value": { "kind": "scalar", "type": "…" }` object.
+  `ChildSchema::recursive(name, mult)` and
+  `ChildSchema::scalar_map(name, ty)` are convenience constructors
+  for hand-written schemas. **Breaking** for hand-written struct
+  literals of `ChildSchema` — one added `value_shape` field to fill
+  in; the recommended migration is to switch to
+  `ChildSchema::recursive(name, mult)` / `scalar_map(name, ty)`
+  rather than referencing `ChildValueShape` directly.
+- `dsl-kit-macros` — `#[derive(DslNode)]` / `#[derive(DslSchema)]` /
+  `#[derive(DslBuild)]` now recognise `BTreeMap<String, V>` where `V`
+  is a scalar payload (`String`, `i64`, `bool`, `f64`, …) as a
+  scalar keyed slot. The schema reports `Multiplicity::Map` and
+  `ChildValueShape::Scalar { ty }`; `Walk` / `WalkMut` skip the slot
+  (scalar values are not `Self`); `DslBuild` reads the tree's keyed
+  half through the new `build_scalar_map::<V>` helper and rebuilds a
+  `BTreeMap<String, V>` with keys intact. Existing recursive keyed
+  shapes are untouched.
+- `dsl-kit-parse` — `build_scalar_map<V>` helper for hand-written
+  `DslBuild` impls: reads `ParseTree::keyed_children[slot]`, treats
+  each entry as a leaf tree whose single field is named `"value"`,
+  and delegates payload conversion to `build_field` so the same
+  `serde::de::DeserializeOwned + FromStr` bounds apply. Missing
+  `"value"` fields surface as `codes::MISSING_FIELD`, type errors as
+  `codes::FIELD_TYPE`, and duplicate keys as `codes::DUPLICATE_KEY`
+  — the same envelope as the recursive `build_child_map`.
+- `dsl-kit-parse` — JSON ⇒ `ParseTree` bridge accepts scalar keyed
+  slots. When a schema declares `Multiplicity::Map` with
+  `ChildValueShape::Scalar { .. }` the bridge routes the JSON object
+  through `build_scalar_keyed_slot`, wrapping each value as a
+  `value`-field leaf so `build_scalar_map` can read it back
+  canonically. Keys sorted on ingest so two spellings of the same map
+  produce byte-identical trees, matching the recursive keyed path.
+  **Scope caveat:** the PEG grammar generator
+  (`schema_gen::grammar_from_schema`), canonical text syntax, example
+  generator, and `dsl-kit-lint` duplicate-key rule do **not** yet
+  route on the scalar shape — a scalar-map schema fed through those
+  paths currently produces a grammar that expects each entry's value
+  to be a full AST node. Use the JSON front-end for scalar-map DSLs
+  until the text-side surface catches up (tracked in gh #5).
 - `dsl-kit-macros` — `#[derive(DslNode)]` / `#[derive(DslSchema)]`
   now recognise `BTreeMap<String, T>` and `BTreeMap<String, Box<T>>`
   (where `T` is the derived-on enum itself) as keyed self-recursive
