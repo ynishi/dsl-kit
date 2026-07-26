@@ -43,7 +43,13 @@ dsl-kit-macros = { path = "crates/dsl-kit-macros", version = "0.5.1" }
 dsl-kit-schema = { path = "crates/dsl-kit-schema", version = "0.5.1" }
 dsl-kit-lint   = { path = "crates/dsl-kit-lint", version = "0.5.1" }
 dsl-kit-parse  = { path = "crates/dsl-kit-parse", version = "0.5.1" }
-dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy", version = "0.5.1" }
+# Path-only (no version): fuzzy is consumed only as a dev-dependency
+# (parse / mcp).  Version-less path dev-deps are stripped by `cargo publish`,
+# while a version pin makes the publish verify step resolve fuzzy against
+# the registry — and release-plz excludes dev-deps from its publish order
+# (release-plz#2697), so the pinned form deadlocks the release when fuzzy
+# is scheduled after its consumers (v0.5.1 incident, 2026-07-26).
+dsl-kit-fuzzy  = { path = "crates/dsl-kit-fuzzy" }
 dsl-kit        = { path = "crates/dsl-kit", version = "0.5.1" }
 dsl-kit-mcp    = { path = "crates/dsl-kit-mcp", version = "0.5.1" }
 dsl-kit-cli    = { path = "crates/dsl-kit-cli", version = "0.5.1" }

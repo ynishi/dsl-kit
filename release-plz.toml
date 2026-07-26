@@ -39,12 +39,22 @@ version_group = "dsl-kit"
 name = "dsl-kit-mcp"
 version_group = "dsl-kit"
 
+# Tag owner: dsl-kit-cli is the LAST crate in release-plz's publish order
+# (it depends on every other published crate), so the unified tag
+# v{version} is only created after every sibling has published.
+# Do NOT move git_tag_enable to an earlier crate: release-plz checks
+# `git tag -l` unconditionally per crate (release-plz#2292), so a tag
+# created mid-run makes every later crate skip with "Already published -
+# Tag already exists" (near-miss observed in the v0.5.1 release,
+# 2026-07-26). If a new leaf crate is ever appended after dsl-kit-cli in
+# the release order, move git_tag_enable to that crate.
 [[package]]
 name = "dsl-kit-cli"
 version_group = "dsl-kit"
+git_tag_enable = true
 
-# Representative crate: creates the single unified tag v{version} and owns
-# the root CHANGELOG. release-plz assigns each commit to the crate whose
+# Representative crate: owns the root CHANGELOG (the unified tag is owned
+# by dsl-kit-cli above). release-plz assigns each commit to the crate whose
 # path it touches; a commit that only touches `crates/dsl-kit-*/…` never
 # lands in the representative crate's CHANGELOG. Since the whole workspace
 # ships lockstep under `version_group = "dsl-kit"`, tell release-plz to
@@ -56,4 +66,3 @@ name = "dsl-kit"
 version_group = "dsl-kit"
 changelog_update = true
 changelog_include = ["dsl-kit-core", "dsl-kit-macros", "dsl-kit-schema", "dsl-kit-lint", "dsl-kit-parse", "dsl-kit-fuzzy", "dsl-kit-mcp", "dsl-kit-cli"]
-git_tag_enable = true
