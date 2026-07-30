@@ -75,7 +75,8 @@ use crate::peg::{
 use crate::{BuildError, Diagnostic};
 use dsl_kit_core::IdGen;
 use dsl_kit_schema::{
-    ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, VariantSchema,
+    ChildSchema, ChildValueShape, FieldSchema, Multiplicity, NodeSchema, ScalarKind,
+    ScalarShorthand, VariantSchema,
 };
 
 /// Diagnostic codes emitted by grammar generation.
@@ -100,7 +101,25 @@ pub mod codes {
     /// opaque parse failure on the DSL author's first document.
     pub const UNSUPPORTED_MAP_VALUE_SHAPE: &str =
         "dsl_kit::schema_gen::unsupported_map_value_shape";
+    /// A child slot declares a [`ScalarShorthand`](dsl_kit_schema::ScalarShorthand)
+    /// this build cannot honour: wrong multiplicity / value shape for
+    /// a shorthand, a duplicate kind, an unknown target variant or
+    /// field, a target field whose type does not match the declared
+    /// kind, or a kind this build does not recognise. Emitted by the
+    /// pre-flight check so an incoherent declaration fails loudly at
+    /// grammar-generation time — the same declaration drives the JSON
+    /// bridge, so silently dropping it here would let the two
+    /// front-ends drift apart.
+    pub const UNSUPPORTED_SCALAR_SHORTHAND: &str =
+        "dsl_kit::schema_gen::unsupported_scalar_shorthand";
 }
+
+/// Integer payload types with a built-in `%int` production. Shared by
+/// the payload-field mapping ([`field_value_peg`]) and the scalar
+/// shorthand kind check so the two stay in step.
+const INT_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+];
 
 /// Name of the generated start rule.
 pub const START_RULE: &str = "node";
@@ -302,6 +321,7 @@ pub fn grammar_from_schema_with(
                     ));
                 }
             }
+            pre_flight.extend(check_scalar_shorthands(schema, v, c));
         }
     }
     if !pre_flight.is_empty() {
@@ -325,6 +345,110 @@ pub fn grammar_from_schema_with(
         rules.push(variant_rule(v, ids, overrides));
     }
     Ok(Grammar::new(rules, START_RULE))
+}
+
+/// Pre-flight validation of one slot's declared scalar shorthands.
+///
+/// The declaration is the single source both front-ends lower from, so
+/// every way it can be incoherent is rejected here in one pass:
+/// shorthands on a slot shape that has no bare-scalar position
+/// (non-`One`/`Optional` multiplicity, or a non-recursive value),
+/// duplicate kinds (kind dispatch must be unambiguous), an unknown
+/// target variant or field, a target field whose type cannot carry the
+/// kind, and a kind this build does not recognise (the schema crate's
+/// `#[non_exhaustive]` escape hatch — rejecting it keeps
+/// `scalar_shorthand_value_peg`'s `_` arm from ever running).
+fn check_scalar_shorthands(
+    schema: &NodeSchema,
+    v: &VariantSchema,
+    c: &ChildSchema,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    if c.scalar_shorthands.is_empty() {
+        return diags;
+    }
+    let site = format!("variant `{}` child slot `{}`", v.name, c.name);
+    if !matches!(c.multiplicity, Multiplicity::One | Multiplicity::Optional) {
+        diags.push(Diagnostic::error(
+            codes::UNSUPPORTED_SCALAR_SHORTHAND,
+            format!("{site}: scalar shorthands are only supported on `One` / `Optional` slots"),
+        ));
+        return diags;
+    }
+    if !matches!(c.value_shape, ChildValueShape::Recursive) {
+        diags.push(Diagnostic::error(
+            codes::UNSUPPORTED_SCALAR_SHORTHAND,
+            format!("{site}: scalar shorthands require a recursive value shape"),
+        ));
+        return diags;
+    }
+    let mut seen: Vec<ScalarKind> = Vec::new();
+    for sh in &c.scalar_shorthands {
+        if seen.contains(&sh.kind) {
+            diags.push(Diagnostic::error(
+                codes::UNSUPPORTED_SCALAR_SHORTHAND,
+                format!(
+                    "{site}: duplicate shorthand for kind `{}` — each kind may map to \
+                     at most one target so dispatch stays unambiguous",
+                    sh.kind.as_str()
+                ),
+            ));
+            continue;
+        }
+        seen.push(sh.kind);
+        let Some(target) = schema.variant(&sh.variant) else {
+            diags.push(Diagnostic::error(
+                codes::UNSUPPORTED_SCALAR_SHORTHAND,
+                format!(
+                    "{site}: shorthand target variant `{}` is not declared in schema `{}`",
+                    sh.variant, schema.name
+                ),
+            ));
+            continue;
+        };
+        let Some(field) = target.fields.iter().find(|f| f.name == sh.field) else {
+            diags.push(Diagnostic::error(
+                codes::UNSUPPORTED_SCALAR_SHORTHAND,
+                format!(
+                    "{site}: shorthand target variant `{}` has no payload field `{}`",
+                    sh.variant, sh.field
+                ),
+            ));
+            continue;
+        };
+        let ty = strip_ws(&field.ty);
+        let compatible = match sh.kind {
+            ScalarKind::Str => ty == "String",
+            ScalarKind::Int => INT_TYPES.contains(&ty.as_str()),
+            ScalarKind::Bool => ty == "bool",
+            // `#[non_exhaustive]` catch-all: reject kinds this build
+            // does not know rather than generating a grammar that
+            // silently drops them.
+            _ => {
+                diags.push(Diagnostic::error(
+                    codes::UNSUPPORTED_SCALAR_SHORTHAND,
+                    format!(
+                        "{site}: unrecognised ScalarKind (upgrade dsl-kit-parse to a \
+                         version that knows about it)"
+                    ),
+                ));
+                continue;
+            }
+        };
+        if !compatible {
+            diags.push(Diagnostic::error(
+                codes::UNSUPPORTED_SCALAR_SHORTHAND,
+                format!(
+                    "{site}: shorthand kind `{}` cannot target `{}::{}` of type `{}`",
+                    sh.kind.as_str(),
+                    sh.variant,
+                    sh.field,
+                    field.ty
+                ),
+            ));
+        }
+    }
+    diags
 }
 
 /// Builds the rule for one variant. Two shapes:
@@ -438,9 +562,6 @@ fn resolved_field_value_peg(
 /// register a [`SyntaxOverrides`] entry (nor a paired
 /// `#[dsl_build(with = ...)]` converter) for these shapes.
 fn field_value_peg(f: &FieldSchema, ids: &IdGen) -> Option<Peg> {
-    const INT_TYPES: &[&str] = &[
-        "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
-    ];
     let ty = strip_ws(&f.ty);
     if ty == "String" {
         Some(token(ids, "%str"))
@@ -490,6 +611,46 @@ fn field_value_peg(f: &FieldSchema, ids: &IdGen) -> Option<Peg> {
     }
 }
 
+/// Value production for one declared scalar shorthand: a synthetic
+/// node of the target variant whose single field captures the scalar
+/// token. Structurally identical to what the explicit node spelling
+/// produces, so the two spellings land on the same `ParseTree` — the
+/// lowering is expressed in the grammar itself, no post-pass needed.
+fn scalar_shorthand_value_peg(sh: &ScalarShorthand, ids: &IdGen) -> Peg {
+    let scalar = match sh.kind {
+        ScalarKind::Str => token(ids, "%str"),
+        ScalarKind::Int => token(ids, "%int"),
+        ScalarKind::Bool => choice(ids, vec![token(ids, "%kw:true"), token(ids, "%kw:false")]),
+        // Unreachable in a generated grammar: the pre-flight check
+        // (`check_scalar_shorthands`) rejects unrecognised kinds with
+        // `UNSUPPORTED_SCALAR_SHORTHAND` before rule generation runs.
+        _ => unreachable!(
+            "pre-flight rejects unrecognised ScalarKind; child_arg_peg must not see it"
+        ),
+    };
+    node(
+        ids,
+        sh.variant.clone(),
+        field(ids, sh.field.clone(), scalar),
+    )
+}
+
+/// Value production for a `One` / `Optional` slot: the explicit node
+/// spelling, plus one alternative per declared scalar shorthand. The
+/// node arm is tried first so the explicit spelling always wins;
+/// a bare scalar cannot open a node production (`ident '('`), so the
+/// alternatives never overlap.
+fn one_slot_value_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
+    if c.scalar_shorthands.is_empty() {
+        return rule_ref(ids, START_RULE);
+    }
+    let mut alts = vec![rule_ref(ids, START_RULE)];
+    for sh in &c.scalar_shorthands {
+        alts.push(scalar_shorthand_value_peg(sh, ids));
+    }
+    choice(ids, alts)
+}
+
 /// Argument production for one child slot, by multiplicity.
 fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
     let name_kw = token(ids, format!("%kw:{}", c.name));
@@ -500,7 +661,7 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
             vec![
                 name_kw,
                 colon,
-                field(ids, c.name.clone(), rule_ref(ids, START_RULE)),
+                field(ids, c.name.clone(), one_slot_value_peg(c, ids)),
             ],
         ),
         // `name: <node>` or `name: none`. The Field arm is tried first,
@@ -516,7 +677,7 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
                 choice(
                     ids,
                     vec![
-                        field(ids, c.name.clone(), rule_ref(ids, START_RULE)),
+                        field(ids, c.name.clone(), one_slot_value_peg(c, ids)),
                         token(ids, "%kw:none"),
                     ],
                 ),
@@ -730,11 +891,13 @@ mod tests {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                     ],
                 },
@@ -745,6 +908,7 @@ mod tests {
                         name: "body".into(),
                         multiplicity: Multiplicity::Optional,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
                 VariantSchema {
@@ -754,6 +918,7 @@ mod tests {
                         name: "items".into(),
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
                 VariantSchema {
@@ -763,6 +928,7 @@ mod tests {
                         name: "entries".into(),
                         multiplicity: Multiplicity::Map,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
                 VariantSchema {
@@ -1070,6 +1236,7 @@ mod tests {
                         name: "children".into(),
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
                 VariantSchema {

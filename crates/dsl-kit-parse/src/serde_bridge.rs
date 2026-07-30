@@ -57,7 +57,10 @@
 use crate::import::{self, import_codes};
 use crate::{BuildError, BuiltinLevenshteinSuggester, Diagnostic, ParseTree, RawValue, codes};
 use dsl_kit_core::Suggester;
-use dsl_kit_schema::{ChildValueShape, Multiplicity, NodeSchema, VariantSchema};
+use dsl_kit_schema::{
+    ChildSchema, ChildValueShape, Multiplicity, NodeSchema, ScalarKind, ScalarShorthand,
+    VariantSchema,
+};
 use serde_json::Value;
 
 /// Additional diagnostic codes emitted specifically by the serde
@@ -77,6 +80,11 @@ pub mod serde_codes {
     /// A child slot's value shape did not match its
     /// [`Multiplicity`](dsl_kit_schema::Multiplicity) contract.
     pub const CHILD_SHAPE: &str = "dsl_kit::parse::serde::child_shape";
+    /// A [`RawValue::Text`] payload (PEG front-end) could not be
+    /// rendered as canonical JSON — its field type has no built-in
+    /// text → JSON mapping, or the text failed to parse as that type.
+    /// Emitted by [`to_canonical_json`](super::serde_bridge::to_canonical_json).
+    pub const CANONICAL_TEXT: &str = "dsl_kit::parse::serde::canonical_text";
 }
 
 /// Parses a JSON string into a [`ParseTree`], using `schema` to
@@ -273,15 +281,7 @@ fn build_tree(
                 };
                 tree.keyed_children.push((key.clone(), entries));
             } else {
-                let subtrees = build_child_slot(
-                    child.multiplicity,
-                    val,
-                    variant,
-                    key,
-                    schema,
-                    diags,
-                    suggester,
-                );
+                let subtrees = build_child_slot(child, val, variant, key, schema, diags, suggester);
                 tree.children.push((key.clone(), subtrees));
             }
         } else {
@@ -310,8 +310,37 @@ fn build_tree(
     Some(tree)
 }
 
+/// JSON kind of a scalar value, for shorthand dispatch. `None` for
+/// shapes no shorthand can accept (objects, arrays, null, floats).
+fn scalar_kind_of(val: &Value) -> Option<ScalarKind> {
+    match val {
+        Value::String(_) => Some(ScalarKind::Str),
+        Value::Number(n) if n.is_i64() || n.is_u64() => Some(ScalarKind::Int),
+        Value::Bool(_) => Some(ScalarKind::Bool),
+        _ => None,
+    }
+}
+
+/// Lowers a bare scalar into the canonical node spelling of its
+/// declared [`ScalarShorthand`] target. The produced tree is exactly
+/// what [`build_tree`] would have produced for
+/// `{"type": <variant>, <field>: <scalar>}` — the shorthand is an
+/// input-side projection, invisible below the front-end.
+fn lower_scalar_shorthand(val: &Value, shorthand: &ScalarShorthand) -> ParseTree {
+    let mut tree = ParseTree::new(shorthand.variant.clone());
+    tree.fields
+        .push((shorthand.field.clone(), RawValue::Json(val.clone())));
+    tree
+}
+
+/// Looks up the declared shorthand matching `val`'s scalar kind, if
+/// the slot declares one.
+fn shorthand_for<'a>(child: &'a ChildSchema, val: &Value) -> Option<&'a ScalarShorthand> {
+    scalar_kind_of(val).and_then(|k| child.scalar_shorthand(k))
+}
+
 fn build_child_slot(
-    m: Multiplicity,
+    child: &ChildSchema,
     val: &Value,
     variant: &VariantSchema,
     slot: &str,
@@ -319,12 +348,15 @@ fn build_child_slot(
     diags: &mut Vec<Diagnostic>,
     suggester: &dyn Suggester,
 ) -> Vec<ParseTree> {
-    match m {
+    match child.multiplicity {
         Multiplicity::One => match val {
             Value::Object(_) => build_tree(val, schema, diags, suggester)
                 .into_iter()
                 .collect(),
             _ => {
+                if let Some(shorthand) = shorthand_for(child, val) {
+                    return vec![lower_scalar_shorthand(val, shorthand)];
+                }
                 diags.push(Diagnostic::error(
                     serde_codes::CHILD_SHAPE,
                     format!(
@@ -343,6 +375,9 @@ fn build_child_slot(
                 .into_iter()
                 .collect(),
             _ => {
+                if let Some(shorthand) = shorthand_for(child, val) {
+                    return vec![lower_scalar_shorthand(val, shorthand)];
+                }
                 diags.push(Diagnostic::error(
                     serde_codes::CHILD_SHAPE,
                     format!(
@@ -540,6 +575,203 @@ fn kind(v: &Value) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical JSON dump
+// ---------------------------------------------------------------------------
+
+/// Renders a [`ParseTree`] as **canonical JSON**: the long-form object
+/// spelling with every input-side shorthand expanded.
+///
+/// Canonical means one shape per meaning:
+///
+/// - every node is the explicit `{"type": <variant>, ...}` object —
+///   a tree lowered from a scalar shorthand renders identically to
+///   one parsed from the explicit spelling, because the lowering
+///   happened at the front-end and this function never sees the
+///   difference;
+/// - `Optional` slots and absent optional payloads omit their key
+///   (never `null`);
+/// - keyed slots render as objects in the tree's sorted-by-key order;
+/// - object key order in the output is `serde_json`'s map order,
+///   which is deterministic for a given tree.
+///
+/// Two documents that parse (through either front-end) to equal
+/// meaning therefore serialize to the same `Value` — which makes this
+/// output the right input for content hashing: hash
+/// `serde_json::to_string(&to_canonical_json(...)?)` instead of the
+/// surface bytes, and adding a shorthand spelling for an existing
+/// value never invalidates a document's hash.
+///
+/// The tree is conformance-checked level by level on the way down;
+/// a non-conforming tree returns those diagnostics unchanged.
+/// [`RawValue::Text`] payloads (PEG front-end) are converted for the
+/// built-in canonical-syntax types (`String`, the integer types,
+/// `bool`, `Option<String>` — where the literal `none` omits the
+/// key — and `Vec<String>`); other text payload types report
+/// [`serde_codes::CANONICAL_TEXT`].
+pub fn to_canonical_json(tree: &ParseTree, schema: &NodeSchema) -> Result<Value, BuildError> {
+    let mut diags = Vec::new();
+    let value = canonical_node(tree, schema, &mut diags);
+    match value {
+        Some(v) if diags.is_empty() => Ok(v),
+        _ => {
+            if diags.is_empty() {
+                // Structural miss that conformance did not cover (e.g. a
+                // scalar keyed entry with no `value` field) — keep the
+                // error bag non-empty so the failure stays loud.
+                diags.push(Diagnostic::error(
+                    serde_codes::CANONICAL_TEXT,
+                    "tree shape not renderable as canonical JSON".to_string(),
+                ));
+            }
+            Err(BuildError::new(diags))
+        }
+    }
+}
+
+fn canonical_node(
+    tree: &ParseTree,
+    schema: &NodeSchema,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<Value> {
+    let level = crate::check_conformance(tree, schema);
+    if !level.is_empty() {
+        diags.extend(level);
+        return None;
+    }
+    // Conformance passed, so the variant, every field name, and every
+    // slot name below are declared; lookups can only miss on a bug in
+    // `check_conformance` itself, which the `?`s would surface as an
+    // (empty-key) omission rather than a panic.
+    let variant = schema.variant(&tree.variant)?;
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".to_string(), Value::String(tree.variant.clone()));
+
+    for (name, raw) in &tree.fields {
+        let field = variant.fields.iter().find(|f| &f.name == name)?;
+        match raw {
+            RawValue::Json(v) => {
+                obj.insert(name.clone(), v.clone());
+            }
+            RawValue::Text(text) => match canonical_json_from_text(text, &field.ty) {
+                Ok(Some(v)) => {
+                    obj.insert(name.clone(), v);
+                }
+                Ok(None) => {} // absent optional — canonical form omits the key
+                Err(reason) => {
+                    diags.push(Diagnostic::error(
+                        serde_codes::CANONICAL_TEXT,
+                        format!("field `{}` on variant `{}`: {}", name, variant.name, reason),
+                    ));
+                }
+            },
+        }
+    }
+
+    for (slot, subtrees) in &tree.children {
+        let child = variant.children.iter().find(|c| &c.name == slot)?;
+        match child.multiplicity {
+            Multiplicity::One => {
+                let v = canonical_node(&subtrees[0], schema, diags)?;
+                obj.insert(slot.clone(), v);
+            }
+            Multiplicity::Optional => {
+                if let Some(sub) = subtrees.first() {
+                    let v = canonical_node(sub, schema, diags)?;
+                    obj.insert(slot.clone(), v);
+                }
+            }
+            _ => {
+                let items: Option<Vec<Value>> = subtrees
+                    .iter()
+                    .map(|sub| canonical_node(sub, schema, diags))
+                    .collect();
+                obj.insert(slot.clone(), Value::Array(items?));
+            }
+        }
+    }
+
+    for (slot, entries) in &tree.keyed_children {
+        let child = variant.children.iter().find(|c| &c.name == slot)?;
+        let mut map = serde_json::Map::new();
+        for (key, entry) in entries {
+            let v = match &child.value_shape {
+                ChildValueShape::Scalar { ty } => match entry.field("value") {
+                    Some(RawValue::Json(v)) => Some(v.clone()),
+                    Some(RawValue::Text(text)) => match canonical_json_from_text(text, ty) {
+                        Ok(v) => v,
+                        Err(reason) => {
+                            diags.push(Diagnostic::error(
+                                serde_codes::CANONICAL_TEXT,
+                                format!(
+                                    "keyed slot `{}` entry `{}` on variant `{}`: {}",
+                                    slot, key, variant.name, reason
+                                ),
+                            ));
+                            None
+                        }
+                    },
+                    None => None,
+                },
+                _ => canonical_node(entry, schema, diags),
+            };
+            map.insert(key.clone(), v?);
+        }
+        obj.insert(slot.clone(), Value::Object(map));
+    }
+
+    Some(Value::Object(obj))
+}
+
+/// Converts a [`RawValue::Text`] payload to its canonical JSON value
+/// by the field's Rust type source text. `Ok(None)` means the field
+/// is canonically *absent* (an optional payload spelled `none`).
+/// Covers the same built-in type set as `schema_gen`'s canonical
+/// syntax mapping, so any text a generated grammar can produce for
+/// these types converts back.
+fn canonical_json_from_text(text: &str, ty: &str) -> Result<Option<Value>, String> {
+    const INT_TYPES: &[&str] = &[
+        "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+    ];
+    let ty: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+    if ty == "String" {
+        Ok(Some(Value::String(text.to_string())))
+    } else if INT_TYPES.contains(&ty.as_str()) {
+        if let Ok(n) = text.parse::<i64>() {
+            Ok(Some(Value::Number(n.into())))
+        } else if let Ok(n) = text.parse::<u64>() {
+            Ok(Some(Value::Number(n.into())))
+        } else {
+            Err(format!("text `{text}` does not parse as `{ty}`"))
+        }
+    } else if ty == "bool" {
+        match text {
+            "true" => Ok(Some(Value::Bool(true))),
+            "false" => Ok(Some(Value::Bool(false))),
+            _ => Err(format!("text `{text}` does not parse as `bool`")),
+        }
+    } else if ty == "Option<String>" {
+        // Mirrors `build_field_optional`: the literal `none` is the
+        // absent spelling, anything else is the payload itself.
+        if text == "none" {
+            Ok(None)
+        } else {
+            Ok(Some(Value::String(text.to_string())))
+        }
+    } else if ty == "Vec<String>" {
+        // The generated grammar contributes a JSON-compatible array
+        // literal as the field text (see `field_value_peg`).
+        serde_json::from_str::<Value>(text)
+            .map(Some)
+            .map_err(|e| format!("text `{text}` does not parse as `Vec<String>`: {e}"))
+    } else {
+        Err(format!(
+            "type `{ty}` has no canonical text → JSON mapping (supported: String, the \
+             integer types, bool, Option<String>, Vec<String>)"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -573,11 +805,13 @@ mod tests {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                     ],
                 },
@@ -593,11 +827,13 @@ mod tests {
                             name: "value".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                         ChildSchema {
                             name: "body".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                     ],
                 },
@@ -608,6 +844,7 @@ mod tests {
                         name: "items".into(),
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
                 VariantSchema {
@@ -617,6 +854,7 @@ mod tests {
                         name: "inner".into(),
                         multiplicity: Multiplicity::Optional,
                         value_shape: ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 },
             ],

@@ -191,6 +191,19 @@ pub struct ChildSchema {
     /// issue) set this to [`ChildValueShape::Scalar`] and carry the
     /// value type as source text.
     pub value_shape: ChildValueShape,
+    /// Declared scalar shorthands accepted by this slot
+    /// ([`ScalarShorthand`]). Empty for every slot that accepts only
+    /// the canonical node spelling — the historical behaviour, and
+    /// the default of every constructor helper.
+    ///
+    /// Only meaningful on [`Multiplicity::One`] /
+    /// [`Multiplicity::Optional`] slots with
+    /// [`ChildValueShape::Recursive`] values; consumers reject other
+    /// combinations up front rather than guessing a meaning for them.
+    /// At most one entry per [`ScalarKind`] — the front-ends dispatch
+    /// on the input's kind alone, never by trial deserialization, so
+    /// a duplicate kind would make the mapping ambiguous.
+    pub scalar_shorthands: Vec<ScalarShorthand>,
 }
 
 impl Default for ChildValueShape {
@@ -213,6 +226,7 @@ impl ChildSchema {
             name: name.into(),
             multiplicity,
             value_shape: ChildValueShape::Recursive,
+            scalar_shorthands: Vec::new(),
         }
     }
 
@@ -226,7 +240,36 @@ impl ChildSchema {
             value_shape: ChildValueShape::Scalar {
                 ty: value_ty.into(),
             },
+            scalar_shorthands: Vec::new(),
         }
+    }
+
+    /// Adds a declared scalar shorthand to the slot (builder style).
+    ///
+    /// ```
+    /// use dsl_kit_schema::{ChildSchema, Multiplicity, ScalarKind};
+    ///
+    /// let slot = ChildSchema::recursive("content", Multiplicity::One)
+    ///     .with_scalar_shorthand(ScalarKind::Str, "Literal", "value");
+    /// assert_eq!(slot.scalar_shorthands.len(), 1);
+    /// ```
+    pub fn with_scalar_shorthand(
+        mut self,
+        kind: ScalarKind,
+        variant: impl Into<String>,
+        field: impl Into<String>,
+    ) -> Self {
+        self.scalar_shorthands.push(ScalarShorthand {
+            kind,
+            variant: variant.into(),
+            field: field.into(),
+        });
+        self
+    }
+
+    /// Looks up the declared shorthand for a scalar kind, if any.
+    pub fn scalar_shorthand(&self, kind: ScalarKind) -> Option<&ScalarShorthand> {
+        self.scalar_shorthands.iter().find(|s| s.kind == kind)
     }
 
     /// Renders the child field as a JSON value.
@@ -235,9 +278,11 @@ impl ChildSchema {
     /// layout (just `name` + `multiplicity`) so external consumers
     /// that do not know about `value_shape` are unaffected. Scalar
     /// slots gain a `"value"` object carrying the shape's kind and
-    /// scalar `type` string.
+    /// scalar `type` string. Declared scalar shorthands gain a
+    /// `"scalar_shorthands"` array; slots without any keep the
+    /// historical layout, again so unaware consumers see no change.
     pub fn to_json(&self) -> Value {
-        match &self.value_shape {
+        let mut obj = match &self.value_shape {
             ChildValueShape::Recursive => json!({
                 "name": self.name,
                 "multiplicity": self.multiplicity.as_str(),
@@ -247,7 +292,86 @@ impl ChildSchema {
                 "multiplicity": self.multiplicity.as_str(),
                 "value": { "kind": "scalar", "type": ty },
             }),
+        };
+        if !self.scalar_shorthands.is_empty() {
+            obj["scalar_shorthands"] = Value::Array(
+                self.scalar_shorthands
+                    .iter()
+                    .map(ScalarShorthand::to_json)
+                    .collect(),
+            );
         }
+        obj
+    }
+}
+
+/// JSON kind accepted by a declared scalar shorthand.
+///
+/// The front-ends dispatch on the *input's* kind — a JSON string /
+/// integer / boolean, or the corresponding canonical-text token — and
+/// each kind maps to at most one declared target, so resolution never
+/// depends on declaration order or trial deserialization.
+///
+/// The enum is `#[non_exhaustive]` so future kinds can be added as
+/// minor bumps. Out-of-crate matches must therefore include a `_ =>`
+/// arm; in-crate matches (this workspace) remain exhaustively checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScalarKind {
+    /// A JSON string (`%str` in canonical text).
+    Str,
+    /// A JSON integer (`%int` in canonical text).
+    Int,
+    /// A JSON boolean (`true` / `false` in canonical text).
+    Bool,
+}
+
+impl ScalarKind {
+    /// Returns the wire-format string used by
+    /// [`ScalarShorthand::to_json`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScalarKind::Str => "string",
+            ScalarKind::Int => "int",
+            ScalarKind::Bool => "bool",
+        }
+    }
+}
+
+/// A declared scalar shorthand on a [`ChildSchema`] slot.
+///
+/// When a [`Multiplicity::One`] / [`Multiplicity::Optional`] child
+/// slot receives a bare scalar of [`kind`](Self::kind) instead of the
+/// canonical node spelling, the front-ends lower it to a node of
+/// [`variant`](Self::variant) whose [`field`](Self::field) carries the
+/// scalar — producing the *same* `ParseTree` as the explicit spelling.
+/// The shorthand is an input-side projection only: canonical
+/// serialization always emits the node spelling, and the lowered tree
+/// is indistinguishable from one parsed from it.
+///
+/// The mapping is declared, never inferred: the target variant is
+/// named here (via `#[dsl_schema(scalar(...))]` on the slot field, or
+/// [`ChildSchema::with_scalar_shorthand`] in hand-written schemas), so
+/// adding another scalar-carrying variant to the enum later cannot
+/// silently change what a bare scalar means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalarShorthand {
+    /// Input kind the shorthand accepts.
+    pub kind: ScalarKind,
+    /// Target variant name the scalar lowers to.
+    pub variant: String,
+    /// Payload field on the target variant that carries the scalar.
+    pub field: String,
+}
+
+impl ScalarShorthand {
+    /// Renders the shorthand as a JSON value.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "kind": self.kind.as_str(),
+            "variant": self.variant,
+            "field": self.field,
+        })
     }
 }
 
@@ -318,14 +442,12 @@ pub enum Multiplicity {
     /// supported end to end — derive, conformance, the JSON bridge,
     /// generated grammars and `DslBuild`. Scalar values
     /// (`BTreeMap<String, T>` where `T` is a scalar payload type —
-    /// Shape 1 of the tracking issue) are recognised by the derive
-    /// (`ChildValueShape::Scalar { ty }`), the JSON ⇔ ParseTree
-    /// bridge, and `DslBuild` via `build_scalar_map`; the PEG
-    /// grammar generator and canonical text syntax do **not** yet
-    /// route on the scalar shape, so a scalar-map schema fed through
-    /// `schema_gen::grammar_from_schema` produces a grammar that
-    /// expects each entry's value to be a full AST node — use the
-    /// JSON front-end for scalar-map DSLs until PEG catches up.
+    /// Shape 1 of the tracking issue) are supported end to end as of
+    /// 0.7: the derive (`ChildValueShape::Scalar { ty }`), the
+    /// JSON ⇔ ParseTree bridge, `DslBuild` via `build_scalar_map`,
+    /// and the PEG grammar generator / canonical text syntax (each
+    /// entry's value is a bare scalar, lowered through a synthetic
+    /// `value`-field leaf node — see `schema_gen::child_arg_peg`).
     /// Keyed slots whose values are *another* AST type (Shape 2) are
     /// still being staged.
     Map,
@@ -375,6 +497,7 @@ mod tests {
                     name: "entries".into(),
                     multiplicity: Multiplicity::Map,
                     value_shape: ChildValueShape::Recursive,
+                    scalar_shorthands: vec![],
                 }],
             }],
         };

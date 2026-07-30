@@ -855,6 +855,7 @@ mod tests {
                         name: "kids".into(),
                         multiplicity: Multiplicity::Many,
                         value_shape: dsl_kit_schema::ChildValueShape::Recursive,
+                        scalar_shorthands: vec![],
                     }],
                 }],
             }
@@ -1046,6 +1047,7 @@ mod tests {
                             name: "entries".into(),
                             multiplicity: Multiplicity::Map,
                             value_shape: dsl_kit_schema::ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         }],
                     }],
                 }

@@ -467,6 +467,160 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// One parsed `#[dsl_schema(scalar(<kind> = Variant::field))]`
+/// declaration on a child-slot field.
+struct ScalarShorthandDecl {
+    /// Declared kind key: `"string"` / `"int"` / `"bool"`.
+    kind: String,
+    /// Target variant name (first path segment).
+    variant: String,
+    /// Target payload field name (second path segment).
+    field: String,
+    /// The declaration's path, kept for error spans.
+    path: syn::Path,
+}
+
+/// Integer payload types a `scalar(int = ...)` shorthand may target.
+/// Mirrors `dsl_kit_parse::schema_gen`'s built-in `%int` mapping.
+const SCALAR_INT_TYPES: &[&str] = &[
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
+];
+
+/// Parses a field's `#[dsl_schema(scalar(...))]` annotations.
+/// `Ok(vec![])` when the field carries no `dsl_schema` attribute.
+fn dsl_schema_scalar_attrs(f: &syn::Field) -> syn::Result<Vec<ScalarShorthandDecl>> {
+    let mut out = Vec::new();
+    for attr in &f.attrs {
+        if !attr.path().is_ident("dsl_schema") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("scalar") {
+                return Err(meta.error(
+                    "unsupported #[dsl_schema(...)] key; expected `scalar(<kind> = Variant::field)`",
+                ));
+            }
+            meta.parse_nested_meta(|inner| {
+                let kind = inner
+                    .path
+                    .get_ident()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                if !matches!(kind.as_str(), "string" | "int" | "bool") {
+                    return Err(inner.error(
+                        "unsupported scalar kind; expected `string`, `int`, or `bool`",
+                    ));
+                }
+                let path: syn::Path = inner.value()?.parse()?;
+                if path.segments.len() != 2 {
+                    return Err(syn::Error::new_spanned(
+                        &path,
+                        "expected a `Variant::field` path (exactly two segments)",
+                    ));
+                }
+                let variant = path.segments[0].ident.to_string();
+                let field = path.segments[1].ident.to_string();
+                out.push(ScalarShorthandDecl {
+                    kind,
+                    variant,
+                    field,
+                    path,
+                });
+                Ok(())
+            })
+        })?;
+    }
+    Ok(out)
+}
+
+/// Whether the field carries any `#[dsl_schema(...)]` attribute —
+/// used to reject the attribute on positions it has no meaning for.
+fn has_dsl_schema_attr(f: &syn::Field) -> bool {
+    f.attrs.iter().any(|a| a.path().is_ident("dsl_schema"))
+}
+
+/// Validates parsed shorthand declarations against the whole enum:
+/// no duplicate kinds, target variant exists, target field is a plain
+/// payload field of a type the kind can carry. Mirrors the runtime
+/// pre-flight in `dsl_kit_parse::schema_gen` so derive users get the
+/// report at compile time instead.
+fn validate_scalar_decls(
+    decls: &[ScalarShorthandDecl],
+    data: &syn::DataEnum,
+    enum_name: &Ident,
+) -> syn::Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for d in decls {
+        if seen.contains(&d.kind.as_str()) {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "duplicate `scalar({} = ...)` declaration on this slot",
+                    d.kind
+                ),
+            ));
+        }
+        seen.push(&d.kind);
+        let Some(target) = data.variants.iter().find(|v| v.ident == d.variant) else {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "shorthand target variant `{}` is not a variant of this enum",
+                    d.variant
+                ),
+            ));
+        };
+        let Fields::Named(fields) = &target.fields else {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "shorthand target variant `{}` must use named fields",
+                    d.variant
+                ),
+            ));
+        };
+        let Some(target_field) = fields
+            .named
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == d.field.as_str()))
+        else {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "shorthand target variant `{}` has no field `{}`",
+                    d.variant, d.field
+                ),
+            ));
+        };
+        if d.field == "id" || detect_recursion(&target_field.ty, enum_name).is_some() {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "shorthand target `{}::{}` must be a plain payload field",
+                    d.variant, d.field
+                ),
+            ));
+        }
+        let ty = normalize_type_str(&target_field.ty.to_token_stream().to_string());
+        let compatible = match d.kind.as_str() {
+            "string" => ty == "String",
+            "int" => SCALAR_INT_TYPES.contains(&ty.as_str()),
+            "bool" => ty == "bool",
+            _ => false,
+        };
+        if !compatible {
+            return Err(syn::Error::new_spanned(
+                &d.path,
+                format!(
+                    "scalar kind `{}` cannot target `{}::{}` of type `{}`",
+                    d.kind, d.variant, d.field, ty
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Derives `dsl_kit_schema::DslSchema` for the same enum shape accepted
 /// by [`DslNode`]. The generated `schema()` method returns a
 /// `NodeSchema` describing every variant, its non-recursive payload
@@ -486,7 +640,30 @@ pub fn derive_dsl_node(input: TokenStream) -> TokenStream {
 /// `ChildValueShape::Scalar { ty }`; the value type is captured as
 /// Rust source text. Every remaining named field becomes a
 /// `FieldSchema` carrying the Rust type source text.
-#[proc_macro_derive(DslSchema)]
+///
+/// ## Scalar shorthands (`#[dsl_schema(scalar(...))]`)
+///
+/// A `One` / `Optional` child slot may declare that a bare scalar in
+/// its position lowers to a named variant:
+///
+/// ```ignore
+/// FsWrite {
+///     id: NodeId,
+///     path: String,
+///     #[dsl_schema(scalar(string = Literal::value))]
+///     content: Box<Self>,
+/// },
+/// Literal { id: NodeId, value: String },
+/// ```
+///
+/// The declaration is recorded in the schema
+/// (`ChildSchema::scalar_shorthands`) so every consumer — the JSON
+/// bridge, the generated canonical-text grammar, wire formats — lowers
+/// the same way. Kinds: `string` / `int` / `bool`, at most one each
+/// per slot; the target must be a plain payload field of a matching
+/// type on a variant of the same enum. The macro validates all of
+/// that at compile time.
+#[proc_macro_derive(DslSchema, attributes(dsl_schema))]
 pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident.clone();
@@ -528,6 +705,48 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
             }
 
             if let Some(kind) = detect_recursion(&f.ty, &name) {
+                let decls = match dsl_schema_scalar_attrs(f) {
+                    Ok(decls) => decls,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                let one_or_optional = matches!(
+                    kind,
+                    Recursion::Direct
+                        | Recursion::Boxed
+                        | Recursion::Optional
+                        | Recursion::OptionalBoxed
+                );
+                if !decls.is_empty() && !one_or_optional {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_schema(scalar(...))] applies to `One` / `Optional` child \
+                         slots only (`T` / `Box<T>` / `Option<T>` / `Option<Box<T>>`)",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if let Err(e) = validate_scalar_decls(&decls, data, &name) {
+                    return e.to_compile_error().into();
+                }
+                let shorthand_ctors: Vec<TokenStream2> = decls
+                    .iter()
+                    .map(|d| {
+                        let kind_ident = match d.kind.as_str() {
+                            "string" => quote!(Str),
+                            "int" => quote!(Int),
+                            _ => quote!(Bool),
+                        };
+                        let variant = &d.variant;
+                        let field = &d.field;
+                        quote! {
+                            ::dsl_kit_schema::ScalarShorthand {
+                                kind: ::dsl_kit_schema::ScalarKind::#kind_ident,
+                                variant: #variant.to_string(),
+                                field: #field.to_string(),
+                            }
+                        }
+                    })
+                    .collect();
                 let mult = match kind {
                     Recursion::Direct | Recursion::Boxed => quote!(One),
                     Recursion::Optional | Recursion::OptionalBoxed => quote!(Optional),
@@ -539,6 +758,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                         name: #ident_str.to_string(),
                         multiplicity: ::dsl_kit_schema::Multiplicity::#mult,
                         value_shape: ::dsl_kit_schema::ChildValueShape::Recursive,
+                        scalar_shorthands: ::std::vec![#(#shorthand_ctors),*],
                     }
                 });
             } else if let Some(value_ty) = detect_scalar_map(&f.ty, &name) {
@@ -548,6 +768,15 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                 // `ChildValueShape::Scalar { ty }`; the value type is
                 // stored as Rust source text so schema consumers can
                 // dispatch on it without a semantic type system.
+                if has_dsl_schema_attr(f) {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_schema(...)] applies to `One` / `Optional` child slots, \
+                         not keyed scalar slots",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
                 let value_ty_src = normalize_type_str(&value_ty.to_token_stream().to_string());
                 child_ctors.push(quote! {
                     ::dsl_kit_schema::ChildSchema {
@@ -556,9 +785,19 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                         value_shape: ::dsl_kit_schema::ChildValueShape::Scalar {
                             ty: #value_ty_src.to_string(),
                         },
+                        scalar_shorthands: ::std::vec![],
                     }
                 });
             } else {
+                if has_dsl_schema_attr(f) {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_schema(...)] applies to `One` / `Optional` child slots, \
+                         not payload fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
                 let ty_src = normalize_type_str(&f.ty.to_token_stream().to_string());
                 let (shape, _) = payload_shape(&f.ty, &name);
                 let optional = matches!(shape, PayloadShape::OptionInner | PayloadShape::VecInner,);

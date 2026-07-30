@@ -507,11 +507,13 @@ mod tests {
                             name: "lhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
+                            scalar_shorthands: vec![],
                         },
                     ],
                 },
