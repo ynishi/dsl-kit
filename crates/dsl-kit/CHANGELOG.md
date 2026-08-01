@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/ynishi/dsl-kit/compare/v0.9.0...v0.10.0) - 2026-08-01
+
+### Added
+
+- *(parse)* @allow text syntax + cfg-host suppression wiring
+- *(parse)* [**breaking**] carry $allow on the ParseTree — JSON front-end, canonical dump, build-time AllowTable
+- *(lint)* honour usage-site suppressions — Linter::lint_with_allows
+- *(lint)* keyed rule removal — Linter::without_rule + rule_names
+
+### Other
+
+- document the conformance/lint boundary + fix tool-surface doc drift
+
 ## [0.9.0](https://github.com/ynishi/dsl-kit/compare/v0.8.0...v0.9.0) - 2026-08-01
 
 ### Added
