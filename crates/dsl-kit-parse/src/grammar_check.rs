@@ -225,6 +225,14 @@ pub fn check_schema_consistency_with(
                 if variant == crate::import::IMPORT_VARIANT {
                     return;
                 }
+                // Same argument for the reserved suppression wrapper
+                // (`$allow`, injected by
+                // `crate::allow::add_allow_syntax`): it is annotation
+                // syntax that `crate::allow::collapse` folds away on
+                // every text parse, so it never faces the schema.
+                if variant == crate::allow::ALLOW_VARIANT {
+                    return;
+                }
                 referenced.insert(variant.clone());
                 if !declared.contains(variant.as_str()) {
                     let base = format!(

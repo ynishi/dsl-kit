@@ -14,7 +14,7 @@
 #![warn(missing_docs)]
 
 use cfg_dsl::{Cfg, CfgAst, cfg_engine, count_nodes, demo_document, pretty};
-use dsl_kit::{BreakpointSet, DslNode, Engine, IdGen, Pending, StepOutcome, Stepper};
+use dsl_kit::{AllowTable, BreakpointSet, DslNode, Engine, IdGen, Pending, StepOutcome, Stepper};
 use dsl_kit_mcp::host::{
     DslHost, EventCounts, HostLocation, HostOutcome, HostSnapshot, PendingProjection, ResolvedCall,
     SuspendedCall,
@@ -28,6 +28,11 @@ const CFG_DEMO_DOCUMENT: &str = include_str!("./resources_data/demo-document.md"
 pub struct CfgHost {
     document: Cfg,
     engine: Engine<CfgAst>,
+    /// Usage-site lint suppressions the loaded document declared,
+    /// keyed on the `NodeId` the build minted for each annotated node.
+    /// Empty for a hand-supplied document — an annotation is something
+    /// a document spells, so only the load paths can produce one.
+    allows: AllowTable,
     /// Resolution history projected into `HostSnapshot::results`.
     resolved_log: Vec<(u64, String)>,
     final_value: Option<String>,
@@ -46,6 +51,7 @@ impl CfgHost {
         Self {
             document,
             engine,
+            allows: AllowTable::default(),
             resolved_log: Vec::new(),
             final_value: None,
         }
@@ -254,8 +260,14 @@ impl DslHost for CfgHost {
 
     fn lint_json(&self) -> Option<String> {
         use dsl_kit_lint::Linter;
-        let diagnostics = Linter::<Cfg>::with_defaults().lint(&self.document);
-        let value: Vec<serde_json::Value> = diagnostics
+        // The document's own `$allow` / `@allow` annotations are
+        // honoured here: a node that named a rule it accepts does not
+        // report that rule again. What they silenced stays enumerable
+        // in `outcome.suppressed`; this surface reports the findings
+        // that survived.
+        let outcome = Linter::<Cfg>::with_defaults().lint_with_allows(&self.document, &self.allows);
+        let value: Vec<serde_json::Value> = outcome
+            .diagnostics
             .into_iter()
             .map(|d| {
                 serde_json::json!({
@@ -279,6 +291,9 @@ impl DslHost for CfgHost {
         let tree = from_json_str(input, &Cfg::schema()).map_err(|e| e.to_json().to_string())?;
         let ids = IdGen::new();
         let document = Cfg::from_parse_tree(&tree, &ids).map_err(|e| e.to_json().to_string())?;
+        // Take the annotations the build recorded against the ids it
+        // just minted, before the generator goes out of scope.
+        self.allows = ids.take_allows();
         self.document = document;
         self.reset();
         Ok(())
@@ -290,6 +305,7 @@ impl DslHost for CfgHost {
         sources_json: &str,
     ) -> Result<String, String> {
         use dsl_kit_parse::DslBuild;
+        use dsl_kit_parse::allow::add_allow_syntax;
         use dsl_kit_parse::import::{Loader, MapResolver, add_import_syntax};
         use dsl_kit_parse::schema_gen::checked_grammar_from_schema;
         use dsl_kit_schema::DslSchema;
@@ -298,12 +314,14 @@ impl DslHost for CfgHost {
             MapResolver::from_sources_json(sources_json).map_err(|e| e.to_json().to_string())?;
         let schema = Cfg::schema();
         let ids = IdGen::new();
-        // Text sources spell imports as `@import "name"` — same
+        // Text sources spell imports as `@import "name"` and
+        // suppressions as `@allow("rule") <node>` — same
         // schema-generated grammar the round-trip tests exercise, with
-        // the reserved spelling injected on top.
+        // both reserved spellings injected on top.
         let mut grammar =
             checked_grammar_from_schema(&schema, &ids).map_err(|e| e.to_json().to_string())?;
         add_import_syntax(&mut grammar, &ids).map_err(|e| e.to_json().to_string())?;
+        add_allow_syntax(&mut grammar, &ids).map_err(|e| e.to_json().to_string())?;
 
         let loaded = Loader::new(&schema)
             .with_grammar(&grammar)
@@ -311,6 +329,7 @@ impl DslHost for CfgHost {
             .map_err(|e| e.to_json().to_string())?;
         let document =
             Cfg::from_parse_tree(&loaded.tree, &ids).map_err(|e| e.to_json().to_string())?;
+        self.allows = ids.take_allows();
         self.document = document;
         self.reset();
         Ok(serde_json::json!({

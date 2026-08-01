@@ -296,7 +296,7 @@ impl Grammar {
             Some(ActiveSink::Top(t)) => t,
             _ => unreachable!("top sink must be present"),
         };
-        top.tree.ok_or_else(|| {
+        let tree = top.tree.ok_or_else(|| {
             BuildError::single(Diagnostic::error(
                 codes::NO_TOP_TREE,
                 format!(
@@ -305,7 +305,13 @@ impl Grammar {
                     self.start
                 ),
             ))
-        })
+        })?;
+        // Reserved `@allow` wrappers are surface syntax, not tree
+        // shape: fold them onto the nodes they annotate before anyone
+        // downstream can see one. Unconditional because a grammar
+        // without `crate::allow::add_allow_syntax` cannot produce a
+        // wrapper, which makes this a plain walk over the result.
+        crate::allow::collapse(tree)
     }
 }
 

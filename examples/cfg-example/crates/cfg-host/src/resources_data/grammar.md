@@ -78,6 +78,24 @@ let document = Cfg::Env {
 For a bigger worked example see
 `dsl-kit://dsl/cfg/samples/demo-document`.
 
+## Accepting a lint finding at one node
+
+`dsl_kit_lint` is advisory, and a document can waive one of its
+findings where the author knows better. The reserved `$allow` key
+names the rules accepted at a node, and the annotation covers that
+node and everything under it:
+
+```json
+{ "type": "Env", "$allow": ["no-redundant-wrap"], "bindings": { … } }
+```
+
+Bundle sources written in canonical text spell the same thing as a
+prefix — `@allow("no-redundant-wrap") Env(bindings: { … })` — because
+`CfgHost` opts its grammar into the reserved spelling. `["*"]` on the
+root quiets the whole document. Correctness and contract rules are not
+waivable this way, and neither is anything `dsl_kit_load` rejects:
+conformance is a gate, lint is a report.
+
 ## Resolving references
 
 `dsl_kit_resolve` takes `result` as the string value to substitute.

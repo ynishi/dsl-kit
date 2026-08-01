@@ -107,9 +107,17 @@ A document with lint findings still loads and still runs — findings
 are material for an author or an agent to act on, not a gate. A DSL
 that never wires a linter simply reports itself as unwired.
 
-There is no ignore-file layer. The levers — declare the constraint in
-the schema, compose the rule set, filter the output — are documented
-on the `dsl-kit-lint` crate.
+There is no ignore-file layer. The most local lever belongs to the
+document: a node names the rules it accepts at that spot — `"$allow":
+["max-fan-out"]` in JSON, `@allow("max-fan-out") <node>` in canonical
+text once the host has opted the grammar in — and the annotation
+covers that node and its subtree, so `["*"]` on the root quiets the
+whole document. Correctness and contract findings stand regardless:
+the first says the program is wrong, the second that it breaks a
+ceiling its caller imposed, and neither is the document's to waive.
+The remaining levers — declare the constraint in the schema, compose
+the rule set, filter the output — are documented on the `dsl-kit-lint`
+crate.
 
 ## Crates
 

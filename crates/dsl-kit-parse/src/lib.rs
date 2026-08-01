@@ -571,6 +571,21 @@ pub fn check_conformance_with(
         return out;
     }
 
+    if tree.variant == allow::ALLOW_VARIANT {
+        out.push(
+            Diagnostic::error(
+                allow::codes::UNCOLLAPSED,
+                format!(
+                    "un-collapsed `{}` wrapper — run the tree through \
+                     `allow::collapse` (every text parse already does) before conformance",
+                    allow::ALLOW_VARIANT
+                ),
+            )
+            .with_span(tree.span),
+        );
+        return out;
+    }
+
     let Some(variant) = schema.variant(&tree.variant) else {
         let msg = format_unknown_variant(&tree.variant, schema, suggester);
         out.push(Diagnostic::error(codes::UNKNOWN_VARIANT, msg).with_span(tree.span));
