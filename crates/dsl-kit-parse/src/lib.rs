@@ -429,6 +429,12 @@ pub mod codes {
     /// A [`crate::Multiplicity::Optional`] slot carried more than one
     /// child.
     pub const ARITY_OPTIONAL: &str = "dsl_kit::parse::arity_optional";
+    /// A collection slot declared non-empty
+    /// ([`ChildSchema::non_empty`](dsl_kit_schema::ChildSchema::non_empty))
+    /// carried no elements. Declared-constraint violation, not a
+    /// heuristic — plain `Many` / `Map` slots keep their
+    /// zero-or-more contract.
+    pub const ARITY_NON_EMPTY: &str = "dsl_kit::parse::arity_non_empty";
     /// A payload field appeared under `children` (structural mismatch).
     pub const FIELD_AS_CHILD: &str = "dsl_kit::parse::field_as_child";
     /// A child slot appeared under `fields` (structural mismatch).
@@ -771,12 +777,42 @@ fn check_children(
                 }
             }
             Multiplicity::Many => {
-                // Zero is fine at the shape level.
+                // Zero is fine at the shape level — unless the schema
+                // *declares* otherwise. An absent slot and a
+                // present-but-empty slot both count as empty (the two
+                // spellings mean the same thing everywhere else).
+                if c.non_empty && count == 0 {
+                    out.push(
+                        Diagnostic::error(
+                            codes::ARITY_NON_EMPTY,
+                            format!(
+                                "child slot `{}` on variant `{}` is declared non-empty \
+                                 but carries no children",
+                                c.name, variant.name
+                            ),
+                        )
+                        .with_span(tree.span),
+                    );
+                }
             }
             Multiplicity::Map => {
                 // Zero-or-more keyed entries is fine at the shape
-                // level (same as `Many`); what a map *cannot* carry is
-                // the same key twice.
+                // level (same as `Many`) — unless declared non-empty,
+                // mirroring the `Many` arm above; what a map *cannot*
+                // carry either way is the same key twice.
+                if c.non_empty && keyed.is_none_or(<[(String, ParseTree)]>::is_empty) {
+                    out.push(
+                        Diagnostic::error(
+                            codes::ARITY_NON_EMPTY,
+                            format!(
+                                "keyed child slot `{}` on variant `{}` is declared \
+                                 non-empty but carries no entries",
+                                c.name, variant.name
+                            ),
+                        )
+                        .with_span(tree.span),
+                    );
+                }
                 //
                 // Walking adjacent pairs checks that in one linear
                 // pass — and the same pass verifies the sorted-by-key
@@ -1423,12 +1459,14 @@ mod tests {
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                     ],
                 },
@@ -1445,12 +1483,14 @@ mod tests {
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                         ChildSchema {
                             name: "body".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                     ],
                 },

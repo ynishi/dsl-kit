@@ -204,6 +204,20 @@ pub struct ChildSchema {
     /// on the input's kind alone, never by trial deserialization, so
     /// a duplicate kind would make the mapping ambiguous.
     pub scalar_shorthands: Vec<ScalarShorthand>,
+    /// Declared non-emptiness for collection slots. `false` (the
+    /// historical behaviour and every constructor's default) keeps
+    /// the zero-or-more contract; `true` declares that the slot must
+    /// hold at least one element.
+    ///
+    /// Only meaningful on [`Multiplicity::Many`] /
+    /// [`Multiplicity::Map`] slots — `One` is inherently non-empty
+    /// and `Optional` inherently permits absence, so consumers reject
+    /// the flag there up front. The constraint is *declared*, not
+    /// inferred: `check_conformance` rejects a violating tree with
+    /// its own diagnostic slug, generated grammars require at least
+    /// one element, and the `no-empty-child-slots` lint reports only
+    /// declared violations instead of guessing from variant shape.
+    pub non_empty: bool,
 }
 
 impl Default for ChildValueShape {
@@ -227,6 +241,7 @@ impl ChildSchema {
             multiplicity,
             value_shape: ChildValueShape::Recursive,
             scalar_shorthands: Vec::new(),
+            non_empty: false,
         }
     }
 
@@ -241,7 +256,23 @@ impl ChildSchema {
                 ty: value_ty.into(),
             },
             scalar_shorthands: Vec::new(),
+            non_empty: false,
         }
+    }
+
+    /// Marks the slot as non-empty (builder style). Only meaningful
+    /// on [`Multiplicity::Many`] / [`Multiplicity::Map`] slots — see
+    /// [`ChildSchema::non_empty`].
+    ///
+    /// ```
+    /// use dsl_kit_schema::{ChildSchema, Multiplicity};
+    ///
+    /// let slot = ChildSchema::recursive("stmts", Multiplicity::Many).with_non_empty();
+    /// assert!(slot.non_empty);
+    /// ```
+    pub fn with_non_empty(mut self) -> Self {
+        self.non_empty = true;
+        self
     }
 
     /// Adds a declared scalar shorthand to the slot (builder style).
@@ -279,7 +310,8 @@ impl ChildSchema {
     /// that do not know about `value_shape` are unaffected. Scalar
     /// slots gain a `"value"` object carrying the shape's kind and
     /// scalar `type` string. Declared scalar shorthands gain a
-    /// `"scalar_shorthands"` array; slots without any keep the
+    /// `"scalar_shorthands"` array, and a declared non-empty slot
+    /// gains `"non_empty": true`; slots without either keep the
     /// historical layout, again so unaware consumers see no change.
     pub fn to_json(&self) -> Value {
         let mut obj = match &self.value_shape {
@@ -300,6 +332,9 @@ impl ChildSchema {
                     .map(ScalarShorthand::to_json)
                     .collect(),
             );
+        }
+        if self.non_empty {
+            obj["non_empty"] = Value::Bool(true);
         }
         obj
     }
@@ -498,6 +533,7 @@ mod tests {
                     multiplicity: Multiplicity::Map,
                     value_shape: ChildValueShape::Recursive,
                     scalar_shorthands: vec![],
+                    non_empty: false,
                 }],
             }],
         };

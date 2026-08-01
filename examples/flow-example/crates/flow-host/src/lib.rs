@@ -425,17 +425,18 @@ mod tests {
     }
 
     #[test]
-    fn lint_json_reports_empty_seq_via_no_empty_child_slots() {
-        // Build a program with an empty inner Seq — NoEmptyChildSlots
-        // fires on it. NoRedundantWrap (R-24 default) also fires on the
-        // outer Seq (single Seq child of same variant). Both must reach
-        // the JSON envelope intact.
+    fn lint_json_reports_redundant_wrap_envelope() {
+        // Build a program whose outer Seq wraps a single Seq child —
+        // NoRedundantWrap (R-24 default) fires on the outer node and
+        // must reach the JSON envelope intact. (The empty inner Seq no
+        // longer lints: `no-empty-child-slots` checks the declared
+        // `non_empty` constraint only, and `Flow` declares none.)
         let ids = IdGen::new();
-        let empty_seq_id = ids.node();
+        let outer_id = ids.node();
         let program = Flow::Seq {
-            id: ids.node(),
+            id: outer_id,
             children: vec![Flow::Seq {
-                id: empty_seq_id,
+                id: ids.node(),
                 children: vec![],
             }],
         };
@@ -444,13 +445,15 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&text).expect("lint_json must be valid JSON");
         let arr = value.as_array().expect("lint_json is a JSON array");
-        // Assert the empty-seq diagnostic is present with the expected
-        // shape; other default rules may also fire (e.g. no-redundant-wrap).
-        let empty_seq_diag = arr
+        assert!(
+            !arr.iter().any(|d| d["rule"] == "no-empty-child-slots"),
+            "undeclared slots must not fire: {text}"
+        );
+        let wrap_diag = arr
             .iter()
-            .find(|d| d["rule"] == "no-empty-child-slots")
-            .expect("no-empty-child-slots entry present");
-        assert_eq!(empty_seq_diag["severity"], "Warn");
-        assert_eq!(empty_seq_diag["node"], empty_seq_id.0);
+            .find(|d| d["rule"] == "no-redundant-wrap")
+            .expect("no-redundant-wrap entry present");
+        assert_eq!(wrap_diag["severity"], "Warn");
+        assert_eq!(wrap_diag["node"], outer_id.0);
     }
 }

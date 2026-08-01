@@ -29,16 +29,36 @@
 //!     println!("[{:?}] {}: {}", d.severity, d.rule, d.message);
 //! }
 //! ```
+//!
+//! ## Suppression
+//!
+//! There is deliberately no ignore-file / per-node suppression layer.
+//! The levers, in order of preference:
+//!
+//! 1. **Declare the constraint in the schema** so the rule checks a
+//!    declaration instead of guessing — e.g. `no-empty-child-slots`
+//!    fires only on slots marked
+//!    [`non_empty`](dsl_kit_schema::ChildSchema) (`#[dsl_schema(non_empty)]`).
+//! 2. **Compose the rule set**: build with [`Linter::new`] +
+//!    [`Linter::with_rule`] instead of [`Linter::with_defaults`], and
+//!    tune per-rule parameters ([`MaxDepth::new`], [`MaxFanOut::new`]).
+//! 3. **Filter the output**: every [`Diagnostic`] carries its
+//!    `(rule, node, severity)` publicly, so a host that needs
+//!    finer-grained suppression can drop entries from
+//!    [`Linter::lint`]'s return value — e.g.
+//!    `diags.retain(|d| d.rule != MaxFanOut::NAME || !allowed.contains(&d.node))`.
+//!    Note that [`NodeId`]s are minted per parse, so such allow-lists
+//!    are session-scoped, not persistable.
 
 #![warn(missing_docs)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dsl_kit_core::{
     Applicability, ErrorCatalogEntry, FixSuggestion, NodeId, PatchPart, Phase, SuggesterHandle,
     Walk, noop_handle,
 };
-use dsl_kit_schema::{DslSchema, Multiplicity};
+use dsl_kit_schema::DslSchema;
 
 // ---------- Diagnostics -------------------------------------------------
 
@@ -382,29 +402,39 @@ impl<A: Walk> Rule<A> for MaxFanOut {
 /// perfectly legal empty block, empty argument list, or override map
 /// with nothing in it.
 ///
-/// What this rule actually encodes is a heuristic: a variant that
-/// exists *only* to hold a collection, holding nothing, is more often
-/// an oversight than an intention. That is the textbook shape of a
-/// [`LintCategory::Suspicious`] rule — "probably a mistake but not
-/// provably wrong" — so it reports at [`Severity::Warn`].
+/// Since the schema can express the constraint
+/// ([`ChildSchema::non_empty`](dsl_kit_schema::ChildSchema)), this
+/// rule checks the **declared** constraint: a variant with at least
+/// one `non_empty` collection slot, built with no children at all,
+/// violates its own schema — a provable
+/// [`LintCategory::Correctness`] finding reported at
+/// [`Severity::Error`]. Collection slots that do *not* declare
+/// `non_empty` keep their zero-or-more contract and are never
+/// flagged, so a DSL where `{}` is a legal no-op block stays silent
+/// without disabling anything.
 ///
-/// Until 0.5 this rule claimed the variant's shape "guarantees at
-/// least one child" and reported `Error` under
-/// [`LintCategory::Correctness`]. No such guarantee exists or ever
-/// did: the schema has no way to say "at least one". A DSL author who
-/// wanted a legitimately-empty list had to disable a default rule to
-/// get it. Expressing non-emptiness in the schema — so that the rule
-/// can check a *declared* constraint instead of inferring one — is
-/// tracked separately.
+/// History: until 0.5 the rule *inferred* non-emptiness from variant
+/// shape ("only collection slots, therefore probably needs a child")
+/// and reported `Error`; 0.5 downgraded the heuristic to
+/// `Suspicious` / `Warn`; with the declaration available the
+/// heuristic is retired entirely — the rule reports declared
+/// violations only, and does not guess.
+///
+/// Precision note: [`Walk::children`] flattens every slot of a node
+/// into one list, so on a variant mixing a `non_empty` slot with
+/// other child slots this rule can only detect the all-slots-empty
+/// case (a populated sibling slot masks the empty declared one).
+/// The authoritative per-slot enforcement is
+/// `dsl_kit_parse::check_conformance` (`ARITY_NON_EMPTY`), which
+/// sees named slots; this rule is the typed-AST backstop for
+/// hand-built values that never passed through a front-end.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoEmptyChildSlots;
 
-// No `NoEmptyManyChildren` alias is kept: the rule's *behaviour*
-// changed with the rename (severity `Error` → `Warn`, coverage widened
-// to `Map`), so an alias would let a downstream that matched on
-// `Severity::Error` keep compiling while quietly seeing different
-// results. A compile error pointing at the CHANGELOG is the honest
-// outcome here.
+// No alias for the pre-declaration behaviour is kept: the rule's
+// *meaning* changed (heuristic Warn on inferred shapes → Error on
+// declared `non_empty` violations only), so downstreams should meet
+// the CHANGELOG rather than silently see different results.
 
 impl NoEmptyChildSlots {
     /// Rule name (also attached to every diagnostic it emits).
@@ -417,27 +447,24 @@ impl<A: Walk + DslSchema> Rule<A> for NoEmptyChildSlots {
     }
 
     fn check(&self, ast: &A, ctx: &mut LintContext) {
-        // Precompute: which variant names carry the "≥1 collection
-        // slot, no One slot" shape.
+        // Precompute: variant name → names of its declared non-empty
+        // slots. Variants without a declaration never fire.
         let schema = A::schema();
-        let collection_only: HashSet<String> = schema
+        let declared: HashMap<String, Vec<String>> = schema
             .variants
             .iter()
-            .filter(|v| {
-                let has_collection = v
+            .filter_map(|v| {
+                let slots: Vec<String> = v
                     .children
                     .iter()
-                    .any(|c| matches!(c.multiplicity, Multiplicity::Many | Multiplicity::Map));
-                let has_one = v
-                    .children
-                    .iter()
-                    .any(|c| c.multiplicity == Multiplicity::One);
-                has_collection && !has_one
+                    .filter(|c| c.non_empty)
+                    .map(|c| c.name.clone())
+                    .collect();
+                (!slots.is_empty()).then(|| (v.name.clone(), slots))
             })
-            .map(|v| v.name.clone())
             .collect();
 
-        if collection_only.is_empty() {
+        if declared.is_empty() {
             return;
         }
 
@@ -446,13 +473,22 @@ impl<A: Walk + DslSchema> Rule<A> for NoEmptyChildSlots {
                 return;
             }
             let name = node.variant_name();
-            if collection_only.contains(name) && node.children().is_empty() {
-                ctx.report(
-                    Self::NAME,
-                    Severity::Warn,
-                    node.node_id(),
-                    format!("{name} holds only collection slots but was built with no children"),
-                );
+            if let Some(slots) = declared.get(name) {
+                if node.children().is_empty() {
+                    ctx.report(
+                        Self::NAME,
+                        Severity::Error,
+                        node.node_id(),
+                        format!(
+                            "{name} declares non-empty slot(s) {} but was built with no children",
+                            slots
+                                .iter()
+                                .map(|s| format!("`{s}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                }
             }
         });
     }
@@ -749,9 +785,9 @@ pub static LINT_DECLS: &[LintDecl] = &[
     LintDecl {
         name: NoEmptyChildSlots::NAME,
         code: "dsl_kit::lint::no_empty_child_slots",
-        category: LintCategory::Suspicious,
-        default_severity: Severity::Warn,
-        desc: "flags a variant whose only child slots are collections (Many / Map) but which was built with no children",
+        category: LintCategory::Correctness,
+        default_severity: Severity::Error,
+        desc: "flags a variant with a declared non-empty collection slot (ChildSchema::non_empty) that was built with no children",
     },
     LintDecl {
         name: NoRedundantWrap::NAME,
@@ -811,6 +847,7 @@ pub fn lint_catalog() -> Vec<ErrorCatalogEntry> {
 mod tests {
     use super::*;
     use dsl_kit_core::{DslNode, NodeId};
+    use dsl_kit_schema::Multiplicity;
 
     // Minimal test AST — a linear chain with configurable fan-out —
     // to exercise Walk + rules without pulling in flow-dsl. This
@@ -856,6 +893,7 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                         value_shape: dsl_kit_schema::ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 }],
             }
@@ -871,6 +909,67 @@ mod tests {
 
     fn node(n: u64, kids: Vec<Tiny>) -> Tiny {
         Tiny::Node {
+            id: NodeId(n),
+            kids,
+        }
+    }
+
+    // Declared counterpart of `Tiny`: same shape, but the schema marks
+    // `kids` as `non_empty` — the declaration `no-empty-child-slots`
+    // checks. `Tiny` itself stays undeclared so the silent-by-default
+    // contract is exercised against the same structure.
+    #[derive(Debug)]
+    enum Decl {
+        Node { id: NodeId, kids: Vec<Decl> },
+    }
+
+    impl DslNode for Decl {
+        fn node_id(&self) -> NodeId {
+            match self {
+                Decl::Node { id, .. } => *id,
+            }
+        }
+
+        fn variant_name(&self) -> &'static str {
+            match self {
+                Decl::Node { .. } => "Node",
+            }
+        }
+    }
+
+    impl Walk for Decl {
+        fn children(&self) -> Vec<&Self> {
+            match self {
+                Decl::Node { kids, .. } => kids.iter().collect(),
+            }
+        }
+    }
+
+    impl DslSchema for Decl {
+        fn schema() -> dsl_kit_schema::NodeSchema {
+            dsl_kit_schema::NodeSchema {
+                name: "Decl".into(),
+                variants: vec![dsl_kit_schema::VariantSchema {
+                    name: "Node".into(),
+                    fields: vec![],
+                    children: vec![
+                        dsl_kit_schema::ChildSchema::recursive("kids", Multiplicity::Many)
+                            .with_non_empty(),
+                    ],
+                }],
+            }
+        }
+    }
+
+    fn dleaf(n: u64) -> Decl {
+        Decl::Node {
+            id: NodeId(n),
+            kids: vec![],
+        }
+    }
+
+    fn dnode(n: u64, kids: Vec<Decl>) -> Decl {
+        Decl::Node {
             id: NodeId(n),
             kids,
         }
@@ -989,37 +1088,48 @@ mod tests {
         assert_eq!(ast.variant_name(), "Node");
     }
 
+    /// Without a `non_empty` declaration an empty collection slot is
+    /// simply its documented zero-or-more shape — the rule stays
+    /// silent instead of guessing from variant shape (the pre-0.9
+    /// heuristic fired `Warn` on this exact tree).
     #[test]
-    fn no_empty_child_slots_fires_on_empty_collection_only_variant() {
-        // Tiny::Node is collection-only per its Schema — empty kids →
-        // fires, at `Warn`: an empty `Many` is suspicious, not wrong.
+    fn no_empty_child_slots_silent_without_declaration() {
         let ast = leaf(1);
         let diags = Linter::<Tiny>::new()
             .with_rule(NoEmptyChildSlots)
             .lint(&ast);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    /// A declared `non_empty` slot built empty is a provable schema
+    /// violation — `Error`, naming the offending slot.
+    #[test]
+    fn no_empty_child_slots_fires_on_declared_violation() {
+        let ast = dleaf(1);
+        let diags = Linter::<Decl>::new()
+            .with_rule(NoEmptyChildSlots)
+            .lint(&ast);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].rule, NoEmptyChildSlots::NAME);
-        assert_eq!(diags[0].severity, Severity::Warn);
+        assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].node, NodeId(1));
-        assert!(diags[0].message.contains("Node"));
+        assert!(diags[0].message.contains("`kids`"));
     }
 
     #[test]
     fn no_empty_child_slots_passes_when_children_present() {
-        let ast = node(1, vec![leaf(2)]);
-        // Note: leaf(2) itself is still empty → fires on it. Only the
-        // populated root is clean.
-        let diags = Linter::<Tiny>::new()
+        let ast = dnode(1, vec![dleaf(2)]);
+        // Note: dleaf(2) itself violates the declaration → fires on
+        // it. Only the populated root is clean.
+        let diags = Linter::<Decl>::new()
             .with_rule(NoEmptyChildSlots)
             .lint(&ast);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].node, NodeId(2));
     }
 
-    /// A keyed (`Map`) slot is a collection like `Many` is, so a
-    /// variant holding only keyed slots gets the same treatment. Before
-    /// the rename the rule keyed off `Multiplicity::Many` alone and
-    /// could not see this shape at all.
+    /// A keyed (`Map`) slot can declare `non_empty` like `Many` can,
+    /// and a declared violation reports the same way.
     #[test]
     fn no_empty_child_slots_covers_keyed_slots() {
         struct Keyed;
@@ -1043,12 +1153,10 @@ mod tests {
                     variants: vec![dsl_kit_schema::VariantSchema {
                         name: "Env".into(),
                         fields: vec![],
-                        children: vec![dsl_kit_schema::ChildSchema {
-                            name: "entries".into(),
-                            multiplicity: Multiplicity::Map,
-                            value_shape: dsl_kit_schema::ChildValueShape::Recursive,
-                            scalar_shorthands: vec![],
-                        }],
+                        children: vec![
+                            dsl_kit_schema::ChildSchema::recursive("entries", Multiplicity::Map)
+                                .with_non_empty(),
+                        ],
                     }],
                 }
             }
@@ -1059,7 +1167,7 @@ mod tests {
             .lint(&Keyed);
         assert_eq!(diags.len(), 1, "diags = {diags:?}");
         assert_eq!(diags[0].rule, NoEmptyChildSlots::NAME);
-        assert_eq!(diags[0].severity, Severity::Warn);
+        assert_eq!(diags[0].severity, Severity::Error);
         assert_eq!(diags[0].node, NodeId(7));
     }
 
@@ -1289,8 +1397,8 @@ mod tests {
     #[test]
     fn report_leaves_suggestion_none_by_default() {
         // Rules that only call `report` must not carry a suggestion.
-        let ast = leaf(1);
-        let diags = Linter::<Tiny>::new()
+        let ast = dleaf(1);
+        let diags = Linter::<Decl>::new()
             .with_rule(NoEmptyChildSlots)
             .lint(&ast);
         assert_eq!(diags.len(), 1);

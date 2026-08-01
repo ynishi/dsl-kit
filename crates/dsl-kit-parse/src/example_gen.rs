@@ -460,12 +460,14 @@ mod tests {
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                     ],
                 },
@@ -477,6 +479,7 @@ mod tests {
                         multiplicity: Multiplicity::Optional,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -487,6 +490,7 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -497,6 +501,7 @@ mod tests {
                         multiplicity: Multiplicity::Map,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -583,6 +588,7 @@ mod tests {
                         multiplicity: Multiplicity::Map,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -674,6 +680,7 @@ mod tests {
                     multiplicity: Multiplicity::One,
                     value_shape: ChildValueShape::Recursive,
                     scalar_shorthands: vec![],
+                    non_empty: false,
                 }],
             }],
         };

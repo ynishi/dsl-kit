@@ -486,18 +486,34 @@ const SCALAR_INT_TYPES: &[&str] = &[
     "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "usize", "isize",
 ];
 
-/// Parses a field's `#[dsl_schema(scalar(...))]` annotations.
-/// `Ok(vec![])` when the field carries no `dsl_schema` attribute.
-fn dsl_schema_scalar_attrs(f: &syn::Field) -> syn::Result<Vec<ScalarShorthandDecl>> {
-    let mut out = Vec::new();
+/// Parsed `#[dsl_schema(...)]` annotations on one field.
+#[derive(Default)]
+struct DslSchemaAttrs {
+    /// `scalar(<kind> = Variant::field)` declarations.
+    scalars: Vec<ScalarShorthandDecl>,
+    /// Bare `non_empty` flag.
+    non_empty: bool,
+}
+
+/// Parses a field's `#[dsl_schema(...)]` annotations
+/// (`scalar(<kind> = Variant::field)` and/or `non_empty`).
+/// `Ok(Default::default())` when the field carries no `dsl_schema`
+/// attribute.
+fn dsl_schema_attrs(f: &syn::Field) -> syn::Result<DslSchemaAttrs> {
+    let mut out = DslSchemaAttrs::default();
     for attr in &f.attrs {
         if !attr.path().is_ident("dsl_schema") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("non_empty") {
+                out.non_empty = true;
+                return Ok(());
+            }
             if !meta.path.is_ident("scalar") {
                 return Err(meta.error(
-                    "unsupported #[dsl_schema(...)] key; expected `scalar(<kind> = Variant::field)`",
+                    "unsupported #[dsl_schema(...)] key; expected \
+                     `scalar(<kind> = Variant::field)` or `non_empty`",
                 ));
             }
             meta.parse_nested_meta(|inner| {
@@ -507,9 +523,9 @@ fn dsl_schema_scalar_attrs(f: &syn::Field) -> syn::Result<Vec<ScalarShorthandDec
                     .map(ToString::to_string)
                     .unwrap_or_default();
                 if !matches!(kind.as_str(), "string" | "int" | "bool") {
-                    return Err(inner.error(
-                        "unsupported scalar kind; expected `string`, `int`, or `bool`",
-                    ));
+                    return Err(
+                        inner.error("unsupported scalar kind; expected `string`, `int`, or `bool`")
+                    );
                 }
                 let path: syn::Path = inner.value()?.parse()?;
                 if path.segments.len() != 2 {
@@ -520,7 +536,7 @@ fn dsl_schema_scalar_attrs(f: &syn::Field) -> syn::Result<Vec<ScalarShorthandDec
                 }
                 let variant = path.segments[0].ident.to_string();
                 let field = path.segments[1].ident.to_string();
-                out.push(ScalarShorthandDecl {
+                out.scalars.push(ScalarShorthandDecl {
                     kind,
                     variant,
                     field,
@@ -663,6 +679,25 @@ fn validate_scalar_decls(
 /// per slot; the target must be a plain payload field of a matching
 /// type on a variant of the same enum. The macro validates all of
 /// that at compile time.
+///
+/// ## Non-empty collections (`#[dsl_schema(non_empty)]`)
+///
+/// A `Many` / `Map` collection slot (recursive or keyed-scalar) may
+/// declare that it must hold at least one element:
+///
+/// ```ignore
+/// Pipeline {
+///     id: NodeId,
+///     #[dsl_schema(non_empty)]
+///     stages: Vec<Self>,
+/// },
+/// ```
+///
+/// Recorded as `ChildSchema::non_empty`; `check_conformance` rejects
+/// a violating tree (`ARITY_NON_EMPTY`), generated grammars require
+/// an element, and the `no-empty-child-slots` lint reports declared
+/// violations only. Rejected at compile time on `One` / `Optional`
+/// slots and on payload fields.
 #[proc_macro_derive(DslSchema, attributes(dsl_schema))]
 pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -705,8 +740,8 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
             }
 
             if let Some(kind) = detect_recursion(&f.ty, &name) {
-                let decls = match dsl_schema_scalar_attrs(f) {
-                    Ok(decls) => decls,
+                let attrs = match dsl_schema_attrs(f) {
+                    Ok(attrs) => attrs,
                     Err(e) => return e.to_compile_error().into(),
                 };
                 let one_or_optional = matches!(
@@ -716,7 +751,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                         | Recursion::Optional
                         | Recursion::OptionalBoxed
                 );
-                if !decls.is_empty() && !one_or_optional {
+                if !attrs.scalars.is_empty() && !one_or_optional {
                     return syn::Error::new_spanned(
                         f,
                         "#[dsl_schema(scalar(...))] applies to `One` / `Optional` child \
@@ -725,10 +760,23 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                     .to_compile_error()
                     .into();
                 }
-                if let Err(e) = validate_scalar_decls(&decls, data, &name) {
+                if attrs.non_empty && one_or_optional {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_schema(non_empty)] applies to `Many` / `Map` collection \
+                         slots only (`Vec<T>` / `BTreeMap<String, T>` and their boxed \
+                         forms) — `One` is inherently non-empty and `Optional` \
+                         inherently permits absence",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                if let Err(e) = validate_scalar_decls(&attrs.scalars, data, &name) {
                     return e.to_compile_error().into();
                 }
-                let shorthand_ctors: Vec<TokenStream2> = decls
+                let non_empty = attrs.non_empty;
+                let shorthand_ctors: Vec<TokenStream2> = attrs
+                    .scalars
                     .iter()
                     .map(|d| {
                         let kind_ident = match d.kind.as_str() {
@@ -759,6 +807,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                         multiplicity: ::dsl_kit_schema::Multiplicity::#mult,
                         value_shape: ::dsl_kit_schema::ChildValueShape::Recursive,
                         scalar_shorthands: ::std::vec![#(#shorthand_ctors),*],
+                        non_empty: #non_empty,
                     }
                 });
             } else if let Some(value_ty) = detect_scalar_map(&f.ty, &name) {
@@ -768,15 +817,22 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                 // `ChildValueShape::Scalar { ty }`; the value type is
                 // stored as Rust source text so schema consumers can
                 // dispatch on it without a semantic type system.
-                if has_dsl_schema_attr(f) {
+                // `non_empty` is legal here (a scalar map is a `Map`
+                // slot); scalar shorthands are not.
+                let attrs = match dsl_schema_attrs(f) {
+                    Ok(attrs) => attrs,
+                    Err(e) => return e.to_compile_error().into(),
+                };
+                if !attrs.scalars.is_empty() {
                     return syn::Error::new_spanned(
                         f,
-                        "#[dsl_schema(...)] applies to `One` / `Optional` child slots, \
-                         not keyed scalar slots",
+                        "#[dsl_schema(scalar(...))] applies to `One` / `Optional` child \
+                         slots, not keyed scalar slots",
                     )
                     .to_compile_error()
                     .into();
                 }
+                let non_empty = attrs.non_empty;
                 let value_ty_src = normalize_type_str(&value_ty.to_token_stream().to_string());
                 child_ctors.push(quote! {
                     ::dsl_kit_schema::ChildSchema {
@@ -786,6 +842,7 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
                             ty: #value_ty_src.to_string(),
                         },
                         scalar_shorthands: ::std::vec![],
+                        non_empty: #non_empty,
                     }
                 });
             } else {

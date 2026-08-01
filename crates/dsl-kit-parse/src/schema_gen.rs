@@ -112,6 +112,14 @@ pub mod codes {
     /// front-ends drift apart.
     pub const UNSUPPORTED_SCALAR_SHORTHAND: &str =
         "dsl_kit::schema_gen::unsupported_scalar_shorthand";
+    /// A child slot declares
+    /// [`non_empty`](dsl_kit_schema::ChildSchema::non_empty) on a
+    /// multiplicity that has no empty collection to forbid (`One` /
+    /// `Optional`). Emitted by the pre-flight check so an incoherent
+    /// hand-written declaration fails loudly at grammar-generation
+    /// time — the derive macro rejects the same combination at
+    /// compile time.
+    pub const INVALID_NON_EMPTY: &str = "dsl_kit::schema_gen::invalid_non_empty";
 }
 
 /// Integer payload types with a built-in `%int` production. Shared by
@@ -322,6 +330,17 @@ pub fn grammar_from_schema_with(
                 }
             }
             pre_flight.extend(check_scalar_shorthands(schema, v, c));
+            if c.non_empty && matches!(c.multiplicity, Multiplicity::One | Multiplicity::Optional) {
+                pre_flight.push(Diagnostic::error(
+                    codes::INVALID_NON_EMPTY,
+                    format!(
+                        "variant `{}` child slot `{}`: `non_empty` is only meaningful \
+                         on `Many` / `Map` collection slots (`One` is inherently \
+                         non-empty, `Optional` inherently permits absence)",
+                        v.name, c.name
+                    ),
+                ));
+            }
         }
     }
     if !pre_flight.is_empty() {
@@ -685,7 +704,11 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
         ),
         // `name: [ <node> ("," <node>)* ]`, empty list allowed. The
         // list commas live inside the Field body; the mixed-field
-        // "trees win" fallback drops them as noise.
+        // "trees win" fallback drops them as noise. A slot declared
+        // `non_empty` drops the outer 0..1 wrap so the grammar itself
+        // requires at least one element — which also makes the
+        // synthesized minimal example carry one (example_gen walks
+        // the grammar, so the constraint propagates for free).
         Multiplicity::Many => {
             let elems = seq(
                 ids,
@@ -699,15 +722,14 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
                     ),
                 ],
             );
+            let list = if c.non_empty {
+                field(ids, c.name.clone(), elems)
+            } else {
+                field(ids, c.name.clone(), repeat(ids, elems, 0, Some(1)))
+            };
             seq(
                 ids,
-                vec![
-                    name_kw,
-                    colon,
-                    token(ids, "["),
-                    field(ids, c.name.clone(), repeat(ids, elems, 0, Some(1))),
-                    token(ids, "]"),
-                ],
+                vec![name_kw, colon, token(ids, "["), list, token(ids, "]")],
             )
         }
         // `name: { <key>: <node> ("," <key>: <node>)* }`, empty map
@@ -786,15 +808,17 @@ fn child_arg_peg(c: &ChildSchema, ids: &IdGen) -> Peg {
                     repeat(ids, seq(ids, vec![token(ids, ","), entry(ids)]), 0, None),
                 ],
             );
+            // A `non_empty` map drops the outer 0..1 wrap, same as
+            // the `Many` arm above: the grammar requires at least one
+            // entry and the synthesized minimal example follows.
+            let body = if c.non_empty {
+                entries
+            } else {
+                repeat(ids, entries, 0, Some(1))
+            };
             seq(
                 ids,
-                vec![
-                    name_kw,
-                    colon,
-                    token(ids, "{"),
-                    repeat(ids, entries, 0, Some(1)),
-                    token(ids, "}"),
-                ],
+                vec![name_kw, colon, token(ids, "{"), body, token(ids, "}")],
             )
         }
         // `#[non_exhaustive]` catch-all: a future Multiplicity variant
@@ -892,12 +916,14 @@ mod tests {
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                         ChildSchema {
                             name: "rhs".into(),
                             multiplicity: Multiplicity::One,
                             value_shape: ChildValueShape::Recursive,
                             scalar_shorthands: vec![],
+                            non_empty: false,
                         },
                     ],
                 },
@@ -909,6 +935,7 @@ mod tests {
                         multiplicity: Multiplicity::Optional,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -919,6 +946,7 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -929,6 +957,7 @@ mod tests {
                         multiplicity: Multiplicity::Map,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {
@@ -1237,6 +1266,7 @@ mod tests {
                         multiplicity: Multiplicity::Many,
                         value_shape: ChildValueShape::Recursive,
                         scalar_shorthands: vec![],
+                        non_empty: false,
                     }],
                 },
                 VariantSchema {

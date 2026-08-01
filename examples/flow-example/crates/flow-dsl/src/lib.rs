@@ -1877,24 +1877,26 @@ mod tests {
         assert_eq!(maybe.variant_name(), "Maybe");
     }
 
+    /// `Flow` declares no `non_empty` slots, so an empty `Seq` / `Par`
+    /// is its documented zero-or-more shape and the declaration-driven
+    /// `no-empty-child-slots` stays silent — the pre-0.9 heuristic
+    /// warned on this exact tree. A DSL that wants the constraint
+    /// declares it per slot with `#[dsl_schema(non_empty)]` (covered
+    /// by dsl-kit-lint's and dsl-kit-parse's own tests).
     #[test]
-    fn no_empty_many_children_fires_on_empty_seq_and_par() {
-        use dsl_kit_lint::{Linter, NoEmptyChildSlots, Severity};
+    fn no_empty_child_slots_silent_on_undeclared_seq_and_par() {
+        use dsl_kit_lint::{Linter, NoEmptyChildSlots};
 
         let ids = IdGen::new();
-        // Two many-only variants (Seq / Par) both empty. Nested inside
-        // a populated outer Seq so the outer itself lints clean.
-        let empty_seq_id = ids.node();
-        let empty_par_id = ids.node();
         let program = Flow::Seq {
             id: ids.node(),
             children: vec![
                 Flow::Seq {
-                    id: empty_seq_id,
+                    id: ids.node(),
                     children: vec![],
                 },
                 Flow::Par {
-                    id: empty_par_id,
+                    id: ids.node(),
                     children: vec![],
                     policy: None,
                     reducer_id: None,
@@ -1904,12 +1906,7 @@ mod tests {
         let diags = Linter::<Flow>::new()
             .with_rule(NoEmptyChildSlots)
             .lint(&program);
-        assert_eq!(diags.len(), 2, "diags = {diags:?}");
-        assert!(diags.iter().all(|d| d.rule == "no-empty-child-slots"));
-        assert!(diags.iter().all(|d| d.severity == Severity::Warn));
-        let hit: Vec<NodeId> = diags.iter().map(|d| d.node).collect();
-        assert!(hit.contains(&empty_seq_id));
-        assert!(hit.contains(&empty_par_id));
+        assert!(diags.is_empty(), "diags = {diags:?}");
     }
 
     #[test]
@@ -1949,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_defaults_now_include_no_empty_many_children() {
+    fn lint_defaults_stay_quiet_on_undeclared_empty_seq() {
         use dsl_kit_lint::Linter;
 
         let ids = IdGen::new();
@@ -1962,14 +1959,17 @@ mod tests {
             }],
         };
         let diags = Linter::<Flow>::with_defaults().lint(&program);
-        // NoEmptyChildSlots fires on the empty inner Seq.
-        // NoRedundantWrap (R-24) also fires on the outer Seq (single
-        // Seq child of same variant). Both are expected under defaults.
+        // `no-empty-child-slots` ships in the defaults but checks the
+        // declared constraint only — Flow declares none, so the empty
+        // inner Seq is clean. NoRedundantWrap (R-24) still fires on
+        // the outer Seq (single Seq child of same variant).
         assert!(
-            diags
-                .iter()
-                .any(|d| d.rule == "no-empty-child-slots" && d.node == empty_seq_id),
-            "expected no-empty-many-children on empty inner Seq, diags = {diags:?}",
+            !diags.iter().any(|d| d.rule == "no-empty-child-slots"),
+            "undeclared slots must not fire, diags = {diags:?}",
+        );
+        assert!(
+            diags.iter().any(|d| d.rule == "no-redundant-wrap"),
+            "defaults still lint the redundant wrap, diags = {diags:?}",
         );
     }
 
