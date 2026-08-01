@@ -32,9 +32,26 @@
 //!
 //! ## Suppression
 //!
-//! There is deliberately no ignore-file / per-node suppression layer.
-//! The levers, in order of preference:
+//! There is deliberately no ignore-file. The levers, from the most
+//! local to the most global:
 //!
+//! 0. **Annotate the node**: a document names the rules it accepts at
+//!    one node (`"$allow": ["max-fan-out"]` in the JSON front-end), the
+//!    build carries those names into a [`dsl_kit_core::AllowTable`]
+//!    keyed on the [`NodeId`] it minted, and
+//!    [`Linter::lint_with_allows`] honours them for that node and its
+//!    subtree. The host's order is `from_parse_tree` →
+//!    [`IdGen::take_allows`](dsl_kit_core::IdGen::take_allows) →
+//!    `lint_with_allows`:
+//!
+//!    ```ignore
+//!    let program = Flow::from_parse_tree(&tree, &ids)?;
+//!    let allows = ids.take_allows();
+//!    let outcome = Linter::<Flow>::with_defaults().lint_with_allows(&program, &allows);
+//!    ```
+//!
+//!    Nothing is dropped: what an annotation silenced is listed in
+//!    [`LintOutcome::suppressed`].
 //! 1. **Declare the constraint in the schema** so the rule checks a
 //!    declaration instead of guessing — e.g. `no-empty-child-slots`
 //!    fires only on slots marked
@@ -52,14 +69,27 @@
 //!    `diags.retain(|d| d.rule != MaxFanOut::NAME || !allowed.contains(&d.node))`.
 //!    Note that [`NodeId`]s are minted per parse, so such allow-lists
 //!    are session-scoped, not persistable.
+//!
+//! ### What a document may not suppress
+//!
+//! Lever 0 reaches [`LintCategory::Suspicious`], [`LintCategory::Style`]
+//! and [`LintCategory::Complexity`] rules, plus custom rules the host
+//! registered — usage-site exceptions to a DSL's own rules are the
+//! reason the lever exists. [`LintCategory::Correctness`] and
+//! [`LintCategory::Contract`] findings stand even under `["*"]`: the
+//! first says the program is wrong, the second that it breaks a ceiling
+//! its caller imposed, and neither is the document's to waive.
+//! `dsl_kit_parse::check_conformance` is the layer that hard-errors on
+//! won't-run shapes; this crate is its typed-AST backstop and does not
+//! hand out exemptions the layer above refuses.
 
 #![warn(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
 
 use dsl_kit_core::{
-    Applicability, ErrorCatalogEntry, FixSuggestion, NodeId, PatchPart, Phase, SuggesterHandle,
-    Walk, noop_handle,
+    AllowTable, Applicability, ErrorCatalogEntry, FixSuggestion, NodeId, PatchPart, Phase,
+    SuggesterHandle, Walk, noop_handle,
 };
 use dsl_kit_schema::DslSchema;
 
@@ -93,6 +123,31 @@ pub struct Diagnostic {
     /// [`Applicability`](dsl_kit_core::Applicability) tells a tool
     /// whether the patch may be applied automatically.
     pub suggestion: Option<FixSuggestion>,
+}
+
+/// Result of a pass that consumed a document's usage-site
+/// suppressions — see [`Linter::lint_with_allows`].
+///
+/// The two fields partition everything the rules reported, plus the
+/// diagnostics the annotations themselves earned (in `diagnostics`).
+///
+/// Keeping `suppressed` enumerable is what keeps the escape hatch
+/// honest. A suppression layer that simply deletes findings
+/// accumulates silent debt — the familiar `eslint-disable` situation,
+/// where "what are we ignoring right now?" is answerable only by
+/// grepping the sources. Here it is a field: a host can print the
+/// count, fail its CI on growth, or list the entries in review.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LintOutcome {
+    /// Findings that survived, in rule-registration order, followed by
+    /// the diagnostics the annotations themselves produced
+    /// ([`UNKNOWN_ALLOW`] / [`NOT_SUPPRESSIBLE`]). Those trailing
+    /// entries are never suppressible: an annotation does not get to
+    /// silence the complaint about itself.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Findings an annotation suppressed, in the order the rules
+    /// reported them. Audit surface, not waste.
+    pub suppressed: Vec<Diagnostic>,
 }
 
 /// Accumulator handed to each rule during a lint pass.
@@ -186,11 +241,15 @@ pub trait Rule<A: Walk> {
 /// Runs a collection of [`Rule`]s over an AST.
 pub struct Linter<A: Walk> {
     rules: Vec<Box<dyn Rule<A>>>,
+    suggester: SuggesterHandle,
 }
 
 impl<A: Walk> Default for Linter<A> {
     fn default() -> Self {
-        Self { rules: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            suggester: noop_handle(),
+        }
     }
 }
 
@@ -258,14 +317,173 @@ impl<A: Walk> Linter<A> {
         self
     }
 
+    /// Injects the [`Suggester`](dsl_kit_core::Suggester) used to turn
+    /// an unknown `$allow` rule name into a `did you mean` hint.
+    ///
+    /// Dormant by default — the no-op suggester returns no candidates,
+    /// so a linter built without one still *reports* the unknown name,
+    /// just without the hint. Pass
+    /// `Arc::new(dsl_kit_fuzzy::FuzzySuggester::default())` at the
+    /// composition root to enable it.
+    ///
+    /// Independent of [`TypoHint::with_suggester`], which scores labels
+    /// found *inside* the AST; this one scores only the rule names in
+    /// annotations.
+    #[must_use]
+    pub fn with_suggester(mut self, suggester: SuggesterHandle) -> Self {
+        self.suggester = suggester;
+        self
+    }
+
     /// Runs every registered rule against `ast` and returns the
     /// accumulated diagnostics, in the order rules were registered.
+    ///
+    /// Equivalent to [`lint_with_allows`](Self::lint_with_allows) with
+    /// an empty table, and implemented as exactly that so the two can
+    /// never drift apart.
     pub fn lint(&self, ast: &A) -> Vec<Diagnostic> {
+        self.lint_with_allows(ast, &AllowTable::default())
+            .diagnostics
+    }
+
+    /// Runs every registered rule against `ast` and splits the result
+    /// against the document's usage-site suppressions.
+    ///
+    /// `allows` maps a [`NodeId`] to the rule names the document
+    /// accepted there — the table
+    /// [`IdGen::take_allows`](dsl_kit_core::IdGen::take_allows) hands
+    /// over once the build has minted the ids. An entry covers the
+    /// annotated node **and its whole subtree**, the item-plus-body
+    /// scope of Clippy's `#[allow]`: a suppression that stopped at the
+    /// annotated node alone could not silence anything the author
+    /// wrote underneath it, which is where the shape being excused
+    /// usually lives. [`ALLOW_WILDCARD`] (`"*"`) stands for every
+    /// suppressible rule in that subtree, so `["*"]` on the root
+    /// quiets the whole document.
+    ///
+    /// What an annotation cannot reach:
+    ///
+    /// - [`LintCategory::Correctness`] and [`LintCategory::Contract`]
+    ///   rules, wildcard included. Each entry naming one is reported as
+    ///   [`NOT_SUPPRESSIBLE`] and left ineffective.
+    /// - A name that is neither declared in [`LINT_DECLS`] nor
+    ///   registered on this linter: reported as [`UNKNOWN_ALLOW`], with
+    ///   a `did you mean` hint when a suggester was injected
+    ///   ([`with_suggester`](Self::with_suggester)).
+    /// - A [`NodeId`] that is not in `ast` — a table built for a
+    ///   different tree: reported as [`UNKNOWN_ALLOW`].
+    ///
+    /// A declared name that this linter does not run (say
+    /// `"dead-variants"` under [`with_defaults`](Self::with_defaults))
+    /// is silent: the name is real, the rule simply was not registered.
+    /// So is a name spelled as its stable code
+    /// (`"dsl_kit::lint::max_fan_out"`), which [`lint_decl`] resolves
+    /// like any other.
+    pub fn lint_with_allows(&self, ast: &A, allows: &AllowTable) -> LintOutcome {
         let mut ctx = LintContext::new();
         for rule in &self.rules {
             rule.check(ast, &mut ctx);
         }
-        ctx.into_diagnostics()
+        let reported = ctx.into_diagnostics();
+
+        if allows.is_empty() {
+            return LintOutcome {
+                diagnostics: reported,
+                suppressed: Vec::new(),
+            };
+        }
+
+        // Expand each annotation over its subtree, collecting the
+        // complaints about the annotations themselves as we go.
+        let mut wildcard: HashSet<NodeId> = HashSet::new();
+        let mut named: HashMap<NodeId, HashSet<&str>> = HashMap::new();
+        let mut notes = LintContext::new();
+
+        for (id, names) in allows.iter() {
+            if names.is_empty() {
+                continue;
+            }
+            let Some(anchor) = ast.find_by_id(*id) else {
+                notes.report(
+                    UNKNOWN_ALLOW,
+                    Severity::Warn,
+                    *id,
+                    format!(
+                        "$allow names node {id}, which is not in this AST; the annotation had no effect"
+                    ),
+                );
+                continue;
+            };
+            let subtree = subtree_ids(anchor);
+            for name in names {
+                if name == ALLOW_WILDCARD {
+                    wildcard.extend(subtree.iter().copied());
+                    continue;
+                }
+                match lint_decl(name) {
+                    Some(decl) if !category_is_suppressible(decl.category) => notes.report(
+                        NOT_SUPPRESSIBLE,
+                        Severity::Warn,
+                        *id,
+                        format!(
+                            "$allow at node {id} names `{}`, a {:?} lint a document may not waive; \
+                             fix the AST instead, or drop the rule from the linter",
+                            decl.name, decl.category
+                        ),
+                    ),
+                    Some(decl) => insert_named(&mut named, &subtree, decl.name),
+                    None if self.rules.iter().any(|r| r.name() == name) => {
+                        insert_named(&mut named, &subtree, name)
+                    }
+                    None => {
+                        let message = format!(
+                            "$allow at node {id} names `{name}`, which is neither a built-in lint \
+                             nor a rule registered on this linter"
+                        );
+                        let message = match self.suggester.enrich_unknown(name, &self.allow_names())
+                        {
+                            Some(hint) => format!("{message}; {hint}"),
+                            None => message,
+                        };
+                        notes.report(UNKNOWN_ALLOW, Severity::Info, *id, message);
+                    }
+                }
+            }
+        }
+
+        let mut diagnostics = Vec::new();
+        let mut suppressed = Vec::new();
+        for diag in reported {
+            // Names were only recorded for suppressible rules, so a
+            // named hit needs no further check; the wildcard covers a
+            // node rather than a rule, so it does.
+            let by_name = named
+                .get(&diag.node)
+                .is_some_and(|names| names.contains(diag.rule));
+            let by_wildcard = wildcard.contains(&diag.node) && rule_is_suppressible(diag.rule);
+            if by_name || by_wildcard {
+                suppressed.push(diag);
+            } else {
+                diagnostics.push(diag);
+            }
+        }
+        diagnostics.extend(notes.into_diagnostics());
+
+        LintOutcome {
+            diagnostics,
+            suppressed,
+        }
+    }
+
+    /// Every name an `$allow` entry could legitimately carry: the
+    /// declared rules plus the ones this linter runs. Candidate list
+    /// for the unknown-name hint.
+    fn allow_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = LINT_DECLS.iter().map(|d| d.name).collect();
+        names.extend(self.rule_names());
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// Number of registered rules.
@@ -306,6 +524,47 @@ impl<A: Walk + DslSchema> Linter<A> {
             .with_rule(NoEmptyChildSlots)
             .with_rule(NoRedundantWrap)
     }
+}
+
+// ---------- Suppression helpers -----------------------------------------
+
+/// Ids of `node` and of every node beneath it — the reach of one
+/// annotation.
+fn subtree_ids<A: Walk>(node: &A) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    node.walk(&mut |n, phase| {
+        if phase == Phase::Pre {
+            ids.insert(n.node_id());
+        }
+    });
+    ids
+}
+
+/// Records `name` as allowed at every id in `subtree`.
+fn insert_named<'a>(
+    named: &mut HashMap<NodeId, HashSet<&'a str>>,
+    subtree: &HashSet<NodeId>,
+    name: &'a str,
+) {
+    for id in subtree {
+        named.entry(*id).or_default().insert(name);
+    }
+}
+
+/// Whether a document may waive `rule`.
+///
+/// An undeclared name belongs to a rule the host wrote and registered
+/// itself; usage-site exceptions to those are precisely what the
+/// annotation is for, so it counts as suppressible.
+fn rule_is_suppressible(rule: &str) -> bool {
+    lint_decl(rule).is_none_or(|decl| category_is_suppressible(decl.category))
+}
+
+/// Whether a category is one a document may waive. See the crate-level
+/// *What a document may not suppress* section for why the two hard
+/// categories are excluded.
+fn category_is_suppressible(category: LintCategory) -> bool {
+    !matches!(category, LintCategory::Correctness | LintCategory::Contract)
 }
 
 // ---------- Built-in rules ----------------------------------------------
@@ -769,6 +1028,28 @@ impl<A: Walk + DslSchema> Rule<A> for TypoHint<A> {
     }
 }
 
+// ---------- Annotation pseudo-rules -------------------------------------
+
+/// `$allow` entry standing for "every suppressible rule at this node
+/// and below".
+pub const ALLOW_WILDCARD: &str = "*";
+
+/// Rule name on diagnostics about an `$allow` entry the linter could
+/// not resolve — a [`NodeId`] absent from the AST, or a rule name that
+/// is neither declared nor registered.
+///
+/// A pseudo-rule: it carries a [`LintDecl`], so an `explain` surface
+/// resolves its code like any other, but it has no [`Rule`] impl —
+/// nothing detects it by walking the AST. It is raised while
+/// [`Linter::lint_with_allows`] resolves the annotations themselves.
+pub const UNKNOWN_ALLOW: &str = "unknown-allow";
+
+/// Rule name on diagnostics about an `$allow` entry naming a
+/// [`LintCategory::Correctness`] or [`LintCategory::Contract`] rule,
+/// which a document may not waive. A pseudo-rule like
+/// [`UNKNOWN_ALLOW`].
+pub const NOT_SUPPRESSIBLE: &str = "not-suppressible";
+
 // ---------- Lint declaration registry -----------------------------------
 
 /// Category of a lint rule, mirroring Clippy's category axis but
@@ -822,7 +1103,9 @@ pub struct LintDecl {
     pub desc: &'static str,
 }
 
-/// Central registry of every built-in lint rule's declaration.
+/// Central registry of every built-in lint rule's declaration, plus
+/// the two annotation pseudo-rules ([`UNKNOWN_ALLOW`],
+/// [`NOT_SUPPRESSIBLE`]) that have a declaration but no `Rule` impl.
 ///
 /// Kept in lock-step with the `Rule` impls above by
 /// `lint_decls_cover_all_builtin_rules` — adding a built-in rule
@@ -880,6 +1163,20 @@ pub static LINT_DECLS: &[LintDecl] = &[
         category: LintCategory::Suspicious,
         default_severity: Severity::Info,
         desc: "flags labels that look like a mistyped schema variant name (opt-in, suggester-driven)",
+    },
+    LintDecl {
+        name: UNKNOWN_ALLOW,
+        code: "dsl_kit::lint::unknown_allow",
+        category: LintCategory::Suspicious,
+        default_severity: Severity::Info,
+        desc: "flags an $allow entry naming a node or a rule the linter cannot resolve",
+    },
+    LintDecl {
+        name: NOT_SUPPRESSIBLE,
+        code: "dsl_kit::lint::not_suppressible",
+        category: LintCategory::Suspicious,
+        default_severity: Severity::Warn,
+        desc: "flags an $allow entry naming a Correctness or Contract rule, which a document may not waive",
     },
 ];
 
@@ -1462,8 +1759,14 @@ mod tests {
             TypoHint::<Tiny>::NAME,
         ];
 
+        // The pseudo-rules: declared like the rest so `explain`
+        // resolves their codes, but raised while resolving `$allow`
+        // annotations rather than by a `Rule` impl, so they have no
+        // NAME const to check against.
+        let pseudo_names = [UNKNOWN_ALLOW, NOT_SUPPRESSIBLE];
+
         // Every built-in rule has a declaration, resolvable by name.
-        for name in rule_names {
+        for name in rule_names.iter().copied().chain(pseudo_names) {
             let decl = lint_decl(name)
                 .unwrap_or_else(|| panic!("no LintDecl registered for rule `{name}`"));
             assert_eq!(decl.name, name);
@@ -1474,7 +1777,7 @@ mod tests {
         // Every declaration points at a real built-in rule.
         for decl in LINT_DECLS {
             assert!(
-                rule_names.contains(&decl.name),
+                rule_names.contains(&decl.name) || pseudo_names.contains(&decl.name),
                 "LINT_DECLS entry `{}` does not match any built-in rule NAME",
                 decl.name
             );
@@ -1486,7 +1789,7 @@ mod tests {
         }
 
         // No stray / missing entries.
-        assert_eq!(LINT_DECLS.len(), rule_names.len());
+        assert_eq!(LINT_DECLS.len(), rule_names.len() + pseudo_names.len());
     }
 
     #[test]
@@ -1522,6 +1825,316 @@ mod tests {
             .with_suggester(Arc::new(FixedSuggester("Alpha")));
         let diags = Linter::<TwoVar>::new().with_rule(rule).lint(&ast);
         assert!(diags.is_empty(), "expected zero diagnostics, got {diags:?}");
+    }
+
+    // ---------- Usage-site suppression ----------------------------------
+
+    /// Builds an [`AllowTable`] the way a front-end would: node id →
+    /// the rule names the document accepted there.
+    fn allows(entries: &[(u64, &[&str])]) -> AllowTable {
+        let mut table = AllowTable::default();
+        for (id, names) in entries {
+            table.insert(
+                NodeId(*id),
+                names.iter().map(|n| (*n).to_string()).collect(),
+            );
+        }
+        table
+    }
+
+    /// Stand-in for a DSL author's own rule: fires on every node, and
+    /// lives outside `LINT_DECLS` like any custom rule would.
+    struct FiresOnEveryNode;
+
+    impl FiresOnEveryNode {
+        const NAME: &'static str = "custom-fires";
+    }
+
+    impl<A: Walk> Rule<A> for FiresOnEveryNode {
+        fn name(&self) -> &'static str {
+            Self::NAME
+        }
+
+        fn check(&self, ast: &A, ctx: &mut LintContext) {
+            ast.walk(&mut |node, phase| {
+                if phase == Phase::Pre {
+                    ctx.report(
+                        Self::NAME,
+                        Severity::Warn,
+                        node.node_id(),
+                        "custom rule fired",
+                    );
+                }
+            });
+        }
+    }
+
+    /// A tree tripping one rule of each interesting category at once:
+    /// duplicate ids (Correctness), depth past the ceiling (Contract),
+    /// fan-out and a redundant wrap (Complexity).
+    fn four_category_tree() -> Tiny {
+        node(1, vec![node(2, vec![leaf(3), leaf(3)])])
+    }
+
+    fn four_category_linter() -> Linter<Tiny> {
+        Linter::<Tiny>::new()
+            .with_rule(UniqueNodeIds)
+            .with_rule(MaxDepth::new(1))
+            .with_rule(MaxFanOut::new(1))
+            .with_rule(NoRedundantWrap)
+    }
+
+    #[test]
+    fn allow_moves_the_named_finding_to_suppressed() {
+        // 5 kids under root; limit 3 → one max-fan-out finding on root.
+        let ast = node(1, (2..7).map(leaf).collect());
+        let outcome = Linter::<Tiny>::new()
+            .with_rule(MaxFanOut::new(3))
+            .lint_with_allows(&ast, &allows(&[(1, &[MaxFanOut::NAME])]));
+
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "diagnostics = {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(outcome.suppressed.len(), 1);
+        assert_eq!(outcome.suppressed[0].rule, MaxFanOut::NAME);
+        assert_eq!(outcome.suppressed[0].node, NodeId(1));
+    }
+
+    #[test]
+    fn allow_covers_the_annotated_nodes_whole_subtree() {
+        // The finding lands on the inner node; the annotation sits on
+        // its parent.
+        let ast = node(1, vec![node(2, (3..8).map(leaf).collect())]);
+        let linter = Linter::<Tiny>::new().with_rule(MaxFanOut::new(3));
+
+        let bare = linter.lint(&ast);
+        assert_eq!(bare.len(), 1, "diagnostics = {bare:?}");
+        assert_eq!(bare[0].node, NodeId(2));
+
+        let outcome = linter.lint_with_allows(&ast, &allows(&[(1, &[MaxFanOut::NAME])]));
+        assert!(
+            outcome.diagnostics.is_empty(),
+            "diagnostics = {:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(outcome.suppressed.len(), 1);
+        assert_eq!(outcome.suppressed[0].node, NodeId(2));
+    }
+
+    #[test]
+    fn wildcard_allow_spares_correctness_and_contract_findings() {
+        let ast = four_category_tree();
+        let outcome =
+            four_category_linter().lint_with_allows(&ast, &allows(&[(1, &[ALLOW_WILDCARD])]));
+
+        let kept: Vec<&str> = outcome.diagnostics.iter().map(|d| d.rule).collect();
+        let quieted: Vec<&str> = outcome.suppressed.iter().map(|d| d.rule).collect();
+
+        assert!(
+            kept.contains(&UniqueNodeIds::NAME),
+            "Correctness must survive `*`, kept = {kept:?}"
+        );
+        assert!(
+            kept.contains(&MaxDepth::NAME),
+            "Contract must survive `*`, kept = {kept:?}"
+        );
+        assert!(
+            quieted.contains(&MaxFanOut::NAME) && quieted.contains(&NoRedundantWrap::NAME),
+            "Complexity findings must be suppressed, quieted = {quieted:?}"
+        );
+        assert!(
+            !kept.contains(&MaxFanOut::NAME) && !kept.contains(&NoRedundantWrap::NAME),
+            "suppressed findings must not also be reported, kept = {kept:?}"
+        );
+    }
+
+    #[test]
+    fn naming_a_correctness_rule_is_reported_and_left_ineffective() {
+        let dup = NodeId(42);
+        let ast = Tiny::Node {
+            id: dup,
+            kids: vec![Tiny::Node {
+                id: dup,
+                kids: vec![],
+            }],
+        };
+        let outcome = Linter::<Tiny>::new()
+            .with_rule(UniqueNodeIds)
+            .lint_with_allows(&ast, &allows(&[(42, &[UniqueNodeIds::NAME])]));
+
+        assert!(
+            outcome.suppressed.is_empty(),
+            "a Correctness finding must not be waivable, suppressed = {:?}",
+            outcome.suppressed
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == UniqueNodeIds::NAME)
+        );
+        let note = outcome
+            .diagnostics
+            .iter()
+            .find(|d| d.rule == NOT_SUPPRESSIBLE)
+            .expect("the entry itself must be reported");
+        assert_eq!(note.severity, Severity::Warn);
+        assert!(
+            note.message.contains(UniqueNodeIds::NAME) && note.message.contains("Correctness"),
+            "unexpected message: {}",
+            note.message
+        );
+    }
+
+    #[test]
+    fn an_unknown_allow_name_is_reported_without_a_suggester() {
+        let ast = node(1, (2..7).map(leaf).collect());
+        let outcome = Linter::<Tiny>::new()
+            .with_rule(MaxFanOut::new(3))
+            .lint_with_allows(&ast, &allows(&[(1, &["max-fanout"])]));
+
+        assert!(
+            outcome.suppressed.is_empty(),
+            "a typo suppresses nothing, suppressed = {:?}",
+            outcome.suppressed
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == MaxFanOut::NAME)
+        );
+        let note = outcome
+            .diagnostics
+            .iter()
+            .find(|d| d.rule == UNKNOWN_ALLOW)
+            .expect("the unknown name must be reported");
+        assert_eq!(note.severity, Severity::Info);
+        assert!(note.message.contains("max-fanout"));
+        assert!(
+            !note.message.contains("did you mean"),
+            "the default suggester is a no-op: {}",
+            note.message
+        );
+    }
+
+    #[test]
+    fn an_unknown_allow_name_gains_a_hint_from_an_injected_suggester() {
+        use std::sync::Arc;
+        let ast = node(1, (2..7).map(leaf).collect());
+        let outcome = Linter::<Tiny>::new()
+            .with_rule(MaxFanOut::new(3))
+            .with_suggester(Arc::new(FixedSuggester(MaxFanOut::NAME)))
+            .lint_with_allows(&ast, &allows(&[(1, &["max-fanout"])]));
+
+        let note = outcome
+            .diagnostics
+            .iter()
+            .find(|d| d.rule == UNKNOWN_ALLOW)
+            .expect("the unknown name must be reported");
+        assert!(
+            note.message.contains("did you mean") && note.message.contains(MaxFanOut::NAME),
+            "unexpected message: {}",
+            note.message
+        );
+    }
+
+    #[test]
+    fn an_allow_for_a_node_outside_the_ast_is_reported() {
+        let ast = leaf(1);
+        let outcome = Linter::<Tiny>::with_defaults()
+            .lint_with_allows(&ast, &allows(&[(99, &[MaxFanOut::NAME])]));
+
+        let note = outcome
+            .diagnostics
+            .iter()
+            .find(|d| d.rule == UNKNOWN_ALLOW)
+            .expect("an unresolvable node must be reported");
+        assert_eq!(note.severity, Severity::Warn);
+        assert_eq!(note.node, NodeId(99));
+        assert!(note.message.contains("n99"), "unexpected: {}", note.message);
+    }
+
+    #[test]
+    fn kept_and_suppressed_together_account_for_every_finding() {
+        let ast = four_category_tree();
+        let linter = four_category_linter();
+        let bare = linter.lint(&ast);
+        let outcome = linter.lint_with_allows(
+            &ast,
+            &allows(&[(1, &[ALLOW_WILDCARD]), (2, &["no-such-rule"])]),
+        );
+
+        // Everything the rules reported is in exactly one bucket; the
+        // annotation's own diagnostics are the only additions.
+        let from_rules: Vec<&Diagnostic> = outcome
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule != UNKNOWN_ALLOW && d.rule != NOT_SUPPRESSIBLE)
+            .chain(outcome.suppressed.iter())
+            .collect();
+        assert_eq!(from_rules.len(), bare.len(), "lost or duplicated findings");
+        for diag in &bare {
+            assert!(
+                from_rules.contains(&diag),
+                "{diag:?} vanished from the outcome"
+            );
+        }
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .filter(|d| d.rule == UNKNOWN_ALLOW)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lint_matches_lint_with_allows_on_an_empty_table() {
+        let ast = four_category_tree();
+        let linter = four_category_linter();
+        let outcome = linter.lint_with_allows(&ast, &AllowTable::default());
+        assert_eq!(linter.lint(&ast), outcome.diagnostics);
+        assert!(outcome.suppressed.is_empty());
+    }
+
+    #[test]
+    fn a_registered_custom_rule_can_be_allowed() {
+        let ast = node(1, vec![leaf(2)]);
+        let outcome = Linter::<Tiny>::new()
+            .with_rule(FiresOnEveryNode)
+            .lint_with_allows(&ast, &allows(&[(2, &[FiresOnEveryNode::NAME])]));
+
+        assert_eq!(outcome.suppressed.len(), 1);
+        assert_eq!(outcome.suppressed[0].node, NodeId(2));
+        assert_eq!(outcome.diagnostics.len(), 1, "the root keeps its finding");
+        assert_eq!(outcome.diagnostics[0].node, NodeId(1));
+        assert!(
+            !outcome.diagnostics.iter().any(|d| d.rule == UNKNOWN_ALLOW),
+            "a registered custom rule is a known name"
+        );
+    }
+
+    #[test]
+    fn a_declared_but_unregistered_rule_name_is_silent() {
+        // `dead-variants` is opt-in, so the defaults never run it. The
+        // name is still real: naming it is not a typo to report.
+        let ast = node(1, vec![node(2, vec![leaf(3)])]);
+        let outcome = Linter::<Tiny>::with_defaults()
+            .lint_with_allows(&ast, &allows(&[(1, &[DeadVariants::NAME])]));
+
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == UNKNOWN_ALLOW || d.rule == NOT_SUPPRESSIBLE),
+            "diagnostics = {:?}",
+            outcome.diagnostics
+        );
+        assert!(outcome.suppressed.is_empty());
     }
 
     #[test]
