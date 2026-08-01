@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/ynishi/dsl-kit/compare/v0.7.0...v0.8.0) - 2026-08-01
+
+### Added
+
+- *(parse)* scalar shorthand for One/Optional child slots + canonical JSON dump
+
 ## [0.7.0](https://github.com/ynishi/dsl-kit/compare/v0.6.1...v0.7.0) - 2026-07-26
 
 ### Added
