@@ -31,10 +31,10 @@
 pub use serde_json;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 mod drive;
 mod engine;
@@ -53,7 +53,10 @@ pub use suggest::{
 /// A `NodeId` is orthogonal to source location: two nodes at the same
 /// source span but in different expansions carry different IDs, and the
 /// same node retains its ID across evaluation runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordered by the allocation counter behind it, so an ordered map keyed
+/// on `NodeId` (e.g. [`AllowTable`]) iterates in allocation order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
 
 impl fmt::Display for NodeId {
@@ -119,10 +122,63 @@ impl fmt::Display for Path {
     }
 }
 
+/// Lint rules a document allowed at specific nodes, keyed by the
+/// [`NodeId`] the build minted for the annotated node.
+///
+/// A document annotates a node with the rule names it wants suppressed
+/// there; the build carries those names across to the typed AST, where
+/// the node's identity is a `NodeId` rather than a source position.
+/// [`IdGen::take_allows`] produces the table and a linter consumes it —
+/// the two halves never have to agree on anything but the id.
+///
+/// The backing map is ordered, so iteration is deterministic and two
+/// runs over the same document produce byte-identical reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowTable(BTreeMap<NodeId, Vec<String>>);
+
+impl AllowTable {
+    /// Records the rule names allowed at `id`, replacing any names
+    /// previously recorded for it.
+    pub fn insert(&mut self, id: NodeId, allows: Vec<String>) {
+        self.0.insert(id, allows);
+    }
+
+    /// Rule names allowed at `id`, or `None` when the node carries no
+    /// annotation.
+    pub fn get(&self, id: &NodeId) -> Option<&Vec<String>> {
+        self.0.get(id)
+    }
+
+    /// Iterates the annotated nodes in ascending [`NodeId`] order.
+    pub fn iter(&self) -> impl Iterator<Item = (&NodeId, &Vec<String>)> {
+        self.0.iter()
+    }
+
+    /// True when no node carries an annotation.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of annotated nodes.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Monotonic ID generator for nodes and call frames.
+///
+/// Also the collection point for per-node annotations a front-end
+/// carried through the parse trunk: the build records them against the
+/// id it just minted ([`Self::record_allows`]) and the host drains them
+/// once the tree is built ([`Self::take_allows`]).
 #[derive(Debug, Default)]
 pub struct IdGen {
     next: AtomicU64,
+    /// Pending `(node, allowed rule names)` pairs, in the order the
+    /// build recorded them. A `Mutex` (rather than the lock-free
+    /// counter next to it) because the payload is not a scalar; the
+    /// lock is held only for a push / take.
+    allows: Mutex<Vec<(NodeId, Vec<String>)>>,
 }
 
 impl IdGen {
@@ -130,6 +186,7 @@ impl IdGen {
     pub const fn new() -> Self {
         Self {
             next: AtomicU64::new(0),
+            allows: Mutex::new(Vec::new()),
         }
     }
 
@@ -141,6 +198,41 @@ impl IdGen {
     /// Allocates a fresh `CallFrameId`.
     pub fn frame(&self) -> CallFrameId {
         CallFrameId(self.next.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Records the rule names a document allowed at `id`.
+    ///
+    /// Called by `#[derive(DslBuild)]`-generated code for every node
+    /// whose parse tree carried an annotation; hand-written builds may
+    /// call it too. Recording nothing is the normal case, so an
+    /// un-annotated document leaves the generator untouched.
+    pub fn record_allows(&self, id: NodeId, allows: Vec<String>) {
+        self.lock_allows().push((id, allows));
+    }
+
+    /// Drains every recorded annotation into an [`AllowTable`].
+    ///
+    /// The host's order is `from_parse_tree` first, `take_allows`
+    /// second: the build mints the ids and records against them, then
+    /// this hands the accumulated table over to whoever consumes it
+    /// (the linter). Draining leaves the generator empty, so a second
+    /// call returns an empty table — take once and keep the result.
+    pub fn take_allows(&self) -> AllowTable {
+        let mut table = AllowTable::default();
+        for (id, allows) in std::mem::take(&mut *self.lock_allows()) {
+            table.insert(id, allows);
+        }
+        table
+    }
+
+    /// Locks the annotation buffer, recovering from poisoning.
+    ///
+    /// The only code under the lock is a `push` / `mem::take`, neither
+    /// of which can leave the `Vec` in a torn state, so a poisoned
+    /// mutex (some other thread panicked while holding it) carries no
+    /// broken invariant worth propagating.
+    fn lock_allows(&self) -> std::sync::MutexGuard<'_, Vec<(NodeId, Vec<String>)>> {
+        self.allows.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

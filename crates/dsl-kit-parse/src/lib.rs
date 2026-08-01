@@ -15,7 +15,8 @@
 //!
 //! - [`ParseTree`] — untyped trunk. Variant name + field payloads +
 //!   named child slots (positional lists, plus keyed entries for
-//!   [`Multiplicity::Map`] slots) + optional source [`Span`].
+//!   [`Multiplicity::Map`] slots) + usage-site lint suppressions
+//!   ([`allow`]) + optional source [`Span`].
 //! - [`RawValue`] — per-field payload representation. `Text` keeps the
 //!   PEG front-end's matched source text; `Json` keeps the serde
 //!   front-end's typed value with no stringify round-trip.
@@ -36,6 +37,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub mod allow;
 pub mod example_gen;
 pub mod grammar_check;
 pub mod import;
@@ -146,6 +148,21 @@ pub struct ParseTree {
     /// [`codes::DUPLICATE_KEY`] — instead of one entry silently
     /// winning.
     pub keyed_children: Vec<(String, Vec<(String, ParseTree)>)>,
+    /// Lint rule names this node suppresses at its own usage site,
+    /// verbatim in the order the document wrote them.
+    ///
+    /// Filled in by the front-end from the reserved
+    /// [`allow::ALLOW_KEY`] (`$allow`) spelling — a document concern,
+    /// not a schema one. [`check_conformance`] ignores the vector
+    /// entirely: an annotation neither satisfies nor violates a
+    /// [`NodeSchema`]. The build (`#[derive(DslBuild)]`) carries it
+    /// across to the typed AST as a
+    /// [`dsl_kit_core::AllowTable`] entry keyed on the minted
+    /// [`NodeId`], which is where a linter reads it.
+    ///
+    /// Empty is the overwhelmingly common case and means "no
+    /// suppression here".
+    pub allows: Vec<String>,
     /// Source-range span, if the front-end tracks it.
     pub span: Option<Span>,
 }
@@ -158,6 +175,7 @@ impl ParseTree {
             fields: Vec::new(),
             children: Vec::new(),
             keyed_children: Vec::new(),
+            allows: Vec::new(),
             span: None,
         }
     }

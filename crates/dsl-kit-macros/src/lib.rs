@@ -920,7 +920,10 @@ pub fn derive_dsl_schema(input: TokenStream) -> TokenStream {
 ///    Keyed slots (`BTreeMap<String, T>`) read the tree's keyed half
 ///    and keep their keys.
 /// 5. Constructs the variant with a fresh `NodeId` from the
-///    caller-supplied `IdGen`.
+///    caller-supplied `IdGen`, first recording the tree's `$allow`
+///    annotation (if any) against that id via `IdGen::record_allows`.
+///    The caller reads the accumulated table back with
+///    `IdGen::take_allows` once the whole tree is built.
 ///
 /// (The named helpers live in `dsl_kit_parse`; this proc-macro crate
 /// cannot intra-doc-link across crates it does not depend on.)
@@ -1112,11 +1115,19 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
             }
         }
 
+        // The node's id is minted into a local first so a `$allow`
+        // annotation on the tree can be recorded against it before the
+        // variant is constructed. `__dsl_kit_`-prefixed so the binding
+        // cannot shadow a field ident.
         variant_arms.push(quote! {
             #variant_name_str => {
                 #(#let_bindings)*
+                let __dsl_kit_id = ids.node();
+                if !tree.allows.is_empty() {
+                    ids.record_allows(__dsl_kit_id, tree.allows.clone());
+                }
                 ::std::result::Result::Ok(Self::#variant_ident {
-                    id: ids.node(),
+                    id: __dsl_kit_id,
                     #(#ctor_fields,)*
                 })
             }

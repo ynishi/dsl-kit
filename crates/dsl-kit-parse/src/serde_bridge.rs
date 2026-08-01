@@ -39,6 +39,13 @@
 //! the object's only key and its value a literal string; anything else
 //! is a [`crate::import::import_codes::SPEC_SHAPE`] diagnostic.
 //!
+//! One key is reserved: `"$allow"` ([`crate::allow::ALLOW_KEY`]) names
+//! the lint rules the document accepts at that node. It is dispatched
+//! before the schema lookup — an annotation is a document concern, not
+//! a declared slot — and lands on [`ParseTree::allows`]. Its value must
+//! be an array of strings; anything else is a
+//! [`crate::allow::codes::ALLOW_SHAPE`] diagnostic.
+//!
 //! ## Example
 //!
 //! ```ignore
@@ -54,6 +61,7 @@
 //! assert_eq!(tree.variant, "Add");
 //! ```
 
+use crate::allow::{self, codes as allow_codes};
 use crate::import::{self, import_codes};
 use crate::{BuildError, BuiltinLevenshteinSuggester, Diagnostic, ParseTree, RawValue, codes};
 use dsl_kit_core::Suggester;
@@ -245,6 +253,24 @@ fn build_tree(
 
     for (key, val) in obj {
         if key == "type" {
+            continue;
+        }
+        // `$allow` is a document-level annotation, not a schema slot:
+        // recognised before schema dispatch so it never reaches the
+        // unknown-key path, and never compared against the variant.
+        if key == allow::ALLOW_KEY {
+            match allow_names(val) {
+                Ok(names) => tree.allows = names,
+                Err(reason) => diags.push(Diagnostic::error(
+                    allow_codes::ALLOW_SHAPE,
+                    format!(
+                        "`{}` on variant `{}` {}",
+                        allow::ALLOW_KEY,
+                        variant.name,
+                        reason
+                    ),
+                )),
+            }
             continue;
         }
         if let Some(_field) = variant.fields.iter().find(|f| &f.name == key) {
@@ -563,6 +589,33 @@ fn build_scalar_keyed_slot(
     out
 }
 
+/// Reads the reserved [`allow::ALLOW_KEY`] value as a list of rule
+/// names. `Err` carries the tail of the diagnostic message, which the
+/// caller prefixes with the key and variant.
+///
+/// An empty array is accepted and yields no names — "annotated with
+/// nothing" and "not annotated" mean the same thing. Every other
+/// non-conforming shape fails: a suppression the author expected to
+/// take effect must never be silently dropped.
+fn allow_names(val: &Value) -> Result<Vec<String>, String> {
+    let Value::Array(items) = val else {
+        return Err(format!(
+            "must be an array of rule-name strings, got {}",
+            kind(val)
+        ));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(s) => Ok(s.clone()),
+            other => Err(format!(
+                "must be an array of rule-name strings, but one entry is {}",
+                kind(other)
+            )),
+        })
+        .collect()
+}
+
 fn kind(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -593,6 +646,14 @@ fn kind(v: &Value) -> &'static str {
 /// - keyed slots render as objects in the tree's sorted-by-key order;
 /// - object key order in the output is `serde_json`'s map order,
 ///   which is deterministic for a given tree.
+///
+/// A node's [`allow::ALLOW_KEY`] (`$allow`) annotation is part of the
+/// document's reviewed meaning — it says which lint rules an author
+/// accepted at that node — so it is emitted here (verbatim, in the
+/// authored order, omitted when empty) and therefore *does* participate
+/// in a content hash computed over this output. Adding or removing a
+/// suppression changes the hash; that is the intent, since the change
+/// is one a reviewer must see.
 ///
 /// Two documents that parse (through either front-end) to equal
 /// meaning therefore serialize to the same `Value` — which makes this
@@ -645,6 +706,17 @@ fn canonical_node(
     let variant = schema.variant(&tree.variant)?;
     let mut obj = serde_json::Map::new();
     obj.insert("type".to_string(), Value::String(tree.variant.clone()));
+    if !tree.allows.is_empty() {
+        obj.insert(
+            allow::ALLOW_KEY.to_string(),
+            Value::Array(
+                tree.allows
+                    .iter()
+                    .map(|name| Value::String(name.clone()))
+                    .collect(),
+            ),
+        );
+    }
 
     for (name, raw) in &tree.fields {
         let field = variant.fields.iter().find(|f| &f.name == name)?;

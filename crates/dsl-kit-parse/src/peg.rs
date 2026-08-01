@@ -722,6 +722,7 @@ impl<'g, 'i> Interpreter<'g, 'i> {
             fields: node_sink.fields,
             children: node_sink.children,
             keyed_children,
+            allows: Vec::new(),
             span: Some(Span::new(start_pos, end_pos)),
         };
         self.contribute_tree(tree);
