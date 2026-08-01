@@ -42,6 +42,9 @@
 //! 2. **Compose the rule set**: build with [`Linter::new`] +
 //!    [`Linter::with_rule`] instead of [`Linter::with_defaults`], and
 //!    tune per-rule parameters ([`MaxDepth::new`], [`MaxFanOut::new`]).
+//!    To keep the defaults minus one rule, subtract instead of
+//!    re-listing: `Linter::with_defaults().without_rule(MaxFanOut::NAME)`
+//!    ([`Linter::without_rule`]).
 //! 3. **Filter the output**: every [`Diagnostic`] carries its
 //!    `(rule, node, severity)` publicly, so a host that needs
 //!    finer-grained suppression can drop entries from
@@ -204,6 +207,57 @@ impl<A: Walk> Linter<A> {
         self
     }
 
+    /// Drops every registered rule whose [`Rule::name`] equals `name`;
+    /// returns the linter for chaining. The counterpart of
+    /// [`with_rule`](Self::with_rule), and the one-line way to take a
+    /// single rule out of [`with_defaults`](Self::with_defaults)
+    /// instead of re-listing the whole set through
+    /// [`new`](Self::new) + `with_rule`.
+    ///
+    /// A name that matches no registered rule is a no-op: custom rules
+    /// live outside [`LINT_DECLS`], so there is no registry against
+    /// which an arbitrary name could be validated. Pass the rule's
+    /// associated const (`MaxFanOut::NAME`) rather than a string
+    /// literal and a typo becomes a compile error; for a name reaching
+    /// the linter at runtime, [`lint_decl`] resolves the built-in ones.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use dsl_kit_core::{DslNode, NodeId, Walk};
+    /// # use dsl_kit_schema::{DslSchema, NodeSchema, VariantSchema};
+    /// use dsl_kit_lint::{Linter, MaxFanOut};
+    ///
+    /// # struct Doc;
+    /// # impl DslNode for Doc {
+    /// #     fn node_id(&self) -> NodeId { NodeId(0) }
+    /// #     fn variant_name(&self) -> &'static str { "Doc" }
+    /// # }
+    /// # impl Walk for Doc {
+    /// #     fn children(&self) -> Vec<&Self> { Vec::new() }
+    /// # }
+    /// # impl DslSchema for Doc {
+    /// #     fn schema() -> NodeSchema {
+    /// #         NodeSchema {
+    /// #             name: "Doc".into(),
+    /// #             variants: vec![VariantSchema {
+    /// #                 name: "Doc".into(),
+    /// #                 fields: vec![],
+    /// #                 children: vec![],
+    /// #             }],
+    /// #         }
+    /// #     }
+    /// # }
+    /// let linter = Linter::<Doc>::with_defaults().without_rule(MaxFanOut::NAME);
+    ///
+    /// assert!(!linter.rule_names().contains(&MaxFanOut::NAME));
+    /// ```
+    #[must_use]
+    pub fn without_rule(mut self, name: &str) -> Self {
+        self.rules.retain(|r| r.name() != name);
+        self
+    }
+
     /// Runs every registered rule against `ast` and returns the
     /// accumulated diagnostics, in the order rules were registered.
     pub fn lint(&self, ast: &A) -> Vec<Diagnostic> {
@@ -218,6 +272,15 @@ impl<A: Walk> Linter<A> {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
+
+    /// Names of the registered rules, in the order they were
+    /// registered — the named counterpart of
+    /// [`rule_count`](Self::rule_count), for auditing which rules a
+    /// composed linter will actually run and for debugging a
+    /// [`without_rule`](Self::without_rule) call that removed nothing.
+    pub fn rule_names(&self) -> Vec<&'static str> {
+        self.rules.iter().map(|r| r.name()).collect()
+    }
 }
 
 impl<A: Walk + DslSchema> Linter<A> {
@@ -231,6 +294,10 @@ impl<A: Walk + DslSchema> Linter<A> {
     /// variants, so a default `Info` flood would drown genuine
     /// `Error` / `Warn` findings. Register it explicitly when a
     /// review pass wants dead-code style diagnostics.
+    ///
+    /// To run the defaults minus a single rule, chain
+    /// [`without_rule`](Self::without_rule) rather than rebuilding the
+    /// set from [`new`](Self::new).
     pub fn with_defaults() -> Self {
         Self::new()
             .with_rule(UniqueNodeIds)
@@ -1078,6 +1145,46 @@ mod tests {
             .with_rule(UniqueNodeIds)
             .with_rule(MaxDepth::new(8));
         assert_eq!(l.rule_count(), 2);
+    }
+
+    #[test]
+    fn without_rule_removes_the_named_rule_from_the_defaults() {
+        // 38 direct children on the root, above MaxFanOut::DEFAULT_LIMIT.
+        let ast = node(1, (2..40).map(leaf).collect());
+
+        let before = Linter::<Tiny>::with_defaults().lint(&ast);
+        assert!(
+            before.iter().any(|d| d.rule == MaxFanOut::NAME),
+            "fixture must trip max-fan-out under the defaults, diags = {before:?}"
+        );
+
+        let linter = Linter::<Tiny>::with_defaults().without_rule(MaxFanOut::NAME);
+        assert_eq!(linter.rule_count(), 4);
+        let after = linter.lint(&ast);
+        assert!(
+            !after.iter().any(|d| d.rule == MaxFanOut::NAME),
+            "max-fan-out must be gone after without_rule, diags = {after:?}"
+        );
+    }
+
+    #[test]
+    fn without_rule_is_a_no_op_for_an_unregistered_name() {
+        let linter = Linter::<Tiny>::with_defaults().without_rule("no-such-rule");
+        assert_eq!(linter.rule_count(), 5);
+    }
+
+    #[test]
+    fn rule_names_lists_defaults_in_registration_order() {
+        assert_eq!(
+            Linter::<Tiny>::with_defaults().rule_names(),
+            vec![
+                UniqueNodeIds::NAME,
+                MaxDepth::NAME,
+                MaxFanOut::NAME,
+                NoEmptyChildSlots::NAME,
+                NoRedundantWrap::NAME,
+            ]
+        );
     }
 
     #[test]
