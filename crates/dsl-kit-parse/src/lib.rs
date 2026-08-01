@@ -495,7 +495,8 @@ pub mod codes {
 ///   declared child slot);
 /// - every declared child slot is present exactly once
 ///   ([`codes::DUPLICATE_CHILD`]) and honours its [`Multiplicity`]
-///   ([`codes::ARITY_ONE`], [`codes::ARITY_OPTIONAL`]);
+///   ([`codes::ARITY_ONE`], [`codes::ARITY_OPTIONAL`]) plus any
+///   declared non-emptiness ([`codes::ARITY_NON_EMPTY`]);
 /// - every child slot sits in the half its [`Multiplicity`] calls for
 ///   — keyed slots under [`ParseTree::keyed_children`], positional
 ///   ones under [`ParseTree::children`] ([`codes::KEYED_SLOT_SHAPE`]);
@@ -506,12 +507,17 @@ pub mod codes {
 ///   or [`codes::FIELD_AS_CHILD`] when the extra name is actually a
 ///   declared payload field).
 ///
-/// [`Multiplicity::Many`] and [`Multiplicity::Map`] both accept
-/// zero-or-more children — emptiness is a domain-level judgment, not a
-/// shape error, so the `no-empty-child-slots` lint rule is where it
-/// belongs. That rule covers both collection shapes and reports at
-/// `Warn`, since neither multiplicity promises a non-empty
-/// collection.
+/// [`Multiplicity::Many`] and [`Multiplicity::Map`] accept
+/// zero-or-more children on their own: emptiness is a domain-level
+/// judgment, not a shape error, so an undeclared collection slot that
+/// came up empty is accepted here without a diagnostic. Declaring the
+/// constraint changes that — a slot marked
+/// [`non_empty`](dsl_kit_schema::ChildSchema::non_empty) (written
+/// `#[dsl_schema(non_empty)]`) is checked at this level and reported
+/// as an error ([`codes::ARITY_NON_EMPTY`]). The `no-empty-child-slots`
+/// lint rule reads the same declaration and reports at `Error` too; it
+/// is the backstop for typed ASTs hand-built without passing through a
+/// front-end, where this check never runs.
 pub fn check_conformance(tree: &ParseTree, schema: &NodeSchema) -> Vec<Diagnostic> {
     check_conformance_with(tree, schema, &BuiltinLevenshteinSuggester)
 }

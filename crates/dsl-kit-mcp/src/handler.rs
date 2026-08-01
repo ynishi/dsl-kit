@@ -1,6 +1,6 @@
 //! `#[tool_router]` handler that speaks to any [`DslHost`].
 //!
-//! The nine MCP tools are DSL-neutral: they operate on generic
+//! The MCP tools are DSL-neutral: they operate on generic
 //! `NodeId` / `Path` / `depth` shapes, so a caller that swaps
 //! [`DslHost`] implementations sees the same contract.
 //!
@@ -24,6 +24,12 @@
 //! - `dsl_kit_resolve_by_id` — resolve a specific pending suspension by
 //!   its stable id, supporting both success (`ok`) and effect-side
 //!   failure (`err`) variants.
+//! - `dsl_kit_schema` — the loaded DSL's type-level schema, when the
+//!   host wires [`DslHost::schema_json`].
+//! - `dsl_kit_load` — parse a JSON document, build the typed AST, and
+//!   swap it into the host.
+//! - `dsl_kit_lint` — advisory lint diagnostics over the loaded AST,
+//!   when the host wires [`DslHost::lint_json`].
 //! - `dsl_kit_reset` — reset the host's stepper.
 
 use std::sync::Arc;
@@ -623,7 +629,8 @@ impl ServerHandler for DslMcpHandler {
                  3. dsl_kit_step (mode: one | to_yield | to_done).\n\
                  4. dsl_kit_state to inspect where the stepper is.\n\
                  5. dsl_kit_resolve to supply a response for a Call, then step again.\n\
-                 6. dsl_kit_reset to start over."
+                 6. dsl_kit_lint for advisory diagnostics, when the host wires a linter.\n\
+                 7. dsl_kit_reset to start over."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder()

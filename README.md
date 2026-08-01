@@ -87,6 +87,30 @@ to-done), `breakpoint add/list/remove`, `state`, `pending`, `resolve`,
 `schema`, `lint`, `explain`. The `custom-mcp-example` shows how to ship
 your own DSL as its own MCP server binary.
 
+## Conformance vs lint
+
+Two layers inspect a document, and only one of them can stop it.
+
+**Conformance is the compiler.** The `from_parse_tree` that
+`#[derive(DslBuild)]` generates runs `check_conformance` before it
+builds anything, so a non-conforming document never becomes an AST: an
+unknown variant, a missing or duplicated field, a slot that breaks its
+declared multiplicity, an empty slot declared
+`#[dsl_schema(non_empty)]` — every one of them is a hard error.
+Neither the document nor the host can suppress them, and both
+front-ends (canonical text and JSON) go through the same check.
+
+**Lint is advisory and opt-in.** `Linter` sits outside parsing and
+loading: it runs only where a host wires it up explicitly
+(`DslHost::lint_json`, surfaced over MCP as the `dsl_kit_lint` tool).
+A document with lint findings still loads and still runs — findings
+are material for an author or an agent to act on, not a gate. A DSL
+that never wires a linter simply reports itself as unwired.
+
+There is no ignore-file layer. The levers — declare the constraint in
+the schema, compose the rule set, filter the output — are documented
+on the `dsl-kit-lint` crate.
+
 ## Crates
 
 | crate | role |

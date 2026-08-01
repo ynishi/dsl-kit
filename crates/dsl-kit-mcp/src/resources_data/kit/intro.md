@@ -20,8 +20,9 @@ steppable, and debuggable through an MCP surface out of the box.
   `WalkMut`; `BreakpointSet` composes conditions over `NodeContext` so
   agents can synthesise breakpoints from the observable stream alone.
 - **MCP surface** — `DslMcpHandler` speaks to any `DslHost`
-  implementation with a fixed ten-tool debugger surface; `DslMcpBuilder`
-  is the light framework for hand-rolled custom MCP servers.
+  implementation with a fixed, DSL-neutral debugger tool surface;
+  `DslMcpBuilder` is the light framework for hand-rolled custom MCP
+  servers.
 
 ## Two audiences, two resource layers
 
@@ -40,7 +41,7 @@ their own server can opt out via `.without_kit_resources()` on both
 
 - `dsl-kit://kit/dsl-host-authoring` — how to implement `DslHost`
   around your own DSL.
-- `dsl-kit://kit/mcp-tool-reference` — the ten MCP tools grouped by
+- `dsl-kit://kit/mcp-tool-reference` — the MCP tool surface, grouped by
   purpose.
 - `dsl-kit://kit/error-catalog` — every `EngineError` code with its
   help text, generated fresh from the enum.

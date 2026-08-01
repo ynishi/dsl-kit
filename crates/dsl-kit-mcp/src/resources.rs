@@ -115,7 +115,7 @@ pub fn kit_resources() -> Vec<ResourceEntry> {
         ResourceEntry::static_markdown(
             "dsl-kit://kit/mcp-tool-reference",
             "dsl-kit — MCP tool reference",
-            "The ten MCP tools DslMcpHandler exposes, grouped by purpose.",
+            "The MCP tools DslMcpHandler exposes, grouped by purpose.",
             KIT_MCP_TOOL_REFERENCE,
         ),
         ResourceEntry {

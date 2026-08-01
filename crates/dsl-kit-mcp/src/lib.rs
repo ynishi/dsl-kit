@@ -4,8 +4,9 @@
 //!
 //! Two surfaces:
 //!
-//! - [`DslMcpHandler`] — the debugger. A fixed ten-tool surface driven
-//!   by any [`DslHost`] implementation. Wire your DSL by implementing
+//! - [`DslMcpHandler`] — the debugger. A fixed, DSL-neutral tool
+//!   surface driven by any [`DslHost`] implementation. Wire your DSL
+//!   by implementing
 //!   `DslHost` and calling `DslMcpHandler::new(Box::new(my_host))`.
 //! - [`DslMcpBuilder`] / [`DslMcpServer`] — the light framework for
 //!   hand-rolled custom MCP servers. Register tools as ordinary

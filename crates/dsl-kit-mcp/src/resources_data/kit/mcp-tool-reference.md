@@ -1,8 +1,8 @@
 # dsl-kit — MCP tool reference
 
-`DslMcpHandler` exposes thirteen tools. All operate on the DSL-neutral
-`NodeId` / `Path` / `depth` / iteration shapes, so a caller sees the
-same contract regardless of which `DslHost` is loaded.
+`DslMcpHandler` exposes the full tool surface below. All of it operates
+on the DSL-neutral `NodeId` / `Path` / `depth` / iteration shapes, so a
+caller sees the same contract regardless of which `DslHost` is loaded.
 
 ## Inspection
 
@@ -59,8 +59,34 @@ same contract regardless of which `DslHost` is loaded.
   code. Omit `code` to list every known code. Built-in codes come from
   `EngineError`; hosts extend the set via `DslHost::catalog()`.
 
+## Schema and lint
+
+- **`dsl_kit_schema`** — the loaded DSL's type-level schema as JSON.
+  Envelope: `{ "wired": bool, "schema": <NodeSchema JSON> | null }`.
+  `wired=false` means the host has not implemented
+  `DslHost::schema_json`: the DSL is reachable over MCP but has not
+  opted into schema reflection.
+- **`dsl_kit_lint`** — run the host's lint pass over the currently
+  loaded AST. Envelope:
+  `{ "wired": bool, "diagnostics": [...] | null }`. `wired=false`
+  means the host has not implemented `DslHost::lint_json` — a
+  lint-less DSL, which is not the same as a clean one. Lint is a pull:
+  `dsl_kit_load` never runs it, so call this tool when you want the
+  advisory diagnostics. They never block a load.
+
 ## Lifecycle
 
+- **`dsl_kit_load`** — parse a JSON document, build the typed AST,
+  swap it into the host, and reset the stepper. Registered breakpoints
+  are cleared on success, since old `NodeId`s mean nothing against the
+  new AST. An optional `sources` object (names mapped to
+  `{"json": "…"}` / `{"text": "…"}` entries) turns the call into a
+  bundle load that resolves `{"$import": "name"}` node positions and
+  adds an `imports` report (dependencies + digest) to the envelope.
+  Envelopes: `{ "ok": true, "dsl", "root", "ast_size" }` on success,
+  `{ "ok": false, "diagnostics": [...] }` when the document failed
+  conformance, and `{ "ok": false, "error": "…" }` for prose-only
+  failures, including hosts that never opted into loading.
 - **`dsl_kit_reset`** — reset the host's stepper. Breakpoints are
   left in place.
 
