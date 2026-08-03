@@ -353,6 +353,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsl-kit-check"
+version = "0.10.0"
+dependencies = [
+ "dsl-kit-core",
+ "dsl-kit-parse",
+ "dsl-kit-schema",
+ "serde_json",
+]
+
+[[package]]
 name = "dsl-kit-cli"
 version = "0.10.0"
 dependencies = [

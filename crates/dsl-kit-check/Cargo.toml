@@ -1,0 +1,30 @@
+[package]
+name = "dsl-kit-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Semantic check layer for dsl-kit DSLs: judgement rules as data (Check IR) plus a syntax-directed solver over ParseTree."
+
+[dependencies]
+# `parse` carries the substrate (ParseTree / Span) and the Diagnostic
+# envelope the solver emits into.  `core` and `schema` are the declared
+# surface of this crate (design §3): the load-time self-validation of a
+# CheckProgram (S2) resolves rule variants against a `NodeSchema`, and
+# the did-you-mean enrichment (S3) goes through `core::Suggester`.  Both
+# are already exercised by the integration tests that build hand-written
+# schemas and grammars.
+dsl-kit-core   = { workspace = true }
+dsl-kit-schema = { workspace = true }
+dsl-kit-parse  = { workspace = true }
+
+[dev-dependencies]
+# Fixture construction only: the serde-front-end half of the anchoring
+# test feeds `serde_bridge::from_json_value` a `json!` document.
+serde_json = "1"
