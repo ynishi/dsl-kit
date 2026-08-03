@@ -406,6 +406,18 @@ fn unify_fact(pattern: &Fact, actual: &Fact, binds: &mut Bindings) -> bool {
         .all(|(p, a)| unify(p, a, binds))
 }
 
+/// Whether two fact *patterns* could ever describe the same fact.
+///
+/// Used by [`crate::CheckProgram::validate`], which compares a rule's
+/// expectation against everything the program can produce. Both sides
+/// may still carry variables, so this is an over-approximation by
+/// design: it answers "is there any binding under which these agree?",
+/// and reports a rule as unsatisfiable only when the answer is no for
+/// every producer.
+pub(crate) fn may_unify_fact(a: &Fact, b: &Fact) -> bool {
+    unify_fact(a, b, &mut Bindings::new())
+}
+
 /// First-order syntactic unification.
 ///
 /// A [`Term::FieldRef`] that survived grounding (the node has no such

@@ -479,9 +479,10 @@ impl CheckProgramBuilder {
 
 /// Contract for a DSL type that ships its own check program.
 ///
-/// Hand-written today; `#[derive(DslCheck)]` will emit it from
-/// `#[dsl_check(...)]` attributes in a later slice, exactly as
-/// `#[derive(DslSchema)]` emits [`dsl_kit_schema::DslSchema`].
+/// `#[derive(DslCheck)]` (in `dsl-kit-macros`) emits it from
+/// `#[dsl_check(...)]` attributes, exactly as `#[derive(DslSchema)]`
+/// emits [`dsl_kit_schema::DslSchema`]; writing the impl by hand is the
+/// route for programs the attribute vocabulary cannot spell.
 pub trait DslCheck {
     /// Returns the judgement rules for this DSL type.
     fn check_program() -> CheckProgram;

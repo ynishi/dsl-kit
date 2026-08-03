@@ -25,6 +25,12 @@ dsl-kit-schema = { workspace = true }
 dsl-kit-parse  = { workspace = true }
 
 [dev-dependencies]
+# `#[derive(DslCheck)]` lives in the proc-macro crate but emits
+# `::dsl_kit_check::…` paths, so its acceptance tests belong here —
+# same arrangement as `dsl-kit-parse`, whose derive coverage sits in
+# the crate the generated code targets.  Dev-only: nothing in this
+# crate's own surface depends on the macros.
+dsl-kit-macros = { workspace = true }
 # Fixture construction only: the serde-front-end half of the anchoring
 # test feeds `serde_bridge::from_json_value` a `json!` document.
 serde_json = "1"

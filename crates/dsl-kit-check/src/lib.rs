@@ -70,6 +70,26 @@
 //! assert!(diags[0].message.contains("[at steps[0]]"));
 //! ```
 //!
+//! ## Writing the program
+//!
+//! Three routes onto the same value, in increasing order of ceremony:
+//!
+//! - `#[derive(DslCheck)]` (in `dsl-kit-macros`) compiles
+//!   `#[dsl_check(requires = "state(A)", produces = "state(B)")]`
+//!   annotations into the [`CheckProgram`] below — the check-layer twin
+//!   of `#[derive(DslSchema)]`, and opt-in for the same reason (a DSL
+//!   that does not check semantics never acquires this dependency).
+//! - [`CheckProgram::builder`] for the judgements the attribute
+//!   vocabulary cannot spell (a third predicate family, `Eq` / `Neq`
+//!   constraints).
+//! - struct literals, for generators.
+//!
+//! Whichever route, run [`CheckProgram::validate`] once where the
+//! program is loaded. Its findings are not suppressible at the document
+//! level, so a rule that can never hold would otherwise block every
+//! document with no escape hatch; `validate` surfaces that before a
+//! single document is checked.
+//!
 //! ## Layout
 //!
 //! - [`ir`] — the data model ([`Term`], [`Fact`], [`Premise`],
@@ -77,12 +97,15 @@
 //!   [`DslCheck`]) plus builders.
 //! - [`solver`] — the single bottom-up pass and its unification.
 //! - [`codes`] — diagnostic slugs.
+//! - `validate` — the program's self-check
+//!   ([`CheckProgram::validate`]).
 
 #![warn(missing_docs)]
 
 pub mod codes;
 pub mod ir;
 pub mod solver;
+mod validate;
 
 pub use ir::{
     CheckProgram, CheckProgramBuilder, DslCheck, Fact, MessageTemplate, Premise, Rule, RuleBuilder,

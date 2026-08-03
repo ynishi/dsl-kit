@@ -2,10 +2,11 @@
 //!
 //! ## Design
 //!
-//! One input shape, four derives. Every macro accepts the same enum
+//! One input shape, five derives. Every macro accepts the same enum
 //! form (named-field variants, one `id: NodeId` each), so a DSL opts
-//! into traversal, schema reflection, parse-tree building, and engine
-//! execution by adding derives — never by restating its shape.
+//! into traversal, schema reflection, parse-tree building, engine
+//! execution, and semantic checking by adding derives — never by
+//! restating its shape.
 //!
 //! `#[derive(DslNode)]` accepts an `enum` whose every variant uses named
 //! fields, exactly one of which is called `id` and typed `NodeId`. The
@@ -36,6 +37,16 @@
 //! the orphan rule bars downstream crates from implementing) opt out of
 //! `build_field` with `#[dsl_build(with = path)]` — the named function
 //! converts the field itself. See [`derive_dsl_build`].
+//!
+//! `#[derive(DslCheck)]` accepts the same shape and emits an
+//! `impl DslCheck` returning a `CheckProgram` — the semantic judgement
+//! rules of the DSL as data. Variants carry `#[dsl_check(requires =
+//! "state(Atom)", produces = "state(Atom)")]`; a `Vec<Self>` child slot
+//! carries `#[dsl_check(fold(initial = "state(Atom)"))]` to declare
+//! that its elements are ordered and thread a state. The macro compiles
+//! those strings into a `CheckProgram` construction expression exactly
+//! as `#[derive(DslSchema)]` compiles a shape into a `NodeSchema` one.
+//! See [`derive_dsl_check`].
 //!
 //! `#[derive(DslExec)]` accepts the same shape and emits an
 //! `impl DslExec` — the mechanical half of an engine `Ast`. Every
@@ -1621,6 +1632,427 @@ pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+// ---------------------------------------------------------------------------
+// DslCheck
+// ---------------------------------------------------------------------------
+
+/// A `pred(Atom, …)` judgement parsed out of a `#[dsl_check(...)]`
+/// string literal.
+///
+/// This is the Stage 1 vocabulary: the predicate is any identifier
+/// (`state`, `type`, `cap`, whatever the DSL author invents) and every
+/// argument is a ground atom. Rule variables (`$name`), constructor
+/// arguments (`ServiceRunning($name)`), and the `bind(...)` wiring that
+/// feeds them from payload fields belong to the next slice and are
+/// rejected here with a message that says so — a silently ignored
+/// annotation would be worse than a compile error.
+#[derive(Debug)]
+struct CheckFactDecl {
+    /// Predicate name.
+    pred: String,
+    /// Ground atom arguments, in order.
+    args: Vec<String>,
+}
+
+/// Emits the `dsl_kit_check::Fact` literal a declaration stands for.
+fn emit_check_fact(decl: &CheckFactDecl) -> TokenStream2 {
+    let pred = &decl.pred;
+    let args = decl
+        .args
+        .iter()
+        .map(|a| quote! { ::dsl_kit_check::Term::Atom(#a.to_string()) });
+    quote! {
+        ::dsl_kit_check::Fact {
+            pred: #pred.to_string(),
+            args: ::std::vec![#(#args),*],
+        }
+    }
+}
+
+/// Rejects anything that is not a plain Rust-style identifier. Errors
+/// are spanned to the string literal so the caret lands on the
+/// annotation rather than on the whole variant.
+fn check_fact_ident(text: &str, lit: &syn::LitStr, role: &str) -> syn::Result<()> {
+    let mut chars = text.chars();
+    let ok = match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        lit,
+        format!("invalid {role} `{text}`; expected an identifier such as `state` or `SystemReady`"),
+    ))
+}
+
+/// Parses `"pred(Atom, …)"` / `"pred"` out of a `#[dsl_check(...)]`
+/// string literal.
+fn parse_check_fact(lit: &syn::LitStr) -> syn::Result<CheckFactDecl> {
+    let raw = lit.value();
+    let text = raw.trim();
+    let (pred, arg_text) = match text.find('(') {
+        Some(open) => {
+            if !text.ends_with(')') {
+                return Err(syn::Error::new_spanned(
+                    lit,
+                    format!("unbalanced parentheses in `{text}`; expected `pred(Atom, …)`"),
+                ));
+            }
+            (&text[..open], Some(text[open + 1..text.len() - 1].trim()))
+        }
+        None => (text, None),
+    };
+    let pred = pred.trim();
+    check_fact_ident(pred, lit, "predicate name")?;
+
+    let mut args = Vec::new();
+    if let Some(arg_text) = arg_text {
+        if !arg_text.is_empty() {
+            for raw_arg in arg_text.split(',') {
+                let arg = raw_arg.trim();
+                if let Some(name) = arg.strip_prefix('$') {
+                    return Err(syn::Error::new_spanned(
+                        lit,
+                        format!(
+                            "rule variable `${name}` is not supported yet — this slice accepts \
+                             ground atoms only (`state(SystemReady)`)"
+                        ),
+                    ));
+                }
+                if arg.contains('(') {
+                    return Err(syn::Error::new_spanned(
+                        lit,
+                        format!(
+                            "constructor argument `{arg}` is not supported yet — this slice \
+                             accepts ground atoms only (`state(SystemReady)`)"
+                        ),
+                    ));
+                }
+                check_fact_ident(arg, lit, "argument")?;
+                args.push(arg.to_string());
+            }
+        }
+    }
+
+    Ok(CheckFactDecl {
+        pred: pred.to_string(),
+        args,
+    })
+}
+
+/// Parsed `#[dsl_check(...)]` annotations on one variant.
+#[derive(Debug, Default)]
+struct DslCheckAttrs {
+    /// `requires = "pred(Atom)"` — becomes a `Premise::State`.
+    requires: Option<CheckFactDecl>,
+    /// `produces = "pred(Atom)"` — becomes `Rule::state_after`.
+    produces: Option<CheckFactDecl>,
+    /// `message = "…"` — overrides the generated wording.
+    message: Option<String>,
+    /// `code = "…"` — overrides the default diagnostic slug.
+    code: Option<syn::LitStr>,
+    /// Whether the variant carried the attribute at all. A variant
+    /// without it contributes no rule (the check layer is opt-in per
+    /// variant, exactly as the solver's "no rule = pass through").
+    seen: bool,
+}
+
+/// Parses a variant's `#[dsl_check(...)]` annotations
+/// (`requires` / `produces` / `message` / `code`).
+/// `Ok(Default::default())` when the variant carries none.
+///
+/// Unknown keys are a compile error rather than a silent skip — the
+/// same discipline `dsl_schema_attrs` follows, and the reason the
+/// whole vocabulary check lives in one function.
+fn dsl_check_attrs(variant: &syn::Variant) -> syn::Result<DslCheckAttrs> {
+    let mut out = DslCheckAttrs::default();
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("dsl_check") {
+            continue;
+        }
+        out.seen = true;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("requires") {
+                if out.requires.is_some() {
+                    return Err(meta.error("duplicate `requires` on this variant"));
+                }
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.requires = Some(parse_check_fact(&lit)?);
+            } else if meta.path.is_ident("produces") {
+                if out.produces.is_some() {
+                    return Err(meta.error("duplicate `produces` on this variant"));
+                }
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.produces = Some(parse_check_fact(&lit)?);
+            } else if meta.path.is_ident("message") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.message = Some(lit.value());
+            } else if meta.path.is_ident("code") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.code = Some(lit);
+            } else {
+                return Err(meta.error(
+                    "unsupported #[dsl_check(...)] key; expected `requires = \"pred(Atom)\"`, \
+                     `produces = \"pred(Atom)\"`, `message = \"…\"`, or `code = \"…\"` \
+                     (`bind(...)` and `$var` arrive with a later slice)",
+                ));
+            }
+            Ok(())
+        })?;
+    }
+    if out.seen && out.requires.is_none() && out.produces.is_none() {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "#[dsl_check(...)] needs at least one of `requires` / `produces` — a rule with \
+             neither a premise nor a conclusion says nothing",
+        ));
+    }
+    Ok(out)
+}
+
+/// Parses a child slot's `#[dsl_check(fold(initial = "pred(Atom)"))]`
+/// annotation. `Ok(None)` when the field carries no `dsl_check`
+/// attribute.
+fn dsl_check_fold_attr(f: &syn::Field) -> syn::Result<Option<CheckFactDecl>> {
+    let mut initial: Option<CheckFactDecl> = None;
+    for attr in &f.attrs {
+        if !attr.path().is_ident("dsl_check") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("fold") {
+                return Err(meta.error(
+                    "unsupported #[dsl_check(...)] key on a child slot; expected \
+                     `fold(initial = \"state(Atom)\")` (`requires` / `produces` belong on \
+                     the variant)",
+                ));
+            }
+            let mut got = false;
+            meta.parse_nested_meta(|inner| {
+                if !inner.path.is_ident("initial") {
+                    return Err(inner.error(
+                        "unsupported `fold(...)` key; expected `initial = \"state(Atom)\"`",
+                    ));
+                }
+                let lit: syn::LitStr = inner.value()?.parse()?;
+                initial = Some(parse_check_fact(&lit)?);
+                got = true;
+                Ok(())
+            })?;
+            if !got {
+                return Err(meta.error("`fold(...)` requires `initial = \"state(Atom)\"`"));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(initial)
+}
+
+/// Derives `dsl_kit_check::DslCheck` for the same enum shape accepted
+/// by `DslNode` / `DslSchema` / `DslBuild`. The generated
+/// `check_program()` method returns a `CheckProgram` — the DSL's
+/// semantic judgement rules as data, evaluated against a `ParseTree` by
+/// `dsl_kit_check::check_semantics`.
+///
+/// The derive is deliberately **opt-in and separate** from
+/// `#[derive(DslSchema)]`: the emitted code names `::dsl_kit_check::…`
+/// types, so a DSL that does not check semantics never acquires the
+/// dependency.
+///
+/// ## Variant annotations
+///
+/// ```ignore
+/// #[derive(DslNode, DslSchema, DslBuild, DslCheck)]
+/// enum Phase {
+///     Plan {
+///         id: NodeId,
+///         #[dsl_check(fold(initial = "state(Raw)"))]
+///         steps: Vec<Phase>,
+///     },
+///
+///     #[dsl_check(produces = "state(SystemReady)")]
+///     SystemPkg { id: NodeId, packages: Vec<String> },
+///
+///     #[dsl_check(requires = "state(SystemReady)", produces = "state(PythonEnv)")]
+///     PythonInstall { id: NodeId, version: String },
+/// }
+/// ```
+///
+/// - `requires = "pred(Atom)"` becomes a `Premise::State` — the running
+///   fold state must unify with it before the variant may appear.
+/// - `produces = "pred(Atom)"` becomes `Rule::state_after` — where the
+///   variant leaves the fold.
+/// - `message = "…"` overrides the generated wording (holes:
+///   `{expected}` / `{found}` / `{provenance}` / `{slot}` / `{$var}`).
+///   Omitted, the variant gets a default naming itself: "`Name`
+///   requires {expected}, found {found} (from {provenance})".
+/// - `code = "…"` overrides the diagnostic slug, which otherwise is
+///   `dsl_kit_check::codes::CHECK_STATE_MISMATCH`.
+/// - A variant with no `#[dsl_check(...)]` contributes no rule and is
+///   waved through by the solver: annotating is opt-in per variant.
+///
+/// ## Fold slots
+///
+/// `#[dsl_check(fold(initial = "pred(Atom)"))]` on a `Vec<Self>` /
+/// `Vec<Box<Self>>` field emits the `SeqSlotDecl` that makes the slot
+/// ordered — its children thread a state from `initial` left to right.
+/// The declaration lives on the field rather than in a stringly-typed
+/// enum-level attribute so the `(variant, slot)` pair cannot drift from
+/// the shape it names. Slots that are not annotated stay unordered
+/// (`SeqMode::All`, the solver's default), and a program needing a
+/// declaration the shape cannot express (a fold over another enum's
+/// slot, say) can still be assembled with `CheckProgram::builder()`.
+///
+/// Only ground atoms are accepted in this slice: `$var`, constructor
+/// arguments, and `bind(...)` are rejected with a compile error naming
+/// the limitation.
+#[proc_macro_derive(DslCheck, attributes(dsl_check))]
+pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    if let Some(attr) = input.attrs.iter().find(|a| a.path().is_ident("dsl_check")) {
+        return syn::Error::new_spanned(
+            attr,
+            "#[dsl_check(...)] belongs on a variant (`requires` / `produces`) or on a \
+             `Vec<Self>` child slot (`fold(initial = \"…\")`), not on the enum itself",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(
+            &input,
+            "#[derive(DslCheck)] currently supports enums only",
+        )
+        .to_compile_error()
+        .into();
+    };
+
+    let mut rule_ctors: Vec<TokenStream2> = Vec::new();
+    let mut seq_ctors: Vec<TokenStream2> = Vec::new();
+
+    for variant in &data.variants {
+        let variant_name = variant.ident.to_string();
+
+        let attrs = match dsl_check_attrs(variant) {
+            Ok(attrs) => attrs,
+            Err(e) => return e.to_compile_error().into(),
+        };
+
+        if attrs.seen {
+            let premises = match &attrs.requires {
+                Some(decl) => {
+                    let expect = emit_check_fact(decl);
+                    quote! {
+                        ::std::vec![::dsl_kit_check::Premise::State { expect: #expect }]
+                    }
+                }
+                None => quote! { ::std::vec![] },
+            };
+            let state_after = match &attrs.produces {
+                Some(decl) => {
+                    let fact = emit_check_fact(decl);
+                    quote! { ::std::option::Option::Some(#fact) }
+                }
+                None => quote! { ::std::option::Option::None },
+            };
+            let template = attrs.message.clone().unwrap_or_else(|| {
+                format!(
+                    "`{variant_name}` requires {{expected}}, found {{found}} (from {{provenance}})"
+                )
+            });
+            let code = match &attrs.code {
+                Some(lit) => quote! { #lit },
+                None => quote! { ::dsl_kit_check::codes::CHECK_STATE_MISMATCH },
+            };
+            rule_ctors.push(quote! {
+                ::dsl_kit_check::Rule {
+                    variant: #variant_name.to_string(),
+                    premises: #premises,
+                    conclusion: ::std::option::Option::None,
+                    state_after: #state_after,
+                    message: ::dsl_kit_check::MessageTemplate {
+                        code: #code,
+                        template: #template.to_string(),
+                    },
+                }
+            });
+        }
+
+        match &variant.fields {
+            Fields::Named(fields) => {
+                for f in &fields.named {
+                    let initial = match dsl_check_fold_attr(f) {
+                        Ok(initial) => initial,
+                        Err(e) => return e.to_compile_error().into(),
+                    };
+                    let (Some(initial), Some(ident)) = (initial, f.ident.as_ref()) else {
+                        continue;
+                    };
+                    if !matches!(
+                        detect_recursion(&f.ty, &name),
+                        Some(Recursion::Many) | Some(Recursion::ManyBoxed)
+                    ) {
+                        return syn::Error::new_spanned(
+                            f,
+                            "#[dsl_check(fold(...))] applies to `Many` child slots only \
+                             (`Vec<Self>` / `Vec<Box<Self>>`) — a fold threads its state \
+                             through an ordered sequence, and every other slot is unordered",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    let slot = ident.to_string();
+                    let initial = emit_check_fact(&initial);
+                    seq_ctors.push(quote! {
+                        ::dsl_kit_check::SeqSlotDecl {
+                            variant: #variant_name.to_string(),
+                            slot: #slot.to_string(),
+                            initial: #initial,
+                            mode: ::dsl_kit_check::SeqMode::Fold,
+                        }
+                    });
+                }
+            }
+            Fields::Unnamed(fields) => {
+                let annotated = fields
+                    .unnamed
+                    .iter()
+                    .find(|f| f.attrs.iter().any(|a| a.path().is_ident("dsl_check")));
+                if let Some(f) = annotated {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_check(...)] applies to named fields only",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            }
+            Fields::Unit => {}
+        }
+    }
+
+    let expanded: TokenStream2 = quote! {
+        impl #impl_generics ::dsl_kit_check::DslCheck for #name #ty_generics #where_clause {
+            fn check_program() -> ::dsl_kit_check::CheckProgram {
+                ::dsl_kit_check::CheckProgram {
+                    rules: ::std::vec![#(#rule_ctors),*],
+                    seq_slots: ::std::vec![#(#seq_ctors),*],
+                }
+            }
+        }
+    };
+
+    expanded.into()
+}
+
 /// Parses a field's `#[dsl_build(with = path)]` annotation, if present.
 /// `Ok(None)` when the field carries no `dsl_build` attribute.
 fn dsl_build_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
@@ -1684,7 +2116,146 @@ fn normalize_type_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_type_str;
+    use super::{dsl_check_attrs, dsl_check_fold_attr, normalize_type_str};
+
+    /// Parses one enum variant from source, attributes included.
+    fn variant(src: &str) -> syn::Variant {
+        syn::parse_str(src).expect("test variant parses")
+    }
+
+    /// Parses one named field by wrapping it in a throwaway variant —
+    /// `syn::Field` has no `Parse` impl of its own.
+    fn field(src: &str) -> syn::Field {
+        let v = variant(&format!("Wrapper {{ {src} }}"));
+        let syn::Fields::Named(named) = v.fields else {
+            panic!("test field is named");
+        };
+        named.named.into_iter().next().expect("one field")
+    }
+
+    #[test]
+    fn dsl_check_reads_the_stage_one_vocabulary() {
+        let v = variant(
+            "#[dsl_check(requires = \"state(SystemReady)\", produces = \"state(PythonEnv)\", \
+             message = \"nope\", code = \"my::code\")] \
+             PythonInstall { id: NodeId, version: String }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+
+        assert!(attrs.seen);
+        let requires = attrs.requires.expect("requires parsed");
+        assert_eq!(requires.pred, "state");
+        assert_eq!(requires.args, ["SystemReady"]);
+        let produces = attrs.produces.expect("produces parsed");
+        assert_eq!(produces.pred, "state");
+        assert_eq!(produces.args, ["PythonEnv"]);
+        assert_eq!(attrs.message.as_deref(), Some("nope"));
+        assert_eq!(attrs.code.map(|c| c.value()).as_deref(), Some("my::code"));
+    }
+
+    #[test]
+    fn a_variant_without_the_attribute_contributes_nothing() {
+        let attrs = dsl_check_attrs(&variant("Plain { id: NodeId }")).expect("no annotation");
+        assert!(!attrs.seen);
+        assert!(attrs.requires.is_none());
+        assert!(attrs.produces.is_none());
+    }
+
+    #[test]
+    fn an_unknown_dsl_check_key_is_a_compile_error() {
+        // A typo must not be silently ignored: the whole point of
+        // routing every key through one parser is that an unknown one
+        // fails loudly at derive time.
+        let v = variant("#[dsl_check(prodcues = \"state(Ready)\")] SystemPkg { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("unknown key rejected");
+        assert!(
+            err.to_string()
+                .contains("unsupported #[dsl_check(...)] key"),
+            "message = {err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_dsl_check_needs_a_judgement() {
+        let v = variant("#[dsl_check(message = \"hi\")] SystemPkg { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("no judgement rejected");
+        assert!(
+            err.to_string().contains("at least one of `requires`"),
+            "message = {err}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_is_rejected() {
+        let v = variant(
+            "#[dsl_check(requires = \"state(A)\", requires = \"state(B)\")] X { id: NodeId }",
+        );
+        let err = dsl_check_attrs(&v).expect_err("duplicate rejected");
+        assert!(err.to_string().contains("duplicate `requires`"), "{err}");
+    }
+
+    #[test]
+    fn variables_and_constructors_name_the_slice_that_brings_them() {
+        let v = variant("#[dsl_check(requires = \"state($name)\")] X { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("`$var` rejected");
+        assert!(err.to_string().contains("rule variable `$name`"), "{err}");
+
+        let v = variant("#[dsl_check(produces = \"state(Running(x))\")] X { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("constructor rejected");
+        assert!(
+            err.to_string().contains("constructor argument"),
+            "message = {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_fact_is_rejected() {
+        let v = variant("#[dsl_check(requires = \"state(Ready\")] X { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("unbalanced parens rejected");
+        assert!(err.to_string().contains("unbalanced parentheses"), "{err}");
+
+        let v = variant("#[dsl_check(requires = \"1state(Ready)\")] X { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("bad predicate rejected");
+        assert!(err.to_string().contains("invalid predicate name"), "{err}");
+
+        let v = variant("#[dsl_check(requires = \"state(not an atom)\")] X { id: NodeId }");
+        let err = dsl_check_attrs(&v).expect_err("bad atom rejected");
+        assert!(err.to_string().contains("invalid argument"), "{err}");
+    }
+
+    #[test]
+    fn fold_declares_the_initial_state() {
+        let f = field("#[dsl_check(fold(initial = \"state(Raw)\"))] steps: Vec<Phase>");
+        let initial = dsl_check_fold_attr(&f)
+            .expect("annotation parses")
+            .expect("initial present");
+        assert_eq!(initial.pred, "state");
+        assert_eq!(initial.args, ["Raw"]);
+
+        let plain = field("steps: Vec<Phase>");
+        assert!(
+            dsl_check_fold_attr(&plain)
+                .expect("no annotation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_unknown_fold_key_is_a_compile_error() {
+        let f = field("#[dsl_check(fold(start = \"state(Raw)\"))] steps: Vec<Phase>");
+        let err = dsl_check_fold_attr(&f).expect_err("unknown inner key rejected");
+        assert!(
+            err.to_string().contains("unsupported `fold(...)` key"),
+            "{err}"
+        );
+
+        let f = field("#[dsl_check(requires = \"state(Raw)\")] steps: Vec<Phase>");
+        let err = dsl_check_fold_attr(&f).expect_err("variant key on a field rejected");
+        assert!(
+            err.to_string().contains("on a child slot"),
+            "message = {err}"
+        );
+    }
 
     #[test]
     fn normalize_collapses_token_stream_whitespace() {

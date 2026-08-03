@@ -31,3 +31,31 @@ pub const CHECK_CAP_MISSING: &str = "dsl_kit::check::cap_missing";
 /// usable while a vocabulary is being sketched, but a shipped
 /// `CheckProgram` should prefer a code that says what broke.
 pub const CHECK_PREMISE_FAILED: &str = "dsl_kit::check::premise_failed";
+
+// ---------------------------------------------------------------------------
+// Program self-validation (`CheckProgram::validate`)
+// ---------------------------------------------------------------------------
+//
+// These are reported against the *program*, not against a document, so
+// they live in their own `program::` sub-namespace. Unlike the codes
+// above they are assigned by the engine rather than chosen by the
+// vocabulary author: a `CheckProgram` is the DSL author's own work and
+// its findings cannot be suppressed at the document level, so a rule
+// that can never hold has to surface before it blocks every document.
+
+/// A rule requires a state nothing in the program can reach: no rule's
+/// `state_after` and no fold declaration's initial state matches it.
+/// Error — the rule can never fire, so every document containing its
+/// variant is rejected with no escape hatch.
+pub const CHECK_PROGRAM_UNDEFINED_STATE: &str = "dsl_kit::check::program::undefined_state";
+
+/// A predicate the program produces (a conclusion, a state transition,
+/// a fold's initial state) that no premise ever requires. Warning —
+/// harmless on its own, but the usual cause is a misspelt predicate
+/// name in one half of the pair.
+pub const CHECK_PROGRAM_UNUSED_PRED: &str = "dsl_kit::check::program::unused_pred";
+
+/// A rule that can never be reached: an earlier rule for the same
+/// variant is unconditional, or carries exactly the same premises, and
+/// therefore always wins. Warning.
+pub const CHECK_PROGRAM_UNREACHABLE_RULE: &str = "dsl_kit::check::program::unreachable_rule";

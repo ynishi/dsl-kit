@@ -18,4 +18,7 @@ proc-macro = true
 [dependencies]
 proc-macro2 = "1"
 quote       = "1"
-syn         = { version = "2", features = ["full"] }
+# extra-traits: Debug on syn types (DslCheckAttrs holds a syn::LitStr and
+# unit tests debug-print it). Declared here so a `-p dsl-kit-macros` build
+# does not depend on feature unification from sibling crates.
+syn         = { version = "2", features = ["full", "extra-traits"] }
