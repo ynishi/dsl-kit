@@ -41,11 +41,14 @@
 //! `#[derive(DslCheck)]` accepts the same shape and emits an
 //! `impl DslCheck` returning a `CheckProgram` — the semantic judgement
 //! rules of the DSL as data. Variants carry `#[dsl_check(requires =
-//! "state(Atom)", produces = "state(Atom)")]`; a `Vec<Self>` child slot
-//! carries `#[dsl_check(fold(initial = "state(Atom)"))]` to declare
-//! that its elements are ordered and thread a state. The macro compiles
-//! those strings into a `CheckProgram` construction expression exactly
-//! as `#[derive(DslSchema)]` compiles a shape into a `NodeSchema` one.
+//! "state(A)", produces = "state(B)")]` for the sequential half and
+//! `#[dsl_check(requires(cond = "type(Bool)"), concludes = "type($a)")]`
+//! for the tree-typing half; `bind(var = "field")` wires a `$var` to a
+//! payload field, and a `Vec<Self>` child slot carries
+//! `#[dsl_check(fold(initial = "state(Atom)"))]` to declare that its
+//! elements are ordered and thread a state. The macro compiles those
+//! strings into a `CheckProgram` construction expression exactly as
+//! `#[derive(DslSchema)]` compiles a shape into a `NodeSchema` one.
 //! See [`derive_dsl_check`].
 //!
 //! `#[derive(DslExec)]` accepts the same shape and emits an
@@ -1636,31 +1639,118 @@ pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
 // DslCheck
 // ---------------------------------------------------------------------------
 
-/// A `pred(Atom, …)` judgement parsed out of a `#[dsl_check(...)]`
+/// One argument term inside a `#[dsl_check(...)]` judgement.
+///
+/// The vocabulary is the Check IR's own term algebra minus
+/// `Term::FieldRef`, which has no surface syntax of its own: a payload
+/// field reaches a judgement by binding a `$var` with `bind(var =
+/// "field")`, so the wiring is declared once per variant instead of
+/// being spelled inside every fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckTermDecl {
+    /// Ground constant — `SystemReady`, `Int`.
+    Atom(String),
+    /// Rule variable — `$name`.
+    Var(String),
+    /// Constructor application — `ServiceRunning($name)`.
+    Ctor(String, Vec<CheckTermDecl>),
+}
+
+impl CheckTermDecl {
+    /// Appends every `$var` name the term mentions, in order.
+    fn collect_vars(&self, out: &mut Vec<String>) {
+        match self {
+            CheckTermDecl::Atom(_) => {}
+            CheckTermDecl::Var(name) => out.push(name.clone()),
+            CheckTermDecl::Ctor(_, args) => {
+                for arg in args {
+                    arg.collect_vars(out);
+                }
+            }
+        }
+    }
+}
+
+/// A `pred(term, …)` judgement parsed out of a `#[dsl_check(...)]`
 /// string literal.
 ///
-/// This is the Stage 1 vocabulary: the predicate is any identifier
-/// (`state`, `type`, `cap`, whatever the DSL author invents) and every
-/// argument is a ground atom. Rule variables (`$name`), constructor
-/// arguments (`ServiceRunning($name)`), and the `bind(...)` wiring that
-/// feeds them from payload fields belong to the next slice and are
-/// rejected here with a message that says so — a silently ignored
-/// annotation would be worse than a compile error.
+/// The predicate is any identifier (`state`, `type`, `cap`, whatever
+/// the DSL author invents) and the arguments are terms: ground atoms,
+/// rule variables (`$name`), and constructor applications
+/// (`ServiceRunning($name)`), nested arbitrarily.
 #[derive(Debug)]
 struct CheckFactDecl {
     /// Predicate name.
     pred: String,
-    /// Ground atom arguments, in order.
-    args: Vec<String>,
+    /// Argument terms, in order.
+    args: Vec<CheckTermDecl>,
+}
+
+impl CheckFactDecl {
+    /// Appends every `$var` name the fact mentions, in order.
+    fn collect_vars(&self, out: &mut Vec<String>) {
+        for arg in &self.args {
+            arg.collect_vars(out);
+        }
+    }
+}
+
+/// One `bind(var = "field")` entry: the payload field a `$var` reads
+/// its value from at check time.
+#[derive(Debug, Clone)]
+struct CheckBind {
+    /// Variable name, without the `$` sigil.
+    var: String,
+    /// Payload field on the annotated variant.
+    field: String,
+    /// The `"field"` literal, kept for error spans.
+    lit: syn::LitStr,
+}
+
+/// One parsed premise of a variant's rule.
+#[derive(Debug)]
+enum CheckPremiseDecl {
+    /// `requires = "pred(…)"` — the running fold state must match.
+    State(CheckFactDecl),
+    /// `requires(slot = "pred(…)")` — the conclusion of every child in
+    /// `slot` must match.
+    Child {
+        /// Child slot name (an ident, kept for error spans).
+        slot: Ident,
+        /// Pattern the child's conclusion must match.
+        expect: CheckFactDecl,
+    },
+}
+
+/// Emits the `dsl_kit_check::Term` literal an argument stands for.
+///
+/// `binds` is the variant's `bind(var = "field")` table: a `$var` it
+/// names becomes a `Term::FieldRef` — the solver resolves it against
+/// the node's payload before unifying — and every other `$var` stays a
+/// rule-local `Term::Var`.
+fn emit_check_term(decl: &CheckTermDecl, binds: &[CheckBind]) -> TokenStream2 {
+    match decl {
+        CheckTermDecl::Atom(name) => quote! { ::dsl_kit_check::Term::Atom(#name.to_string()) },
+        CheckTermDecl::Var(name) => match binds.iter().find(|b| &b.var == name) {
+            Some(bind) => {
+                let field = &bind.field;
+                quote! { ::dsl_kit_check::Term::FieldRef(#field.to_string()) }
+            }
+            None => quote! { ::dsl_kit_check::Term::Var(#name.to_string()) },
+        },
+        CheckTermDecl::Ctor(name, args) => {
+            let args = args.iter().map(|a| emit_check_term(a, binds));
+            quote! {
+                ::dsl_kit_check::Term::Ctor(#name.to_string(), ::std::vec![#(#args),*])
+            }
+        }
+    }
 }
 
 /// Emits the `dsl_kit_check::Fact` literal a declaration stands for.
-fn emit_check_fact(decl: &CheckFactDecl) -> TokenStream2 {
+fn emit_check_fact(decl: &CheckFactDecl, binds: &[CheckBind]) -> TokenStream2 {
     let pred = &decl.pred;
-    let args = decl
-        .args
-        .iter()
-        .map(|a| quote! { ::dsl_kit_check::Term::Atom(#a.to_string()) });
+    let args = decl.args.iter().map(|a| emit_check_term(a, binds));
     quote! {
         ::dsl_kit_check::Fact {
             pred: #pred.to_string(),
@@ -1669,88 +1759,190 @@ fn emit_check_fact(decl: &CheckFactDecl) -> TokenStream2 {
     }
 }
 
-/// Rejects anything that is not a plain Rust-style identifier. Errors
-/// are spanned to the string literal so the caret lands on the
-/// annotation rather than on the whole variant.
-fn check_fact_ident(text: &str, lit: &syn::LitStr, role: &str) -> syn::Result<()> {
-    let mut chars = text.chars();
-    let ok = match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        _ => false,
-    };
-    if ok {
-        return Ok(());
-    }
-    Err(syn::Error::new_spanned(
-        lit,
-        format!("invalid {role} `{text}`; expected an identifier such as `state` or `SystemReady`"),
-    ))
+/// Recursive-descent cursor over the text of one `#[dsl_check(...)]`
+/// judgement literal.
+///
+/// Nested constructors (`state(ServiceRunning($name))`) rule out the
+/// split-on-comma shortcut, so the grammar is spelled out:
+///
+/// ```text
+/// fact := ident [ "(" args ")" ]
+/// args := term { "," term }
+/// term := "$" ident | ident [ "(" args ")" ]
+/// ```
+///
+/// Every error is spanned to the string literal, so the caret lands on
+/// the annotation rather than on the whole variant.
+struct CheckFactParser<'a> {
+    text: &'a str,
+    pos: usize,
+    lit: &'a syn::LitStr,
 }
 
-/// Parses `"pred(Atom, …)"` / `"pred"` out of a `#[dsl_check(...)]`
+impl<'a> CheckFactParser<'a> {
+    fn new(text: &'a str, lit: &'a syn::LitStr) -> Self {
+        Self { text, pos: 0, lit }
+    }
+
+    fn error(&self, message: String) -> syn::Error {
+        syn::Error::new_spanned(self.lit, message)
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_whitespace() {
+                self.pos += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.text[self.pos..].chars().next()
+    }
+
+    fn bump(&mut self) {
+        if let Some(c) = self.peek() {
+            self.pos += c.len_utf8();
+        }
+    }
+
+    /// Reads one Rust-style identifier, or fails naming `role`.
+    fn ident(&mut self, role: &str) -> syn::Result<String> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(c) if c.is_ascii_alphabetic() || c == '_') {
+            self.bump();
+            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+                self.bump();
+            }
+        }
+        if start == self.pos {
+            let rest = self.text[start..].trim_end();
+            return Err(self.error(format!(
+                "invalid {role} in `{}`{}; expected an identifier such as `state` or \
+                 `SystemReady`",
+                self.text,
+                if rest.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at `{rest}`")
+                }
+            )));
+        }
+        Ok(self.text[start..self.pos].to_string())
+    }
+
+    /// Reads `( term, … )`, cursor sitting on the opening parenthesis.
+    fn args(&mut self) -> syn::Result<Vec<CheckTermDecl>> {
+        self.bump(); // `(`
+        let mut args = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(')') {
+            self.bump();
+            return Ok(args);
+        }
+        loop {
+            args.push(self.term()?);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.bump();
+                }
+                Some(')') => {
+                    self.bump();
+                    return Ok(args);
+                }
+                Some(_) => {
+                    return Err(self.error(format!(
+                        "invalid argument in `{}`; expected `,` or `)` after an argument",
+                        self.text
+                    )));
+                }
+                None => {
+                    return Err(self.error(format!(
+                        "unbalanced parentheses in `{}`; expected `pred(term, …)`",
+                        self.text
+                    )));
+                }
+            }
+        }
+    }
+
+    fn term(&mut self) -> syn::Result<CheckTermDecl> {
+        self.skip_ws();
+        if self.peek() == Some('$') {
+            self.bump();
+            return Ok(CheckTermDecl::Var(self.ident("rule variable")?));
+        }
+        let name = self.ident("argument")?;
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            return Ok(CheckTermDecl::Ctor(name, self.args()?));
+        }
+        Ok(CheckTermDecl::Atom(name))
+    }
+
+    fn fact(&mut self) -> syn::Result<CheckFactDecl> {
+        self.skip_ws();
+        let pred = self.ident("predicate name")?;
+        self.skip_ws();
+        let args = if self.peek() == Some('(') {
+            self.args()?
+        } else {
+            Vec::new()
+        };
+        self.skip_ws();
+        if self.pos != self.text.len() {
+            return Err(self.error(format!(
+                "trailing text `{}` in `{}`; a judgement is one `pred(term, …)`",
+                &self.text[self.pos..],
+                self.text
+            )));
+        }
+        Ok(CheckFactDecl { pred, args })
+    }
+}
+
+/// Parses `"pred(term, …)"` / `"pred"` out of a `#[dsl_check(...)]`
 /// string literal.
 fn parse_check_fact(lit: &syn::LitStr) -> syn::Result<CheckFactDecl> {
     let raw = lit.value();
-    let text = raw.trim();
-    let (pred, arg_text) = match text.find('(') {
-        Some(open) => {
-            if !text.ends_with(')') {
-                return Err(syn::Error::new_spanned(
-                    lit,
-                    format!("unbalanced parentheses in `{text}`; expected `pred(Atom, …)`"),
-                ));
-            }
-            (&text[..open], Some(text[open + 1..text.len() - 1].trim()))
-        }
-        None => (text, None),
-    };
-    let pred = pred.trim();
-    check_fact_ident(pred, lit, "predicate name")?;
+    CheckFactParser::new(raw.trim(), lit).fact()
+}
 
-    let mut args = Vec::new();
-    if let Some(arg_text) = arg_text {
-        if !arg_text.is_empty() {
-            for raw_arg in arg_text.split(',') {
-                let arg = raw_arg.trim();
-                if let Some(name) = arg.strip_prefix('$') {
-                    return Err(syn::Error::new_spanned(
-                        lit,
-                        format!(
-                            "rule variable `${name}` is not supported yet — this slice accepts \
-                             ground atoms only (`state(SystemReady)`)"
-                        ),
-                    ));
-                }
-                if arg.contains('(') {
-                    return Err(syn::Error::new_spanned(
-                        lit,
-                        format!(
-                            "constructor argument `{arg}` is not supported yet — this slice \
-                             accepts ground atoms only (`state(SystemReady)`)"
-                        ),
-                    ));
-                }
-                check_fact_ident(arg, lit, "argument")?;
-                args.push(arg.to_string());
-            }
-        }
+/// [`parse_check_fact`] for positions that admit no variables — a
+/// fold's initial state, which is the seed of the sequence and has
+/// nothing to bind against.
+fn parse_check_fact_ground(lit: &syn::LitStr) -> syn::Result<CheckFactDecl> {
+    let decl = parse_check_fact(lit)?;
+    let mut vars = Vec::new();
+    decl.collect_vars(&mut vars);
+    if let Some(var) = vars.first() {
+        return Err(syn::Error::new_spanned(
+            lit,
+            format!(
+                "rule variable `${var}` cannot appear in a fold's initial state: the seed is \
+                 supplied by the declaration, before any child has bound anything"
+            ),
+        ));
     }
-
-    Ok(CheckFactDecl {
-        pred: pred.to_string(),
-        args,
-    })
+    Ok(decl)
 }
 
 /// Parsed `#[dsl_check(...)]` annotations on one variant.
 #[derive(Debug, Default)]
 struct DslCheckAttrs {
-    /// `requires = "pred(Atom)"` — becomes a `Premise::State`.
-    requires: Option<CheckFactDecl>,
-    /// `produces = "pred(Atom)"` — becomes `Rule::state_after`.
+    /// Premises in declaration order — `requires = "pred(…)"` (state)
+    /// and `requires(slot = "pred(…)")` (child slot).
+    premises: Vec<CheckPremiseDecl>,
+    /// `produces = "pred(…)"` — becomes `Rule::state_after`.
     produces: Option<CheckFactDecl>,
+    /// `concludes = "pred(…)"` — becomes `Rule::conclusion`, the
+    /// synthesised attribute a parent's child premise reads.
+    concludes: Option<CheckFactDecl>,
+    /// `bind(var = "field")` entries wiring `$var` to payload fields.
+    binds: Vec<CheckBind>,
     /// `message = "…"` — overrides the generated wording.
     message: Option<String>,
     /// `code = "…"` — overrides the default diagnostic slug.
@@ -1761,8 +1953,36 @@ struct DslCheckAttrs {
     seen: bool,
 }
 
-/// Parses a variant's `#[dsl_check(...)]` annotations
-/// (`requires` / `produces` / `message` / `code`).
+impl DslCheckAttrs {
+    /// Whether a `requires = "pred(…)"` (state) premise is present.
+    fn has_state_premise(&self) -> bool {
+        self.premises
+            .iter()
+            .any(|p| matches!(p, CheckPremiseDecl::State(_)))
+    }
+
+    /// Every `$var` the variant's judgements mention, deduplicated.
+    fn mentioned_vars(&self) -> Vec<String> {
+        let mut vars = Vec::new();
+        for premise in &self.premises {
+            match premise {
+                CheckPremiseDecl::State(fact) => fact.collect_vars(&mut vars),
+                CheckPremiseDecl::Child { expect, .. } => expect.collect_vars(&mut vars),
+            }
+        }
+        for fact in [self.produces.as_ref(), self.concludes.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            fact.collect_vars(&mut vars);
+        }
+        vars.dedup();
+        vars
+    }
+}
+
+/// Parses a variant's `#[dsl_check(...)]` annotations (`requires` /
+/// `produces` / `concludes` / `bind` / `message` / `code`).
 /// `Ok(Default::default())` when the variant carries none.
 ///
 /// Unknown keys are a compile error rather than a silent skip — the
@@ -1777,17 +1997,82 @@ fn dsl_check_attrs(variant: &syn::Variant) -> syn::Result<DslCheckAttrs> {
         out.seen = true;
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("requires") {
-                if out.requires.is_some() {
-                    return Err(meta.error("duplicate `requires` on this variant"));
+                // Two shapes on one key: `requires = "state(A)"` is the
+                // running fold state, `requires(cond = "type(Bool)")`
+                // names child slots. The `=` decides which.
+                if meta.input.peek(syn::Token![=]) {
+                    if out.has_state_premise() {
+                        return Err(meta.error("duplicate `requires` on this variant"));
+                    }
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    out.premises
+                        .push(CheckPremiseDecl::State(parse_check_fact(&lit)?));
+                    return Ok(());
                 }
-                let lit: syn::LitStr = meta.value()?.parse()?;
-                out.requires = Some(parse_check_fact(&lit)?);
+                let mut any = false;
+                meta.parse_nested_meta(|inner| {
+                    let Some(slot) = inner.path.get_ident().cloned() else {
+                        return Err(inner.error(
+                            "expected a child slot name, as in `requires(cond = \"type(Bool)\")`",
+                        ));
+                    };
+                    if out
+                        .premises
+                        .iter()
+                        .any(|p| matches!(p, CheckPremiseDecl::Child { slot: s, .. } if *s == slot))
+                    {
+                        return Err(inner
+                            .error(format!("duplicate child slot `{slot}` in `requires(...)`")));
+                    }
+                    let lit: syn::LitStr = inner.value()?.parse()?;
+                    let expect = parse_check_fact(&lit)?;
+                    out.premises.push(CheckPremiseDecl::Child { slot, expect });
+                    any = true;
+                    Ok(())
+                })?;
+                if !any {
+                    return Err(meta.error(
+                        "`requires(...)` needs at least one `slot = \"pred(term, …)\"` entry",
+                    ));
+                }
             } else if meta.path.is_ident("produces") {
                 if out.produces.is_some() {
                     return Err(meta.error("duplicate `produces` on this variant"));
                 }
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 out.produces = Some(parse_check_fact(&lit)?);
+            } else if meta.path.is_ident("concludes") {
+                if out.concludes.is_some() {
+                    return Err(meta.error("duplicate `concludes` on this variant"));
+                }
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                out.concludes = Some(parse_check_fact(&lit)?);
+            } else if meta.path.is_ident("bind") {
+                let mut any = false;
+                meta.parse_nested_meta(|inner| {
+                    let Some(var) = inner.path.get_ident().cloned() else {
+                        return Err(inner.error(
+                            "expected a rule variable name, as in `bind(name = \"name\")`",
+                        ));
+                    };
+                    let var = var.to_string();
+                    if out.binds.iter().any(|b| b.var == var) {
+                        return Err(inner.error(format!("duplicate `bind({var} = …)`")));
+                    }
+                    let lit: syn::LitStr = inner.value()?.parse()?;
+                    out.binds.push(CheckBind {
+                        var,
+                        field: lit.value(),
+                        lit,
+                    });
+                    any = true;
+                    Ok(())
+                })?;
+                if !any {
+                    return Err(
+                        meta.error("`bind(...)` needs at least one `var = \"field\"` entry")
+                    );
+                }
             } else if meta.path.is_ident("message") {
                 let lit: syn::LitStr = meta.value()?.parse()?;
                 out.message = Some(lit.value());
@@ -1796,22 +2081,125 @@ fn dsl_check_attrs(variant: &syn::Variant) -> syn::Result<DslCheckAttrs> {
                 out.code = Some(lit);
             } else {
                 return Err(meta.error(
-                    "unsupported #[dsl_check(...)] key; expected `requires = \"pred(Atom)\"`, \
-                     `produces = \"pred(Atom)\"`, `message = \"…\"`, or `code = \"…\"` \
-                     (`bind(...)` and `$var` arrive with a later slice)",
+                    "unsupported #[dsl_check(...)] key; expected `requires = \"pred(term)\"`, \
+                     `requires(slot = \"pred(term)\")`, `produces = \"pred(term)\"`, \
+                     `concludes = \"pred(term)\"`, `bind(var = \"field\")`, `message = \"…\"`, \
+                     or `code = \"…\"`",
                 ));
             }
             Ok(())
         })?;
     }
-    if out.seen && out.requires.is_none() && out.produces.is_none() {
+    if out.seen && out.premises.is_empty() && out.produces.is_none() && out.concludes.is_none() {
         return Err(syn::Error::new_spanned(
             variant,
-            "#[dsl_check(...)] needs at least one of `requires` / `produces` — a rule with \
-             neither a premise nor a conclusion says nothing",
+            "#[dsl_check(...)] needs at least one of `requires` / `produces` / `concludes` — a \
+             rule with neither a premise nor a conclusion says nothing",
         ));
     }
     Ok(out)
+}
+
+/// Cross-checks a variant's parsed annotations against its shape:
+/// every `bind(var = "field")` must name a payload field the variant
+/// declares, every `requires(slot = …)` must name one of its child
+/// slots, and every bound `$var` must actually appear in a judgement.
+///
+/// Kept separate from [`dsl_check_attrs`] because it needs the enum
+/// name to tell a child slot from a payload field — the same
+/// `detect_recursion` classification the other derives run on.
+fn validate_check_attrs(
+    variant: &syn::Variant,
+    attrs: &DslCheckAttrs,
+    enum_name: &Ident,
+) -> syn::Result<()> {
+    if attrs.binds.is_empty()
+        && !attrs
+            .premises
+            .iter()
+            .any(|p| matches!(p, CheckPremiseDecl::Child { .. }))
+    {
+        return Ok(());
+    }
+
+    let Fields::Named(fields) = &variant.fields else {
+        return Err(syn::Error::new_spanned(
+            variant,
+            "`bind(...)` and `requires(slot = …)` name fields, so they apply to named-field \
+             variants only",
+        ));
+    };
+
+    for bind in &attrs.binds {
+        let field = fields
+            .named
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| *i == bind.field));
+        let Some(field) = field else {
+            return Err(syn::Error::new_spanned(
+                &bind.lit,
+                format!(
+                    "`bind({} = \"{}\")` names a field variant `{}` does not declare",
+                    bind.var, bind.field, variant.ident
+                ),
+            ));
+        };
+        if detect_recursion(&field.ty, enum_name).is_some() {
+            return Err(syn::Error::new_spanned(
+                &bind.lit,
+                format!(
+                    "`bind({} = \"{}\")` names a child slot, not a payload field — a `$var` \
+                     reads a scalar value, and a child's judgement reaches the rule through \
+                     `requires({} = \"…\")` instead",
+                    bind.var, bind.field, bind.field
+                ),
+            ));
+        }
+    }
+
+    for premise in &attrs.premises {
+        let CheckPremiseDecl::Child { slot, .. } = premise else {
+            continue;
+        };
+        let field = fields
+            .named
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == slot));
+        let Some(field) = field else {
+            return Err(syn::Error::new_spanned(
+                slot,
+                format!(
+                    "`requires({slot} = …)` names a slot variant `{}` does not declare",
+                    variant.ident
+                ),
+            ));
+        };
+        if detect_recursion(&field.ty, enum_name).is_none() {
+            return Err(syn::Error::new_spanned(
+                slot,
+                format!(
+                    "`requires({slot} = …)` names a payload field, not a child slot — only a \
+                     child node carries a conclusion to match against"
+                ),
+            ));
+        }
+    }
+
+    let mentioned = attrs.mentioned_vars();
+    for bind in &attrs.binds {
+        if !mentioned.contains(&bind.var) {
+            return Err(syn::Error::new_spanned(
+                &bind.lit,
+                format!(
+                    "`bind({} = \"{}\")` binds `${}`, which no judgement on this variant \
+                     mentions",
+                    bind.var, bind.field, bind.var
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Parses a child slot's `#[dsl_check(fold(initial = "pred(Atom)"))]`
@@ -1839,7 +2227,7 @@ fn dsl_check_fold_attr(f: &syn::Field) -> syn::Result<Option<CheckFactDecl>> {
                     ));
                 }
                 let lit: syn::LitStr = inner.value()?.parse()?;
-                initial = Some(parse_check_fact(&lit)?);
+                initial = Some(parse_check_fact_ground(&lit)?);
                 got = true;
                 Ok(())
             })?;
@@ -1879,21 +2267,51 @@ fn dsl_check_fold_attr(f: &syn::Field) -> syn::Result<Option<CheckFactDecl>> {
 ///
 ///     #[dsl_check(requires = "state(SystemReady)", produces = "state(PythonEnv)")]
 ///     PythonInstall { id: NodeId, version: String },
+///
+///     // A parameterised state: `$name` reads the `name` payload field.
+///     #[dsl_check(
+///         requires = "state(ComfyUIInstalled)",
+///         produces = "state(ServiceRunning($name))",
+///         bind(name = "name")
+///     )]
+///     ComfyUIService { id: NodeId, name: String },
+///
+///     #[dsl_check(requires = "state(ServiceRunning($target))", bind(target = "target"))]
+///     Readiness { id: NodeId, target: String, port: u16 },
 /// }
 /// ```
 ///
-/// - `requires = "pred(Atom)"` becomes a `Premise::State` — the running
-///   fold state must unify with it before the variant may appear.
-/// - `produces = "pred(Atom)"` becomes `Rule::state_after` — where the
-///   variant leaves the fold.
+/// - `requires = "pred(term, …)"` becomes a `Premise::State` — the
+///   running fold state must unify with it before the variant may
+///   appear.
+/// - `requires(slot = "pred(term, …)")` becomes a `Premise::Child` per
+///   named slot — the conclusion of every child in that slot must
+///   unify with the pattern. This is the tree-typing half
+///   (`requires(cond = "type(Bool)")`).
+/// - `produces = "pred(term, …)"` becomes `Rule::state_after` — where
+///   the variant leaves the fold.
+/// - `concludes = "pred(term, …)"` becomes `Rule::conclusion` — the
+///   synthesised attribute the parent's `requires(slot = …)` reads.
+/// - `bind(var = "field")` wires `$var` to a payload field: every
+///   occurrence of `$var` in that variant's judgements is emitted as a
+///   `Term::FieldRef`, which the solver resolves against the node
+///   before unifying. An unbound `$var` stays a rule-local
+///   `Term::Var`, scoped to one attempt at one rule (the `$a` in
+///   `requires(then_branch = "type($a)", else_branch = "type($a)")`).
 /// - `message = "…"` overrides the generated wording (holes:
 ///   `{expected}` / `{found}` / `{provenance}` / `{slot}` / `{$var}`).
 ///   Omitted, the variant gets a default naming itself: "`Name`
 ///   requires {expected}, found {found} (from {provenance})".
 /// - `code = "…"` overrides the diagnostic slug, which otherwise is
-///   `dsl_kit_check::codes::CHECK_STATE_MISMATCH`.
+///   `CHECK_STATE_MISMATCH` for a rule that talks about state and
+///   `CHECK_TYPE_MISMATCH` for one that only constrains children.
 /// - A variant with no `#[dsl_check(...)]` contributes no rule and is
 ///   waved through by the solver: annotating is opt-in per variant.
+///
+/// Every name a judgement mentions is checked against the variant's
+/// shape at derive time: `bind(...)` must name a payload field,
+/// `requires(slot = …)` must name a child slot, and a `bind(...)` no
+/// judgement uses is an error rather than dead wiring.
 ///
 /// ## Fold slots
 ///
@@ -1907,9 +2325,9 @@ fn dsl_check_fold_attr(f: &syn::Field) -> syn::Result<Option<CheckFactDecl>> {
 /// declaration the shape cannot express (a fold over another enum's
 /// slot, say) can still be assembled with `CheckProgram::builder()`.
 ///
-/// Only ground atoms are accepted in this slice: `$var`, constructor
-/// arguments, and `bind(...)` are rejected with a compile error naming
-/// the limitation.
+/// A fold's `initial` must be ground: it is the seed of the sequence,
+/// supplied before any child has bound anything, so a `$var` there is
+/// a compile error.
 #[proc_macro_derive(DslCheck, attributes(dsl_check))]
 pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -1945,20 +2363,39 @@ pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
             Ok(attrs) => attrs,
             Err(e) => return e.to_compile_error().into(),
         };
+        if let Err(e) = validate_check_attrs(variant, &attrs, &name) {
+            return e.to_compile_error().into();
+        }
 
         if attrs.seen {
-            let premises = match &attrs.requires {
-                Some(decl) => {
-                    let expect = emit_check_fact(decl);
+            let binds = &attrs.binds;
+            let premise_ctors = attrs.premises.iter().map(|premise| match premise {
+                CheckPremiseDecl::State(decl) => {
+                    let expect = emit_check_fact(decl, binds);
+                    quote! { ::dsl_kit_check::Premise::State { expect: #expect } }
+                }
+                CheckPremiseDecl::Child { slot, expect } => {
+                    let slot = slot.to_string();
+                    let expect = emit_check_fact(expect, binds);
                     quote! {
-                        ::std::vec![::dsl_kit_check::Premise::State { expect: #expect }]
+                        ::dsl_kit_check::Premise::Child {
+                            slot: #slot.to_string(),
+                            expect: #expect,
+                        }
                     }
                 }
-                None => quote! { ::std::vec![] },
-            };
+            });
+            let premises = quote! { ::std::vec![#(#premise_ctors),*] };
             let state_after = match &attrs.produces {
                 Some(decl) => {
-                    let fact = emit_check_fact(decl);
+                    let fact = emit_check_fact(decl, binds);
+                    quote! { ::std::option::Option::Some(#fact) }
+                }
+                None => quote! { ::std::option::Option::None },
+            };
+            let conclusion = match &attrs.concludes {
+                Some(decl) => {
+                    let fact = emit_check_fact(decl, binds);
                     quote! { ::std::option::Option::Some(#fact) }
                 }
                 None => quote! { ::std::option::Option::None },
@@ -1968,15 +2405,21 @@ pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
                     "`{variant_name}` requires {{expected}}, found {{found}} (from {{provenance}})"
                 )
             });
+            // A rule that talks about the fold state reports under the
+            // state slug; one that only constrains its children is a
+            // typing judgement.
             let code = match &attrs.code {
                 Some(lit) => quote! { #lit },
-                None => quote! { ::dsl_kit_check::codes::CHECK_STATE_MISMATCH },
+                None if attrs.has_state_premise() || attrs.produces.is_some() => {
+                    quote! { ::dsl_kit_check::codes::CHECK_STATE_MISMATCH }
+                }
+                None => quote! { ::dsl_kit_check::codes::CHECK_TYPE_MISMATCH },
             };
             rule_ctors.push(quote! {
                 ::dsl_kit_check::Rule {
                     variant: #variant_name.to_string(),
                     premises: #premises,
-                    conclusion: ::std::option::Option::None,
+                    conclusion: #conclusion,
                     state_after: #state_after,
                     message: ::dsl_kit_check::MessageTemplate {
                         code: #code,
@@ -2010,7 +2453,10 @@ pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
                         .into();
                     }
                     let slot = ident.to_string();
-                    let initial = emit_check_fact(&initial);
+                    // A fold seed is ground by construction
+                    // (`parse_check_fact_ground`), so it has no `$var`
+                    // for a bind table to resolve.
+                    let initial = emit_check_fact(&initial, &[]);
                     seq_ctors.push(quote! {
                         ::dsl_kit_check::SeqSlotDecl {
                             variant: #variant_name.to_string(),
@@ -2116,7 +2562,34 @@ fn normalize_type_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dsl_check_attrs, dsl_check_fold_attr, normalize_type_str};
+    use super::{
+        CheckPremiseDecl, CheckTermDecl, DslCheckAttrs, dsl_check_attrs, dsl_check_fold_attr,
+        normalize_type_str, validate_check_attrs,
+    };
+
+    /// The state premise (`requires = "…"`) of a parsed variant.
+    fn state_premise(attrs: &DslCheckAttrs) -> Option<&super::CheckFactDecl> {
+        attrs.premises.iter().find_map(|p| match p {
+            CheckPremiseDecl::State(fact) => Some(fact),
+            CheckPremiseDecl::Child { .. } => None,
+        })
+    }
+
+    /// The child premises (`requires(slot = "…")`), as `(slot, fact)`.
+    fn child_premises(attrs: &DslCheckAttrs) -> Vec<(String, &super::CheckFactDecl)> {
+        attrs
+            .premises
+            .iter()
+            .filter_map(|p| match p {
+                CheckPremiseDecl::Child { slot, expect } => Some((slot.to_string(), expect)),
+                CheckPremiseDecl::State(_) => None,
+            })
+            .collect()
+    }
+
+    fn enum_name() -> syn::Ident {
+        syn::parse_str("Phase").expect("test enum name parses")
+    }
 
     /// Parses one enum variant from source, attributes included.
     fn variant(src: &str) -> syn::Variant {
@@ -2143,22 +2616,27 @@ mod tests {
         let attrs = dsl_check_attrs(&v).expect("annotation parses");
 
         assert!(attrs.seen);
-        let requires = attrs.requires.expect("requires parsed");
+        let requires = state_premise(&attrs).expect("requires parsed");
         assert_eq!(requires.pred, "state");
-        assert_eq!(requires.args, ["SystemReady"]);
-        let produces = attrs.produces.expect("produces parsed");
+        assert_eq!(requires.args, [CheckTermDecl::Atom("SystemReady".into())]);
+        let produces = attrs.produces.as_ref().expect("produces parsed");
         assert_eq!(produces.pred, "state");
-        assert_eq!(produces.args, ["PythonEnv"]);
+        assert_eq!(produces.args, [CheckTermDecl::Atom("PythonEnv".into())]);
         assert_eq!(attrs.message.as_deref(), Some("nope"));
-        assert_eq!(attrs.code.map(|c| c.value()).as_deref(), Some("my::code"));
+        assert_eq!(
+            attrs.code.as_ref().map(|c| c.value()).as_deref(),
+            Some("my::code")
+        );
+        validate_check_attrs(&v, &attrs, &enum_name()).expect("shape agrees");
     }
 
     #[test]
     fn a_variant_without_the_attribute_contributes_nothing() {
         let attrs = dsl_check_attrs(&variant("Plain { id: NodeId }")).expect("no annotation");
         assert!(!attrs.seen);
-        assert!(attrs.requires.is_none());
+        assert!(attrs.premises.is_empty());
         assert!(attrs.produces.is_none());
+        assert!(attrs.concludes.is_none());
     }
 
     #[test]
@@ -2195,16 +2673,124 @@ mod tests {
     }
 
     #[test]
-    fn variables_and_constructors_name_the_slice_that_brings_them() {
-        let v = variant("#[dsl_check(requires = \"state($name)\")] X { id: NodeId }");
-        let err = dsl_check_attrs(&v).expect_err("`$var` rejected");
-        assert!(err.to_string().contains("rule variable `$name`"), "{err}");
+    fn variables_and_nested_constructors_parse() {
+        let v = variant(
+            "#[dsl_check(produces = \"state(ServiceRunning(Named($name, v1)))\")] \
+             X { id: NodeId, name: String }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let produces = attrs.produces.as_ref().expect("produces parsed");
+        assert_eq!(
+            produces.args,
+            [CheckTermDecl::Ctor(
+                "ServiceRunning".into(),
+                vec![CheckTermDecl::Ctor(
+                    "Named".into(),
+                    vec![
+                        CheckTermDecl::Var("name".into()),
+                        CheckTermDecl::Atom("v1".into()),
+                    ],
+                )],
+            )]
+        );
+        assert_eq!(attrs.mentioned_vars(), ["name"]);
+    }
 
-        let v = variant("#[dsl_check(produces = \"state(Running(x))\")] X { id: NodeId }");
-        let err = dsl_check_attrs(&v).expect_err("constructor rejected");
+    #[test]
+    fn bind_wires_a_variable_to_a_payload_field() {
+        let v = variant(
+            "#[dsl_check(requires = \"state(ServiceRunning($target))\", \
+             bind(target = \"target\"))] \
+             Readiness { id: NodeId, target: String, port: u16 }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        assert_eq!(attrs.binds.len(), 1);
+        assert_eq!(attrs.binds[0].var, "target");
+        assert_eq!(attrs.binds[0].field, "target");
+        validate_check_attrs(&v, &attrs, &enum_name()).expect("shape agrees");
+    }
+
+    #[test]
+    fn bind_must_name_a_payload_field_a_judgement_uses() {
+        // No such field.
+        let v = variant(
+            "#[dsl_check(requires = \"state(Running($n))\", bind(n = \"nmae\"))] \
+             X { id: NodeId, name: String }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let err = validate_check_attrs(&v, &attrs, &enum_name()).expect_err("typo rejected");
+        assert!(err.to_string().contains("does not declare"), "{err}");
+
+        // The field is a child slot, not a payload value.
+        let v = variant(
+            "#[dsl_check(requires = \"state(Running($n))\", bind(n = \"steps\"))] \
+             X { id: NodeId, steps: Vec<Phase> }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let err = validate_check_attrs(&v, &attrs, &enum_name()).expect_err("child slot rejected");
         assert!(
-            err.to_string().contains("constructor argument"),
-            "message = {err}"
+            err.to_string().contains("child slot, not a payload"),
+            "{err}"
+        );
+
+        // Bound, but nothing mentions `$n` — dead wiring.
+        let v = variant(
+            "#[dsl_check(requires = \"state(Ready)\", bind(n = \"name\"))] \
+             X { id: NodeId, name: String }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let err = validate_check_attrs(&v, &attrs, &enum_name()).expect_err("unused bind rejected");
+        assert!(err.to_string().contains("no judgement"), "{err}");
+    }
+
+    #[test]
+    fn requires_with_slots_becomes_child_premises() {
+        let v = variant(
+            "#[dsl_check(requires(cond = \"type(Bool)\", then_branch = \"type($a)\"), \
+             concludes = \"type($a)\")] \
+             If { id: NodeId, cond: Box<Phase>, then_branch: Box<Phase> }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        assert!(state_premise(&attrs).is_none());
+        let children = child_premises(&attrs);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].0, "cond");
+        assert_eq!(children[0].1.args, [CheckTermDecl::Atom("Bool".into())]);
+        assert_eq!(children[1].0, "then_branch");
+        assert_eq!(children[1].1.args, [CheckTermDecl::Var("a".into())]);
+        let concludes = attrs.concludes.as_ref().expect("concludes parsed");
+        assert_eq!(concludes.pred, "type");
+        validate_check_attrs(&v, &attrs, &enum_name()).expect("shape agrees");
+    }
+
+    #[test]
+    fn a_child_premise_must_name_a_child_slot() {
+        let v = variant(
+            "#[dsl_check(requires(conde = \"type(Bool)\"))] If { id: NodeId, cond: Box<Phase> }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let err = validate_check_attrs(&v, &attrs, &enum_name()).expect_err("typo rejected");
+        assert!(err.to_string().contains("does not declare"), "{err}");
+
+        let v = variant(
+            "#[dsl_check(requires(version = \"type(Bool)\"))] X { id: NodeId, version: String }",
+        );
+        let attrs = dsl_check_attrs(&v).expect("annotation parses");
+        let err = validate_check_attrs(&v, &attrs, &enum_name()).expect_err("payload rejected");
+        assert!(
+            err.to_string().contains("payload field, not a child slot"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_fold_seed_cannot_carry_a_variable() {
+        let f = field("#[dsl_check(fold(initial = \"state($x)\"))] steps: Vec<Phase>");
+        let err = dsl_check_fold_attr(&f).expect_err("`$var` seed rejected");
+        assert!(
+            err.to_string()
+                .contains("cannot appear in a fold's initial"),
+            "{err}"
         );
     }
 
@@ -2230,7 +2816,7 @@ mod tests {
             .expect("annotation parses")
             .expect("initial present");
         assert_eq!(initial.pred, "state");
-        assert_eq!(initial.args, ["Raw"]);
+        assert_eq!(initial.args, [CheckTermDecl::Atom("Raw".into())]);
 
         let plain = field("steps: Vec<Phase>");
         assert!(

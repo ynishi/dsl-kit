@@ -31,6 +31,12 @@ dsl-kit-parse  = { workspace = true }
 # the crate the generated code targets.  Dev-only: nothing in this
 # crate's own surface depends on the macros.
 dsl-kit-macros = { workspace = true }
+# The house `Suggester` implementation, used to exercise
+# `check_semantics_with`'s `did you mean` enrichment against a real
+# similarity algorithm rather than a stub — same dev-only arrangement
+# as `dsl-kit-parse` / `dsl-kit-mcp`, whose own unknown-* hints are
+# tested through it.
+dsl-kit-fuzzy = { workspace = true }
 # Fixture construction only: the serde-front-end half of the anchoring
 # test feeds `serde_bridge::from_json_value` a `json!` document.
 serde_json = "1"

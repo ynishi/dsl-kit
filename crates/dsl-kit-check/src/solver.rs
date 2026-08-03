@@ -49,8 +49,10 @@
 
 use std::collections::BTreeMap;
 
+use dsl_kit_core::{NoopSuggester, Suggester};
 use dsl_kit_parse::{Diagnostic, ParseTree, RawValue, Span};
 
+use crate::hint::Vocabulary;
 use crate::ir::{CheckProgram, Fact, Premise, Rule, SeqMode, Term};
 
 // ---------------------------------------------------------------------------
@@ -93,9 +95,92 @@ use crate::ir::{CheckProgram, Fact, Premise, Rule, SeqMode, Term};
 /// assert!(diags[0].message.contains("`not` wants type(Bool), got type(Int)"));
 /// ```
 pub fn check_semantics(tree: &ParseTree, program: &CheckProgram) -> Vec<Diagnostic> {
+    check_semantics_with(tree, program, &NoopSuggester)
+}
+
+/// Variant of [`check_semantics`] that routes `did you mean X?` hints
+/// through a caller-supplied [`Suggester`].
+///
+/// A state handle is a value the *document* invents
+/// (`ServiceRunning(comfyui)` names the service a previous step
+/// started), so a typo in one cannot be caught by the schema layer the
+/// way an unknown variant is. When a premise fails on a name rather
+/// than on a shape, this variant measures the name against everything
+/// the program can mention plus everything the offending fact does,
+/// and appends the suggester's hint to the message.
+///
+/// [`check_semantics`] delegates here with
+/// [`NoopSuggester`](dsl_kit_core::NoopSuggester), so the plain entry
+/// point stays free of any similarity algorithm and its messages are
+/// byte-identical to what they were before hints existed. Reach for
+/// this variant to plug one in (e.g. `dsl-kit-fuzzy`'s
+/// `FuzzySuggester`), exactly as `check_conformance_with` does for
+/// shape diagnostics.
+///
+/// ```
+/// use dsl_kit_check::{CheckProgram, Rule, SeqSlotDecl, atom, check_semantics_with, codes,
+///                     ctor, fact, field_ref};
+/// use dsl_kit_core::{Suggester, Suggestion};
+/// use dsl_kit_parse::{ParseTree, RawValue};
+///
+/// // A toy suggester: any candidate the query is a prefix of.
+/// struct Prefix;
+/// impl Suggester for Prefix {
+///     fn suggest<'a>(&self, q: &str, cands: &'a [&str]) -> Vec<Suggestion<'a>> {
+///         cands.iter().filter(|c| c.starts_with(q))
+///             .map(|c| Suggestion { candidate: c, score: 0.9 }).collect()
+///     }
+/// }
+///
+/// // `Start` names the service it launches; `Probe` names the one it
+/// // waits for. Both read the handle out of their own payload.
+/// let program = CheckProgram::builder()
+///     .seq_slot(SeqSlotDecl::fold("Plan", "steps", fact("state", [atom("Raw")])))
+///     .rule(
+///         Rule::on("Start")
+///             .transitions_to(fact("state", [ctor("Running", [field_ref("name")])]))
+///             .message(codes::CHECK_STATE_MISMATCH, "unused"),
+///     )
+///     .rule(
+///         Rule::on("Probe")
+///             .requires_state(fact("state", [ctor("Running", [field_ref("target")])]))
+///             .message(codes::CHECK_STATE_MISMATCH, "`probe` wants {expected}, found {found}"),
+///     )
+///     .build();
+///
+/// let mut start = ParseTree::new("Start");
+/// start.fields = vec![("name".into(), RawValue::Text("comfyui".into()))];
+/// let mut probe = ParseTree::new("Probe");
+/// probe.fields = vec![("target".into(), RawValue::Text("comfy".into()))];
+///
+/// let mut plan = ParseTree::new("Plan");
+/// plan.children = vec![("steps".into(), vec![start, probe])];
+///
+/// let diags = check_semantics_with(&plan, &program, &Prefix);
+/// assert_eq!(diags.len(), 1);
+/// assert!(diags[0].message.contains("did you mean: comfyui"));
+/// ```
+pub fn check_semantics_with(
+    tree: &ParseTree,
+    program: &CheckProgram,
+    suggester: &dyn Suggester,
+) -> Vec<Diagnostic> {
+    let ctx = Ctx {
+        program,
+        vocabulary: Vocabulary::of_program(program),
+        suggester,
+    };
     let mut diags = Vec::new();
-    solve(tree, "", None, program, &mut diags);
+    solve(tree, "", None, &ctx, &mut diags);
     diags
+}
+
+/// What the walk carries: the program under evaluation plus the two
+/// halves of the did-you-mean machinery.
+struct Ctx<'a> {
+    program: &'a CheckProgram,
+    vocabulary: Vocabulary,
+    suggester: &'a dyn Suggester,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +256,11 @@ struct Failure<'r> {
     found: String,
     provenance: String,
     bindings: Bindings,
+    /// The two facts as values, kept alongside their rendered forms so
+    /// a name-level disagreement can be measured for a `did you mean`
+    /// hint. `None` when the premise compared bare terms
+    /// ([`Premise::Neq`]), where a spelling correction means nothing.
+    facts: Option<(Fact, Fact)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +271,7 @@ fn solve(
     node: &ParseTree,
     path: &str,
     state_in: Option<&StateVal>,
-    program: &CheckProgram,
+    ctx: &Ctx<'_>,
     diags: &mut Vec<Diagnostic>,
 ) -> Solved {
     let here = Provenance::of(path, node.span);
@@ -190,7 +280,7 @@ fn solve(
     // 1a. Positional slots. A declared Fold slot threads its own
     //     state; everything else sees the incoming one unchanged.
     for (slot, children) in &node.children {
-        let decl = program.seq_slot(&node.variant, slot);
+        let decl = ctx.program.seq_slot(&node.variant, slot);
         let folding = matches!(decl, Some(d) if d.mode == SeqMode::Fold);
         let mut running: Option<StateVal> = match decl {
             Some(d) if folding => Some(StateVal {
@@ -203,7 +293,7 @@ fn solve(
         let mut vals = Vec::with_capacity(children.len());
         for (i, child) in children.iter().enumerate() {
             let child_path = child_path(path, slot, &i.to_string());
-            let solved = solve(child, &child_path, running.as_ref(), program, diags);
+            let solved = solve(child, &child_path, running.as_ref(), ctx, diags);
             if folding {
                 if let Some(next) = solved.state_out {
                     running = Some(next);
@@ -220,14 +310,14 @@ fn solve(
         let mut vals = Vec::with_capacity(entries.len());
         for (key, child) in entries {
             let child_path = child_path(path, slot, key);
-            let solved = solve(child, &child_path, state_in, program, diags);
+            let solved = solve(child, &child_path, state_in, ctx, diags);
             vals.push((solved.conclusion, solved.prov));
         }
         slots.insert(slot.clone(), vals);
     }
 
     // 2. No rule for this variant: pass through untouched.
-    let rules: Vec<&Rule> = program.rules_for(&node.variant).collect();
+    let rules: Vec<&Rule> = ctx.program.rules_for(&node.variant).collect();
     if rules.is_empty() {
         return Solved {
             conclusion: None,
@@ -267,7 +357,7 @@ fn solve(
 
     // 5. Report once, then contribute nothing.
     if let Some(failure) = best {
-        diags.push(failure.into_diagnostic(path, node.span));
+        diags.push(failure.into_diagnostic(path, node.span, ctx));
     }
     Solved {
         conclusion: None,
@@ -297,14 +387,16 @@ fn try_rule<'r>(
                     let Some(found) = found else { continue };
                     let before = binds.clone();
                     if !unify_fact(&expect, found, &mut binds) {
+                        let expected = apply_fact(&expect, &before);
                         return Err(Box::new(Failure {
                             rule,
                             satisfied: index,
                             slot: Some(slot.clone()),
-                            expected: apply_fact(&expect, &before).to_string(),
+                            expected: expected.to_string(),
                             found: found.to_string(),
                             provenance: prov.render(),
                             bindings: before,
+                            facts: Some((expected, found.clone())),
                         }));
                     }
                 }
@@ -314,14 +406,16 @@ fn try_rule<'r>(
                 let Some(state) = state_in else { continue };
                 let before = binds.clone();
                 if !unify_fact(&expect, &state.fact, &mut binds) {
+                    let expected = apply_fact(&expect, &before);
                     return Err(Box::new(Failure {
                         rule,
                         satisfied: index,
                         slot: None,
-                        expected: apply_fact(&expect, &before).to_string(),
+                        expected: expected.to_string(),
                         found: state.fact.to_string(),
                         provenance: state.prov.render(),
                         bindings: before,
+                        facts: Some((expected, state.fact.clone())),
                     }));
                 }
             }
@@ -330,14 +424,19 @@ fn try_rule<'r>(
                 let rhs = ground_field_refs(rhs, node);
                 let before = binds.clone();
                 if !unify(&lhs, &rhs, &mut binds) {
+                    let (lhs, rhs) = (apply(&lhs, &before), apply(&rhs, &before));
                     return Err(Box::new(Failure {
                         rule,
                         satisfied: index,
                         slot: None,
-                        expected: apply(&lhs, &before).to_string(),
-                        found: apply(&rhs, &before).to_string(),
+                        expected: lhs.to_string(),
+                        found: rhs.to_string(),
                         provenance: location_label(&node.variant, node.span),
                         bindings: before,
+                        // Wrapped in a nameless one-argument fact so
+                        // the hint walk, which compares facts, can
+                        // reach the terms.
+                        facts: Some((Fact::new("", [lhs]), Fact::new("", [rhs]))),
                     }));
                 }
             }
@@ -355,6 +454,10 @@ fn try_rule<'r>(
                         found: rhs.to_string(),
                         provenance: location_label(&node.variant, node.span),
                         bindings: binds.clone(),
+                        // Two terms that *agree* — the complaint is
+                        // that they do, so there is nothing to spell
+                        // differently.
+                        facts: None,
                     }));
                 }
             }
@@ -374,7 +477,7 @@ fn try_rule<'r>(
 }
 
 impl Failure<'_> {
-    fn into_diagnostic(self, path: &str, span: Option<Span>) -> Diagnostic {
+    fn into_diagnostic(self, path: &str, span: Option<Span>, ctx: &Ctx<'_>) -> Diagnostic {
         let body = render_template(
             &self.rule.message.template,
             &MsgCtx {
@@ -385,7 +488,18 @@ impl Failure<'_> {
                 bindings: &self.bindings,
             },
         );
-        let message = format!("{body} [at {}]", location_label(path, span));
+        // The hint goes between the author's wording and the anchor:
+        // the sentence stays theirs, and `[at …]` stays last so the
+        // message always ends where the problem is.
+        let hint = self
+            .facts
+            .as_ref()
+            .and_then(|(expected, found)| {
+                ctx.vocabulary.did_you_mean(expected, found, ctx.suggester)
+            })
+            .map(|hint| format!(" ({hint})"))
+            .unwrap_or_default();
+        let message = format!("{body}{hint} [at {}]", location_label(path, span));
         Diagnostic::error(self.rule.message.code, message).with_span(span)
     }
 }

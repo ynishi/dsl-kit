@@ -90,6 +90,19 @@
 //! document with no escape hatch; `validate` surfaces that before a
 //! single document is checked.
 //!
+//! ## Suggestions
+//!
+//! A state handle is a value the document invents — nothing declares
+//! `ServiceRunning(comfyui)`, a step produced it — so a typo in one
+//! cannot be caught the way an unknown variant is.
+//! [`check_semantics_with`] closes that gap: hand it a
+//! [`Suggester`](dsl_kit_core::Suggester) and a premise that fails on a
+//! *name* (rather than on a shape) gains a `did you mean: comfyui`
+//! hint, measured against everything the program can mention plus
+//! everything the offending fact does. [`check_semantics`] uses a no-op
+//! suggester, so the plain entry point pulls in no similarity algorithm
+//! and its messages are unchanged.
+//!
 //! ## Layout
 //!
 //! - [`ir`] — the data model ([`Term`], [`Fact`], [`Premise`],
@@ -99,10 +112,13 @@
 //! - [`codes`] — diagnostic slugs.
 //! - `validate` — the program's self-check
 //!   ([`CheckProgram::validate`]).
+//! - `hint` — the candidate vocabulary behind the `did you mean`
+//!   suffix.
 
 #![warn(missing_docs)]
 
 pub mod codes;
+mod hint;
 pub mod ir;
 pub mod solver;
 mod validate;
@@ -111,4 +127,4 @@ pub use ir::{
     CheckProgram, CheckProgramBuilder, DslCheck, Fact, MessageTemplate, Premise, Rule, RuleBuilder,
     SeqMode, SeqSlotDecl, Term, atom, ctor, fact, field_ref, var,
 };
-pub use solver::check_semantics;
+pub use solver::{check_semantics, check_semantics_with};
