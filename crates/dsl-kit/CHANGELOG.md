@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/ynishi/dsl-kit/compare/v0.10.0...v0.10.1) - 2026-08-03
+
+### Added
+
+- *(check,macros)* parameterised dsl_check terms + did-you-mean hints (S3)
+- *(check,macros)* derive(DslCheck) + CheckProgram self-validation (S2)
+
 ## [0.10.0](https://github.com/ynishi/dsl-kit/compare/v0.9.0...v0.10.0) - 2026-08-01
 
 ### Added
