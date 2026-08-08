@@ -28,6 +28,32 @@ enum Script {
     },
     #[dsl_exec(call(label))]
     Effect { id: NodeId, label: String },
+    /// `payload(a, b)`: the named fields, as an object.
+    #[dsl_exec(call(label, payload(src, dst)))]
+    Transfer {
+        id: NodeId,
+        label: String,
+        src: String,
+        dst: String,
+        /// Not named by the clause, so it stays out of the payload.
+        #[allow(dead_code)]
+        note: String,
+    },
+    /// `payload`: every non-recursive field except the label.
+    #[dsl_exec(call(label, payload))]
+    Notify {
+        id: NodeId,
+        label: String,
+        channel: String,
+        urgent: bool,
+    },
+    /// `payload = field`: that field alone, unwrapped.
+    #[dsl_exec(call(label, payload = args))]
+    Shell {
+        id: NodeId,
+        label: String,
+        args: Vec<String>,
+    },
     #[dsl_exec(repeat)]
     Retry { id: NodeId, body: Box<Script> },
     #[dsl_exec(value)]
@@ -151,6 +177,85 @@ fn call_suspends_with_its_label() {
     resolve_sole(&mut e, "payload");
     let out = e.step().unwrap();
     assert!(matches!(out, StepOutcome::Done(ref s) if s == "payload"));
+}
+
+/// Returns the `CallSpec` of the sole suspension after one step.
+fn sole_call_spec(e: &mut Engine<DerivedAst<'_, Script, ScriptSemantics>>) -> dsl_kit::CallSpec {
+    match e.step().unwrap() {
+        StepOutcome::Blocked { newly_pending } => match &newly_pending[0].reason {
+            SuspendReason::Call { spec } => spec.clone(),
+            other => panic!("expected Call reason, got {other:?}"),
+        },
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_payload_carries_the_named_fields() {
+    let ids = IdGen::new();
+    let root = Script::Transfer {
+        id: ids.node(),
+        label: "net.transfer".into(),
+        src: "/local/a.bin".into(),
+        dst: "pod:/remote/a.bin".into(),
+        note: "not part of the effect".into(),
+    };
+    let mut e = engine(&root);
+    let spec = sole_call_spec(&mut e);
+    assert_eq!(spec.label, "net.transfer");
+    // A resolver reads the arguments straight off the spec.
+    assert_eq!(spec.payload["src"], "/local/a.bin");
+    assert_eq!(spec.payload["dst"], "pod:/remote/a.bin");
+    assert!(
+        spec.payload.get("note").is_none(),
+        "unnamed fields stay out: {}",
+        spec.payload
+    );
+}
+
+#[test]
+fn call_payload_bare_form_takes_every_field_but_the_label() {
+    let ids = IdGen::new();
+    let root = Script::Notify {
+        id: ids.node(),
+        label: "notify".into(),
+        channel: "ops".into(),
+        urgent: true,
+    };
+    let mut e = engine(&root);
+    let spec = sole_call_spec(&mut e);
+    assert_eq!(spec.payload["channel"], "ops");
+    assert_eq!(spec.payload["urgent"], true);
+    assert!(
+        spec.payload.get("label").is_none(),
+        "the label is not duplicated into the payload: {}",
+        spec.payload
+    );
+}
+
+#[test]
+fn call_payload_single_field_is_not_wrapped() {
+    let ids = IdGen::new();
+    let root = Script::Shell {
+        id: ids.node(),
+        label: "sh.exec".into(),
+        args: vec!["ls".into(), "-la".into()],
+    };
+    let mut e = engine(&root);
+    let spec = sole_call_spec(&mut e);
+    assert_eq!(spec.payload, dsl_kit::serde_json::json!(["ls", "-la"]));
+}
+
+#[test]
+fn call_without_a_payload_clause_stays_null() {
+    let ids = IdGen::new();
+    let root = Script::Effect {
+        id: ids.node(),
+        label: "fetch".into(),
+    };
+    let mut e = engine(&root);
+    let spec = sole_call_spec(&mut e);
+    assert!(spec.payload.is_null());
 }
 
 #[test]

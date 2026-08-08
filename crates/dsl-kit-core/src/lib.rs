@@ -1149,6 +1149,11 @@ impl From<String> for OpId {
 /// zero, type mismatch on a dynamic value) are reported as
 /// [`EngineError::EvalFailed`] with the node context supplied by the
 /// engine at the call site.
+///
+/// `apply` sees the child *values*, not the node's own fields — an op
+/// that needs data attached to its node reads it from an argument, or
+/// the effect moves to a `Call` child and carries its arguments in
+/// [`CallSpec::payload`].
 pub trait Op<V>: Send + Sync {
     /// Fold the evaluated child values into the node's value.
     ///

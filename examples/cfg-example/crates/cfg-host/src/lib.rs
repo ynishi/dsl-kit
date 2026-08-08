@@ -94,35 +94,13 @@ impl DslHost for CfgHost {
         }
         results.sort_by_key(|(id, _)| *id);
 
-        let suspended_call =
-            self.engine
-                .suspended_call()
-                .map(|(_sid, node_id, label)| SuspendedCall {
-                    node: node_id.0,
-                    label: label.to_string(),
-                });
+        let suspended_call = SuspendedCall::sole(self.engine.pending());
 
         let pending: Vec<PendingProjection> = self
             .engine
             .pending()
             .iter()
-            .map(|p| {
-                let (reason, label) = match &p.reason {
-                    dsl_kit::SuspendReason::Call { spec } => {
-                        ("call".to_string(), spec.label.clone())
-                    }
-                    dsl_kit::SuspendReason::Breakpoint => ("breakpoint".into(), String::new()),
-                    dsl_kit::SuspendReason::Cooperative => ("cooperative".into(), String::new()),
-                    dsl_kit::SuspendReason::User { tag } => (format!("user:{tag}"), String::new()),
-                    _ => ("unknown".into(), String::new()),
-                };
-                PendingProjection {
-                    id: p.id.0,
-                    reason,
-                    label,
-                    at: pending_to_location(&p.at),
-                }
-            })
+            .map(PendingProjection::of)
             .collect();
 
         HostSnapshot {
@@ -353,7 +331,7 @@ fn step_outcome_to_host(outcome: StepOutcome<String>, pending: &[Pending]) -> Ho
             match reference {
                 Some(p) => HostOutcome::Suspended {
                     reason: p.reason.to_string(),
-                    at: pending_to_location(&p.at),
+                    at: HostLocation::of(&p.at),
                 },
                 None => HostOutcome::Suspended {
                     reason: "waiting".into(),
@@ -367,16 +345,6 @@ fn step_outcome_to_host(outcome: StepOutcome<String>, pending: &[Pending]) -> Ho
                 },
             }
         }
-    }
-}
-
-fn pending_to_location(ctx: &dsl_kit::NodeContext) -> HostLocation {
-    HostLocation {
-        node: ctx.node.0,
-        path: ctx.path.0.iter().map(|n| n.0).collect(),
-        depth: ctx.depth,
-        frame: ctx.frame.map(|f| f.0),
-        iteration: ctx.iteration.map(|i| i.0),
     }
 }
 

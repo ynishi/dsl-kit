@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-macros` — `#[dsl_exec(call(..))]` can now name the effect's
+  payload, so a derived DSL can hand its arguments to the host:
+  `call(label, payload)` serialises every non-recursive field except
+  the label into a JSON object, `call(label, payload(src, dst))` takes
+  the named fields, and `call(label, payload = args)` passes that one
+  field unwrapped. Payload fields must implement `serde::Serialize`; a
+  serialisation failure is reported as `{"__payload_error": "…"}`
+  rather than silently dropped. `call(label)` is unchanged and still
+  suspends with `null`.
+- `dsl-kit-core` — `Stepper::suspended_call_spec` returns the whole
+  `CallSpec` (label **and** payload) for the sole in-flight `Call`;
+  `suspended_call` stays as the label-only convenience.
+- `dsl-kit-mcp` — `PendingProjection::of`, `SuspendedCall::sole` and
+  `HostLocation::of` project engine types into the JSON-friendly host
+  view. Hosts should call these instead of building the structs by
+  hand, so the reason vocabulary and payload pass-through stay
+  identical across DSLs.
+
 - `dsl-kit-parse` — new `import` module: a load/link phase that lets a
   document pull in other sources before conformance and `DslBuild`.
   The JSON bridge reserves `{"$import": "name"}` at node positions as
@@ -208,6 +226,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `dsl-kit-mcp` — `SuspendedCall` and `PendingProjection` gained a
+  `payload: serde_json::Value` field, and the `dsl_kit_state` /
+  `dsl_kit_pending` tools now emit it under `"payload"`. A client
+  answering a `Call` reads the effect's arguments there instead of
+  re-deriving them from the AST. **Breaking** for hosts that build
+  either struct with a struct literal — `PendingProjection::of` /
+  `SuspendedCall::sole` are the construction paths that survive future
+  additions.
+
 - `dsl-kit-schema` — `Multiplicity` is now `#[non_exhaustive]`.
   Downstream out-of-crate matches on the enum must include a `_ =>`
   arm; in-crate matches remain exhaustively checked. This bump costs
@@ -240,6 +267,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+
+- `dsl-kit-core` — the engine no longer drops `NodeKind::Call`'s
+  payload. It reached the host as `Null` regardless of what the DSL
+  attached to the node, contradicting `CallSpec::payload`'s "the engine
+  stores it verbatim" contract and leaving a resolver no way to learn
+  an effect's arguments except by reaching back into the DSL's own
+  state — which is exactly what `Call`-shaped effects exist to avoid.
+  The payload now travels verbatim into `CallSpec`. Present since the
+  engine walker landed; the unbound-`Read` path (payload
+  `{"kind": "read"}`) was the only one that ever exercised the channel.
 
 - `dsl-kit-lint` — `NoEmptyManyChildren` is now `NoEmptyChildSlots`
   (`no-empty-many-children` → `no-empty-child-slots`,

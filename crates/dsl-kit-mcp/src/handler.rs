@@ -277,7 +277,7 @@ impl DslMcpHandler {
 
         let suspended = snap
             .suspended_call
-            .map(|s| json!({ "node": s.node, "label": s.label }));
+            .map(|s| json!({ "node": s.node, "label": s.label, "payload": s.payload }));
 
         let results_json: Vec<Value> = snap
             .results
@@ -694,6 +694,9 @@ fn pending_to_json(p: &PendingProjection) -> Value {
         "id": p.id,
         "reason": p.reason,
         "label": p.label,
+        // The effect's arguments: a client answering the call reads
+        // them here instead of re-deriving them from the AST.
+        "payload": p.payload,
         "at": {
             "node": p.at.node,
             "path": p.at.path,
@@ -866,6 +869,84 @@ mod tests {
 
     fn stub_handler() -> DslMcpHandler {
         DslMcpHandler::new(Box::new(StubHost))
+    }
+
+    /// Host frozen on one `Call` that carries effect arguments — the
+    /// shape a client has to answer.
+    struct SuspendedHost;
+
+    fn effect_payload() -> Value {
+        json!({ "src": "/local/a.bin", "dst": "pod:/remote/a.bin" })
+    }
+
+    #[async_trait::async_trait]
+    impl DslHost for SuspendedHost {
+        fn dsl_name(&self) -> &str {
+            "suspended"
+        }
+        fn root_node_id(&self) -> u64 {
+            1
+        }
+        fn root_summary(&self) -> String {
+            "Suspended".into()
+        }
+        fn ast_size(&self) -> usize {
+            1
+        }
+        fn ast_pretty(&self) -> String {
+            "Suspended".into()
+        }
+        fn snapshot(&self) -> HostSnapshot {
+            let at = crate::host::HostLocation {
+                node: 1,
+                path: vec![1],
+                depth: 1,
+                frame: Some(1),
+                iteration: None,
+            };
+            HostSnapshot {
+                depth: 1,
+                current_path: Some(vec![1]),
+                suspended_call: Some(crate::host::SuspendedCall {
+                    node: 1,
+                    label: "net.transfer".into(),
+                    payload: effect_payload(),
+                }),
+                pending: vec![PendingProjection {
+                    id: 1,
+                    reason: "call".into(),
+                    label: "net.transfer".into(),
+                    payload: effect_payload(),
+                    at,
+                }],
+                results: Vec::new(),
+                events: EventCounts::default(),
+            }
+        }
+        async fn step_one(&mut self, _bps: &BreakpointSet) -> Result<HostOutcome, String> {
+            Ok(HostOutcome::Done)
+        }
+        async fn step_to_yield(&mut self, _bps: &BreakpointSet) -> Result<HostOutcome, String> {
+            Ok(HostOutcome::Done)
+        }
+        fn reset(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn state_exposes_the_effect_payload() {
+        let handler = DslMcpHandler::new(Box::new(SuspendedHost));
+        let out = handler.dsl_kit_state().await.expect("state renders");
+        let value: Value = serde_json::from_str(&out).expect("state output is JSON");
+        assert_eq!(value["suspended_call"]["payload"], effect_payload());
+        assert_eq!(value["pending"][0]["payload"], effect_payload());
+    }
+
+    #[tokio::test]
+    async fn pending_exposes_the_effect_payload() {
+        let handler = DslMcpHandler::new(Box::new(SuspendedHost));
+        let out = handler.dsl_kit_pending().await.expect("pending renders");
+        let value: Value = serde_json::from_str(&out).expect("pending output is JSON");
+        assert_eq!(value["pending"][0]["payload"]["src"], "/local/a.bin");
     }
 
     #[tokio::test]

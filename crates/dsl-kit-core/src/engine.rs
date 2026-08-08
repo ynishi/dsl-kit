@@ -301,6 +301,14 @@ pub enum NodeKind {
         /// [`crate::CallSpec::label`].
         label: String,
         /// Opaque payload the host inspects when dispatching the effect.
+        ///
+        /// The engine passes it verbatim into
+        /// [`crate::CallSpec::payload`], so it is the effect's argument
+        /// channel: a resolver reads it off the [`crate::Pending`] it
+        /// is handed and never has to reach back into the DSL's own
+        /// state to recover what the call was about. Use
+        /// [`serde_json::Value::Null`] when a label alone says
+        /// everything.
         payload: serde_json::Value,
     },
 }
@@ -797,13 +805,25 @@ impl<A: Ast> Engine<A> {
     /// Returns `None` when there are zero or more than one pending
     /// suspensions, or when the sole pending is a non-`Call` reason
     /// (breakpoint / cooperative / user).
+    ///
+    /// This is the label-only convenience; use
+    /// [`Self::suspended_call_spec`] when the effect carries arguments.
     pub fn suspended_call(&self) -> Option<(SuspensionId, NodeId, &str)> {
+        self.suspended_call_spec()
+            .map(|(sid, node, spec)| (sid, node, spec.label.as_str()))
+    }
+
+    /// Same as [`Self::suspended_call`] but hands back the whole
+    /// [`crate::CallSpec`], so the caller sees the effect's payload —
+    /// the arguments the DSL attached to the node — and not just its
+    /// label.
+    pub fn suspended_call_spec(&self) -> Option<(SuspensionId, NodeId, &crate::CallSpec)> {
         if self.pending.len() != 1 {
             return None;
         }
         let p = &self.pending[0];
         match &p.reason {
-            SuspendReason::Call { spec } => Some((p.id, p.at.node, spec.label.as_str())),
+            SuspendReason::Call { spec } => Some((p.id, p.at.node, spec)),
             _ => None,
         }
     }
@@ -1382,8 +1402,12 @@ impl<A: Ast> Engine<A> {
                 };
                 Ok(self.allocate(frame))
             }
-            NodeKind::Call { label, payload: _ } => {
-                Ok(self.spawn_pending_leaf(node_id, path, label, serde_json::Value::Null))
+            NodeKind::Call { label, payload } => {
+                // The payload travels verbatim into `CallSpec` — it is
+                // the only channel an effect has for its arguments, so
+                // a resolver can stay independent of the DSL's own
+                // state (see `CallSpec::payload`).
+                Ok(self.spawn_pending_leaf(node_id, path, label, payload))
             }
         }
     }
@@ -2859,6 +2883,9 @@ mod tests {
         Scope(String, Box<N>),
         Maybe(Option<Box<N>>),
         Call(String),
+        /// A `Call` carrying an effect payload; `Call` is the same node
+        /// with a `Null` payload.
+        CallWith(String, serde_json::Value),
         Apply(&'static str, Vec<N>),
         Branch(Box<N>, Box<N>, Option<Box<N>>),
         Loop(Box<N>),
@@ -2898,7 +2925,8 @@ mod tests {
                 let b = body.as_ref().map(|b| Box::new(assign_ids(b, next)));
                 Node::Maybe(id, b)
             }
-            N::Call(label) => Node::Call(id, label.clone()),
+            N::Call(label) => Node::Call(id, label.clone(), serde_json::Value::Null),
+            N::CallWith(label, payload) => Node::Call(id, label.clone(), payload.clone()),
             N::Apply(op, children) => {
                 let cs = children
                     .iter()
@@ -2932,7 +2960,7 @@ mod tests {
         Par(NodeId, Vec<(NodeId, Node)>, JoinPolicy, ReducerId),
         Scope(NodeId, String, Box<(NodeId, Node)>),
         Maybe(NodeId, Option<Box<(NodeId, Node)>>),
-        Call(NodeId, String),
+        Call(NodeId, String, serde_json::Value),
         Apply(NodeId, OpId, Vec<(NodeId, Node)>),
         Branch(
             NodeId,
@@ -3013,14 +3041,8 @@ mod tests {
                     flatten(bn, out, lits);
                 }
             }
-            Node::Call(id, label) => {
-                out.insert(
-                    id,
-                    NodeKind::Call {
-                        label,
-                        payload: serde_json::Value::Null,
-                    },
-                );
+            Node::Call(id, label, payload) => {
+                out.insert(id, NodeKind::Call { label, payload });
             }
             Node::Apply(id, op_id, children) => {
                 let child_ids: Vec<NodeId> = children.iter().map(|(cid, _)| *cid).collect();
@@ -5060,6 +5082,54 @@ mod tests {
         e.resolve(sid, Ok(V::S("supplied".into()))).unwrap();
         let out = e.step().unwrap();
         assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "supplied"));
+    }
+
+    #[test]
+    fn call_payload_reaches_the_host_verbatim() {
+        // The payload is the effect's argument channel: a resolver
+        // reads `src` / `dst` off the CallSpec instead of reaching back
+        // into the DSL's own node map. Regression for the engine having
+        // dropped the payload and always suspending with `Null`.
+        let payload = serde_json::json!({
+            "src": "/local/a.bin",
+            "dst": "pod:/remote/a.bin",
+            "retries": 3,
+        });
+        let mut e = build_with_ops(N::CallWith("net.transfer".into(), payload.clone()));
+        let out = e.step().unwrap();
+        let sid = match out {
+            StepOutcome::Blocked { newly_pending } => {
+                assert_eq!(newly_pending.len(), 1);
+                match &newly_pending[0].reason {
+                    SuspendReason::Call { spec } => {
+                        assert_eq!(spec.label, "net.transfer");
+                        assert_eq!(spec.payload, payload, "payload must survive verbatim");
+                    }
+                    other => panic!("expected Call-shaped reason, got {other:?}"),
+                }
+                newly_pending[0].id
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        };
+        e.resolve(sid, Ok(V::S("transferred".into()))).unwrap();
+        let out = e.step().unwrap();
+        assert!(matches!(out, StepOutcome::Done(V::S(ref s)) if s == "transferred"));
+    }
+
+    #[test]
+    fn call_without_a_payload_still_suspends_with_null() {
+        // The label-only shape stays exactly as it was.
+        let mut e = build_with_ops(N::Call("ping".into()));
+        match e.step().unwrap() {
+            StepOutcome::Blocked { newly_pending } => match &newly_pending[0].reason {
+                SuspendReason::Call { spec } => {
+                    assert_eq!(spec.label, "ping");
+                    assert_eq!(spec.payload, serde_json::Value::Null);
+                }
+                other => panic!("expected Call-shaped reason, got {other:?}"),
+            },
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     #[test]

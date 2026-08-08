@@ -30,7 +30,10 @@ caller sees the same contract regardless of which `DslHost` is loaded.
 - **`dsl_kit_pending`** — list every live suspension. In the common
   one-in-flight case this returns zero or one entry; under a `Par`
   fan-out it enumerates every live child. Each entry carries a stable
-  `id`, `reason`, `label`, and `at` location.
+  `id`, `reason`, `label`, `payload`, and `at` location. `payload` is
+  the effect's arguments exactly as the DSL attached them to the node
+  (`null` when the label says everything) — read the call's inputs
+  from there rather than re-deriving them from `dsl_kit_ast`.
 - **`dsl_kit_resolve_by_id`** — resolve one specific pending
   suspension by its stable `id`. Body variants:
   - `{ id, ok: "response text" }` — success payload.

@@ -38,6 +38,28 @@ pub struct SuspendedCall {
     pub node: u64,
     /// Host-defined label identifying the effect.
     pub label: String,
+    /// Effect payload the DSL attached to the node, verbatim. `null`
+    /// when the label carries the whole message.
+    pub payload: serde_json::Value,
+}
+
+impl SuspendedCall {
+    /// Projects the sole in-flight `Call` of a stepper, if there is
+    /// exactly one and it is `Call`-shaped. Mirrors
+    /// [`dsl_kit::Stepper::suspended_call_spec`], so hosts do not
+    /// hand-roll the projection (and do not quietly drop the payload
+    /// while doing it).
+    pub fn sole(pending: &[dsl_kit::Pending]) -> Option<Self> {
+        let [p] = pending else { return None };
+        match &p.reason {
+            dsl_kit::SuspendReason::Call { spec } => Some(Self {
+                node: p.at.node.0,
+                label: spec.label.clone(),
+                payload: spec.payload.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// A call that has just been resolved.
@@ -100,8 +122,44 @@ pub struct PendingProjection {
     pub reason: String,
     /// Effect label for `Call`-shaped suspensions; empty otherwise.
     pub label: String,
+    /// Effect payload for `Call`-shaped suspensions, verbatim from the
+    /// DSL node; `null` otherwise.
+    pub payload: serde_json::Value,
     /// Location context.
     pub at: HostLocation,
+}
+
+impl PendingProjection {
+    /// Projects one engine [`Pending`](dsl_kit::Pending) into the
+    /// JSON-friendly view. Hosts should call this rather than building
+    /// the struct by hand — the reason vocabulary and the payload
+    /// pass-through then stay identical across every DSL.
+    pub fn of(p: &dsl_kit::Pending) -> Self {
+        let (reason, label, payload) = match &p.reason {
+            dsl_kit::SuspendReason::Call { spec } => {
+                ("call".to_string(), spec.label.clone(), spec.payload.clone())
+            }
+            dsl_kit::SuspendReason::Breakpoint => {
+                ("breakpoint".into(), String::new(), serde_json::Value::Null)
+            }
+            dsl_kit::SuspendReason::Cooperative => {
+                ("cooperative".into(), String::new(), serde_json::Value::Null)
+            }
+            dsl_kit::SuspendReason::User { tag } => (
+                format!("user:{tag}"),
+                String::new(),
+                serde_json::Value::Null,
+            ),
+            _ => ("unknown".into(), String::new(), serde_json::Value::Null),
+        };
+        Self {
+            id: p.id.0,
+            reason,
+            label,
+            payload,
+            at: HostLocation::of(&p.at),
+        }
+    }
 }
 
 /// Location context of a suspension, in generic (JSON-friendly) form.
@@ -117,6 +175,20 @@ pub struct HostLocation {
     pub frame: Option<u64>,
     /// Iteration counter when the surrounding node is loop-shaped.
     pub iteration: Option<u64>,
+}
+
+impl HostLocation {
+    /// Projects an engine [`NodeContext`](dsl_kit::NodeContext) into the
+    /// JSON-friendly view.
+    pub fn of(at: &dsl_kit::NodeContext) -> Self {
+        Self {
+            node: at.node.0,
+            path: at.path.0.iter().map(|n| n.0).collect(),
+            depth: at.depth,
+            frame: at.frame.map(|f| f.0),
+            iteration: at.iteration.map(|i| i.0),
+        }
+    }
 }
 
 /// Outcome of a step against a `DslHost`.

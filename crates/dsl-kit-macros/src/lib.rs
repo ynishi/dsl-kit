@@ -56,7 +56,8 @@
 //! variant names its engine `NodeKind` through a `#[dsl_exec(...)]`
 //! annotation (`value` / `read(field)` / `apply = "op"` / `bind(field)`
 //! / `branch` / `repeat` / `seq` / `scope(field)` / `maybe` /
-//! `call(field)`); recursive child fields are picked up in declaration
+//! `call(field)`, the last of which may name an effect payload —
+//! `call(label, payload(src, dst))`); recursive child fields are picked up in declaration
 //! order. Pair the impl with a `DslSemantics` implementation via
 //! `dsl_kit_core::DerivedAst` to obtain a runnable `Ast`. See
 //! [`derive_dsl_exec`].
@@ -1201,8 +1202,30 @@ enum ExecSpec {
     Scope { label_field: Ident },
     /// `#[dsl_exec(maybe)]` — optional body.
     Maybe,
-    /// `#[dsl_exec(call(FIELD))]` — effect leaf labelled by `FIELD`.
-    Call { label_field: Ident },
+    /// `#[dsl_exec(call(FIELD))]` — effect leaf labelled by `FIELD`,
+    /// optionally carrying an effect payload (see [`CallPayload`]).
+    Call {
+        label_field: Ident,
+        payload: CallPayload,
+    },
+}
+
+/// What `#[dsl_exec(call(LABEL, ...))]` puts in `NodeKind::Call`'s
+/// payload — the effect's argument channel, handed to the host verbatim
+/// through `CallSpec::payload`.
+#[derive(Debug, Clone)]
+enum CallPayload {
+    /// `call(LABEL)` — no arguments beyond the label; payload is `null`.
+    None,
+    /// `call(LABEL, payload)` — every non-recursive field except the
+    /// label, as a JSON object keyed by field name.
+    AllFields,
+    /// `call(LABEL, payload(a, b))` — the listed fields only, as a JSON
+    /// object keyed by field name.
+    Fields(Vec<Ident>),
+    /// `call(LABEL, payload = FIELD)` — that one field serialised on its
+    /// own, with no surrounding object.
+    Single(Ident),
 }
 
 /// Parses the variant's `#[dsl_exec(...)]` annotation. Errors when the
@@ -1251,14 +1274,16 @@ fn dsl_exec_attr(variant: &syn::Variant) -> syn::Result<ExecSpec> {
             } else if meta.path.is_ident("maybe") {
                 spec = Some(ExecSpec::Maybe);
             } else if meta.path.is_ident("call") {
+                let (label_field, payload) = call_form(&meta)?;
                 spec = Some(ExecSpec::Call {
-                    label_field: field_of(&meta)?,
+                    label_field,
+                    payload,
                 });
             } else {
                 return Err(meta.error(
                     "unknown #[dsl_exec(...)] form; expected one of value / read(field) / \
                      apply = \"op\" / bind(field) / branch / repeat / seq / scope(field) / \
-                     maybe / call(field)",
+                     maybe / call(field[, payload | payload(a, b) | payload = field])",
                 ));
             }
             Ok(())
@@ -1271,6 +1296,54 @@ fn dsl_exec_attr(variant: &syn::Variant) -> syn::Result<ExecSpec> {
         "#[derive(DslExec)] requires a #[dsl_exec(...)] annotation on every variant \
          (or implement Ast by hand for advanced shapes)",
     ))
+}
+
+/// Parses the inside of `call(...)`: a mandatory label field name plus
+/// an optional `payload` clause in one of three shapes —
+/// `payload` (every other non-recursive field), `payload(a, b)` (those
+/// fields), `payload = field` (that field, unwrapped).
+///
+/// A variant whose *label* field is literally named `payload` has to
+/// implement `exec_kind` by hand; `call(payload)` reads as the clause.
+fn call_form(meta: &syn::meta::ParseNestedMeta) -> syn::Result<(Ident, CallPayload)> {
+    let mut label: Option<Ident> = None;
+    let mut payload = CallPayload::None;
+    meta.parse_nested_meta(|inner| {
+        if inner.path.is_ident("payload") {
+            if inner.input.peek(syn::token::Paren) {
+                let mut fields: Vec<Ident> = Vec::new();
+                inner.parse_nested_meta(|f| match f.path.get_ident() {
+                    Some(ident) => {
+                        fields.push(ident.clone());
+                        Ok(())
+                    }
+                    None => Err(f.error("expected a field name")),
+                })?;
+                if fields.is_empty() {
+                    return Err(inner.error("payload(...) needs at least one field name"));
+                }
+                payload = CallPayload::Fields(fields);
+            } else if inner.input.peek(syn::Token![=]) {
+                payload = CallPayload::Single(inner.value()?.parse()?);
+            } else {
+                payload = CallPayload::AllFields;
+            }
+            return Ok(());
+        }
+        match inner.path.get_ident() {
+            Some(ident) if label.is_none() => {
+                label = Some(ident.clone());
+                Ok(())
+            }
+            Some(_) => Err(inner.error(
+                "expected a single label field name, then an optional \
+                 `payload` / `payload(a, b)` / `payload = field` clause",
+            )),
+            None => Err(inner.error("expected a field name")),
+        }
+    })?;
+    let label = label.ok_or_else(|| meta.error("expected a label field name argument"))?;
+    Ok((label, payload))
 }
 
 /// Emits the NodeId expression for a single-node recursive field
@@ -1297,6 +1370,31 @@ fn single_child_id(
 /// declaration order exactly like `#[derive(DslNode)]` does. Pair the
 /// generated impl with a `DslSemantics` implementation via
 /// `dsl_kit_core::DerivedAst` to obtain a runnable `Ast`.
+///
+/// # Effect payloads
+///
+/// `call(LABEL)` suspends with a `null` payload — the label is the whole
+/// message. When the effect takes arguments, name them so they reach the
+/// host verbatim through `CallSpec::payload` and the resolver never has
+/// to look the node up in the DSL's own state:
+///
+/// | form | payload |
+/// |---|---|
+/// | `call(label)` | `null` |
+/// | `call(label, payload)` | every non-recursive field except `label`, as an object |
+/// | `call(label, payload(src, dst))` | those fields, as an object |
+/// | `call(label, payload = args)` | `args` alone, unwrapped |
+///
+/// Every field feeding a payload must implement `serde::Serialize`.
+///
+/// ```ignore
+/// #[derive(DslNode, DslExec)]
+/// enum Flow {
+///     #[dsl_exec(call(label, payload(src, dst)))]
+///     Transfer { id: NodeId, label: String, src: String, dst: String },
+/// }
+/// // resolver side: spec.payload["src"] / spec.payload["dst"]
+/// ```
 #[proc_macro_derive(DslExec, attributes(dsl_exec))]
 pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -1586,15 +1684,87 @@ pub fn derive_dsl_exec(input: TokenStream) -> TokenStream {
                         ::dsl_kit_core::NodeKind::Maybe { body: #body_expr },
                 });
             }
-            ExecSpec::Call { label_field } => {
+            ExecSpec::Call {
+                label_field,
+                payload: payload_form,
+            } => {
                 if !recursive.is_empty() {
                     return err("#[dsl_exec(call(..))] variants must have no child fields".into());
                 }
+                // Which fields feed the payload, and how they are shaped.
+                let known: Vec<&Ident> = payload.iter().map(|(id, _)| id).collect();
+                let selected: Vec<Ident> = match &payload_form {
+                    CallPayload::None => Vec::new(),
+                    CallPayload::AllFields => known
+                        .iter()
+                        .filter(|id| **id != &label_field)
+                        .map(|id| (*id).clone())
+                        .collect(),
+                    CallPayload::Fields(fields) => fields.clone(),
+                    CallPayload::Single(field) => vec![field.clone()],
+                };
+                if let Some(unknown) = selected.iter().find(|f| !known.contains(f)) {
+                    return err(format!(
+                        "#[dsl_exec(call(..))] payload field `{unknown}` is not a \
+                         non-recursive field of this variant"
+                    ));
+                }
+                // The label field is already bound by the pattern.
+                let extra_binds = selected.iter().filter(|f| **f != label_field);
+                // A serialisation failure is reported *in* the payload
+                // rather than silently dropped — losing an effect's
+                // arguments without a trace is the failure mode this
+                // whole channel exists to avoid.
+                let or_error = quote! {
+                    let _value = |
+                        r: ::std::result::Result<
+                            ::dsl_kit_core::serde_json::Value,
+                            ::dsl_kit_core::serde_json::Error,
+                        >,
+                    | -> ::dsl_kit_core::serde_json::Value {
+                        match r {
+                            ::std::result::Result::Ok(v) => v,
+                            ::std::result::Result::Err(e) => {
+                                let mut _err = ::dsl_kit_core::serde_json::Map::new();
+                                _err.insert(
+                                    ::std::string::String::from("__payload_error"),
+                                    ::dsl_kit_core::serde_json::Value::String(
+                                        ::std::string::ToString::to_string(&e),
+                                    ),
+                                );
+                                ::dsl_kit_core::serde_json::Value::Object(_err)
+                            }
+                        }
+                    };
+                };
+                let payload_expr = match &payload_form {
+                    CallPayload::None => quote! { ::dsl_kit_core::serde_json::Value::Null },
+                    CallPayload::Single(field) => quote! {{
+                        #or_error
+                        _value(::dsl_kit_core::serde_json::to_value(#field))
+                    }},
+                    _ => {
+                        let inserts = selected.iter().map(|f| {
+                            quote! {
+                                _payload.insert(
+                                    ::std::string::String::from(::std::stringify!(#f)),
+                                    _value(::dsl_kit_core::serde_json::to_value(#f)),
+                                );
+                            }
+                        });
+                        quote! {{
+                            #or_error
+                            let mut _payload = ::dsl_kit_core::serde_json::Map::new();
+                            #(#inserts)*
+                            ::dsl_kit_core::serde_json::Value::Object(_payload)
+                        }}
+                    }
+                };
                 kind_arms.push(quote! {
-                    Self::#variant_ident { #label_field, .. } =>
+                    Self::#variant_ident { #label_field, #(#extra_binds,)* .. } =>
                         ::dsl_kit_core::NodeKind::Call {
                             label: #label_field.clone(),
-                            payload: ::dsl_kit_core::serde_json::Value::Null,
+                            payload: #payload_expr,
                         },
                 });
             }
