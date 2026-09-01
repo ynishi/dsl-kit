@@ -140,8 +140,8 @@ pub fn dump_field<T: serde::Serialize>(
     name: &str,
     value: &T,
 ) -> Result<(), BuildError> {
-    let v = serde_json::to_value(value)
-        .map_err(|e| dump_value_error(format!("field `{name}`"), e))?;
+    let v =
+        serde_json::to_value(value).map_err(|e| dump_value_error(format!("field `{name}`"), e))?;
     tree.fields.push((name.to_string(), RawValue::Json(v)));
     Ok(())
 }

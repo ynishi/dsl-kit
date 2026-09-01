@@ -133,7 +133,13 @@ fn full_ast(ids: &IdGen) -> Cfg {
         items: vec![leaf(ids, "i1"), leaf(ids, "i2")],
         env: BTreeMap::from([
             ("x".to_string(), Box::new(leaf(ids, "ex"))),
-            ("y".to_string(), Box::new(Cfg::Gauge { id: ids.node(), level: Level::High })),
+            (
+                "y".to_string(),
+                Box::new(Cfg::Gauge {
+                    id: ids.node(),
+                    level: Level::High,
+                }),
+            ),
         ]),
         limits: BTreeMap::from([("mem".to_string(), 512), ("cpu".to_string(), 2)]),
     }
@@ -148,7 +154,10 @@ fn dumped_tree_is_self_conformant() {
     let ids = IdGen::default();
     let tree = full_ast(&ids).to_parse_tree().expect("dump");
     let diags = check_conformance(&tree, &Cfg::schema());
-    assert!(diags.is_empty(), "dumped tree failed conformance: {diags:?}");
+    assert!(
+        diags.is_empty(),
+        "dumped tree failed conformance: {diags:?}"
+    );
 }
 
 #[test]
