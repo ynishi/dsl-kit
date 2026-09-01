@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/ynishi/dsl-kit/compare/v0.11.0...v0.11.1) - 2026-09-01
+
+### Added
+
+- *(parse,macros)* AST→ParseTree reverse derive (DslDump) + canonical JSON dump
+
+### Other
+
+- *(parse)* cargo fmt over dump.rs / dump_roundtrip.rs
+
 ## [0.11.0](https://github.com/ynishi/dsl-kit/compare/v0.10.1...v0.11.0) - 2026-08-08
 
 ### Fixed
