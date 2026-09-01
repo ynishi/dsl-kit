@@ -38,6 +38,17 @@
 //! `build_field` with `#[dsl_build(with = path)]` — the named function
 //! converts the field itself. See [`derive_dsl_build`].
 //!
+//! `#[derive(DslDump)]` is `DslBuild`'s inverse: it emits an
+//! `impl DslDump` that re-serializes a typed AST value back into the
+//! `ParseTree` shape the build derive accepts, so the pair round-trips
+//! (modulo fresh `NodeId`s). Chain the emitted tree through
+//! `dsl_kit_parse::serde_bridge::to_canonical_json` (or use the
+//! `dsl_kit_parse::dump_canonical_json` convenience) to serialize an
+//! in-memory AST as canonical bridge JSON. Payload fields must
+//! implement `serde::Serialize`; a field carrying
+//! `#[dsl_build(with = ...)]` must carry the dual
+//! `#[dsl_dump(with = path)]` serializer. See [`derive_dsl_dump`].
+//!
 //! `#[derive(DslCheck)]` accepts the same shape and emits an
 //! `impl DslCheck` returning a `CheckProgram` — the semantic judgement
 //! rules of the DSL as data. Variants carry `#[dsl_check(requires =
@@ -1170,6 +1181,261 @@ pub fn derive_dsl_build(input: TokenStream) -> TokenStream {
                         "check_conformance accepted unknown variant `{}` — this is a bug",
                         other,
                     ),
+                }
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Derives `dsl_kit_parse::DslDump` — the inverse of
+/// `#[derive(DslBuild)]` — for an enum whose variants use named fields
+/// and carry an `id: NodeId` field.
+///
+/// The generated `to_parse_tree_with` re-emits the `ParseTree` shape
+/// the same enum's `DslBuild` derive accepts, so the pair round-trips
+/// (`from_parse_tree(&ast.to_parse_tree()?, &ids)` rebuilds an
+/// equivalent AST, modulo fresh `NodeId`s). Field routing mirrors the
+/// build derive exactly:
+///
+/// 1. The `id` field is not serialized; it is only used to look up the
+///    node's `$allow` annotation in the caller-supplied `AllowTable`.
+/// 2. Payload fields emit through `dump_field` /
+///    `dump_field_optional` (types must implement
+///    `serde::Serialize`). An absent `Option` omits its key; `Vec`
+///    payloads always emit, including `[]`.
+/// 3. A field annotated `#[dsl_dump(with = path)]` bypasses
+///    `dump_field`: `path` must name a function
+///    `fn(&T) -> Result<Option<serde_json::Value>, BuildError>`, where
+///    `Ok(None)` omits the key. This is the dual of
+///    `#[dsl_build(with = path)]`, and the derive **requires** it on
+///    any field that carries `#[dsl_build(with = ...)]` — a custom
+///    build converter cannot be inverted mechanically, so the dual
+///    serializer must be spelled out. The attribute applies to payload
+///    fields only; annotating a recursive child field is a compile
+///    error.
+/// 4. Recursive child fields emit through `dump_child_one` /
+///    `_optional` / `_many` / `_map`, unwrapping `Box` where the
+///    source field is boxed. Keyed slots (`BTreeMap<String, T>`) emit
+///    in map iteration order — already ascending by key, as
+///    conformance demands. Scalar-valued keyed slots emit through
+///    `dump_scalar_map`.
+///
+/// (The named helpers live in `dsl_kit_parse::dump`; this proc-macro
+/// crate cannot intra-doc-link across crates it does not depend on.)
+#[proc_macro_derive(DslDump, attributes(dsl_dump))]
+pub fn derive_dsl_dump(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = input.ident.clone();
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
+    let Data::Enum(data) = &input.data else {
+        return syn::Error::new_spanned(&input, "#[derive(DslDump)] currently supports enums only")
+            .to_compile_error()
+            .into();
+    };
+
+    let mut variant_arms = Vec::new();
+
+    for variant in &data.variants {
+        let variant_ident = &variant.ident;
+        let variant_name_str = variant_ident.to_string();
+
+        let Fields::Named(fields) = &variant.fields else {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslDump)] requires every variant to use named fields",
+            )
+            .to_compile_error()
+            .into();
+        };
+
+        let has_id = fields
+            .named
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|ident| ident == "id"));
+        if !has_id {
+            return syn::Error::new_spanned(
+                variant,
+                "#[derive(DslDump)] requires each variant to have an `id: NodeId` field",
+            )
+            .to_compile_error()
+            .into();
+        }
+
+        let mut bind_idents = Vec::new();
+        let mut emit_stmts = Vec::new();
+
+        for f in &fields.named {
+            let Some(ident) = &f.ident else { continue };
+            if ident == "id" {
+                continue;
+            }
+            bind_idents.push(ident.clone());
+            let ident_str = ident.to_string();
+
+            let dump_with = match dsl_dump_with_attr(f) {
+                Ok(w) => w,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            let build_with = match dsl_build_with_attr(f) {
+                Ok(w) => w,
+                Err(e) => return e.to_compile_error().into(),
+            };
+            // A scalar keyed slot (`BTreeMap<String, V>`) is a keyed
+            // Map slot in the schema, but a dump-side `with` fn can
+            // only land its value in `tree.fields` — every dump would
+            // then fail conformance with CHILD_AS_FIELD. (The build
+            // side is fine: its `with` fn receives the whole
+            // `&ParseTree` and can read the keyed half.) Reject at
+            // compile time instead of emitting a serializer that can
+            // never conform.
+            if (build_with.is_some() || dump_with.is_some())
+                && detect_scalar_map(&f.ty, &name).is_some()
+            {
+                return syn::Error::new_spanned(
+                    f,
+                    "custom converters on scalar keyed slots (`BTreeMap<String, _>`) cannot \
+                     be expressed by #[derive(DslDump)] — the dump-side `with` output lands \
+                     in payload fields while the schema declares a keyed Map slot; write a \
+                     hand-written DslDump impl for this enum instead",
+                )
+                .to_compile_error()
+                .into();
+            }
+            if build_with.is_some() && dump_with.is_none() {
+                return syn::Error::new_spanned(
+                    f,
+                    "this field has #[dsl_build(with = ...)] but no #[dsl_dump(with = ...)]; \
+                     a custom build converter cannot be inverted mechanically — provide the \
+                     dual serializer `fn(&T) -> Result<Option<serde_json::Value>, BuildError>`",
+                )
+                .to_compile_error()
+                .into();
+            }
+            if let Some(path) = &dump_with {
+                if detect_recursion(&f.ty, &name).is_some() {
+                    return syn::Error::new_spanned(
+                        f,
+                        "#[dsl_dump(with = ...)] applies to payload fields only, \
+                         not recursive child fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                emit_stmts.push(quote! {
+                    if let ::std::option::Option::Some(__dsl_kit_v) = #path(#ident)? {
+                        __dsl_kit_tree.fields.push((
+                            #ident_str.to_string(),
+                            ::dsl_kit_parse::RawValue::Json(__dsl_kit_v),
+                        ));
+                    }
+                });
+                continue;
+            }
+
+            if let Some(kind) = detect_recursion(&f.ty, &name) {
+                let call = match kind {
+                    Recursion::Direct => quote! {
+                        ::dsl_kit_parse::dump_child_one(
+                            &mut __dsl_kit_tree, #ident_str, #ident, __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::Boxed => quote! {
+                        ::dsl_kit_parse::dump_child_one(
+                            &mut __dsl_kit_tree, #ident_str, &**#ident, __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::Optional => quote! {
+                        ::dsl_kit_parse::dump_child_optional(
+                            &mut __dsl_kit_tree, #ident_str, #ident.as_ref(), __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::OptionalBoxed => quote! {
+                        ::dsl_kit_parse::dump_child_optional(
+                            &mut __dsl_kit_tree, #ident_str, #ident.as_deref(), __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::Many => quote! {
+                        ::dsl_kit_parse::dump_child_many(
+                            &mut __dsl_kit_tree, #ident_str, #ident.iter(), __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::ManyBoxed => quote! {
+                        ::dsl_kit_parse::dump_child_many(
+                            &mut __dsl_kit_tree,
+                            #ident_str,
+                            #ident.iter().map(|__dsl_kit_b| &**__dsl_kit_b),
+                            __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::Map => quote! {
+                        ::dsl_kit_parse::dump_child_map(
+                            &mut __dsl_kit_tree, #ident_str, #ident.iter(), __dsl_kit_allows,
+                        )?;
+                    },
+                    Recursion::MapBoxed => quote! {
+                        ::dsl_kit_parse::dump_child_map(
+                            &mut __dsl_kit_tree,
+                            #ident_str,
+                            #ident.iter().map(|(__dsl_kit_k, __dsl_kit_v)| {
+                                (__dsl_kit_k, &**__dsl_kit_v)
+                            }),
+                            __dsl_kit_allows,
+                        )?;
+                    },
+                };
+                emit_stmts.push(call);
+            } else if detect_scalar_map(&f.ty, &name).is_some() {
+                emit_stmts.push(quote! {
+                    ::dsl_kit_parse::dump_scalar_map(&mut __dsl_kit_tree, #ident_str, #ident)?;
+                });
+            } else {
+                let (shape, _) = payload_shape(&f.ty, &name);
+                let call = match shape {
+                    PayloadShape::OptionInner => quote! {
+                        ::dsl_kit_parse::dump_field_optional(
+                            &mut __dsl_kit_tree, #ident_str, #ident,
+                        )?;
+                    },
+                    _ => quote! {
+                        ::dsl_kit_parse::dump_field(&mut __dsl_kit_tree, #ident_str, #ident)?;
+                    },
+                };
+                emit_stmts.push(call);
+            }
+        }
+
+        variant_arms.push(quote! {
+            Self::#variant_ident { id: __dsl_kit_id, #(#bind_idents,)* } => {
+                let mut __dsl_kit_tree = ::dsl_kit_parse::ParseTree::new(#variant_name_str);
+                if let ::std::option::Option::Some(__dsl_kit_node_allows) =
+                    __dsl_kit_allows.get(__dsl_kit_id)
+                {
+                    __dsl_kit_tree.allows = __dsl_kit_node_allows.clone();
+                }
+                #(#emit_stmts)*
+                ::std::result::Result::Ok(__dsl_kit_tree)
+            }
+        });
+    }
+
+    let expanded: TokenStream2 = quote! {
+        impl #impl_generics ::dsl_kit_parse::DslDump for #name #ty_generics #where_clause {
+            // `__dsl_kit_`-prefixed parameter so a user field named
+            // `allows` cannot shadow the table inside the variant arms
+            // (same hygiene convention as `__dsl_kit_id` on the build
+            // side).
+            fn to_parse_tree_with(
+                &self,
+                __dsl_kit_allows: &::dsl_kit_core::AllowTable,
+            ) -> ::std::result::Result<
+                ::dsl_kit_parse::ParseTree,
+                ::dsl_kit_parse::BuildError,
+            > {
+                match self {
+                    #(#variant_arms)*
                 }
             }
         }
@@ -2669,30 +2935,56 @@ pub fn derive_dsl_check(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Parses a field's `#[dsl_build(with = path)]` annotation, if present.
-/// `Ok(None)` when the field carries no `dsl_build` attribute.
-fn dsl_build_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
+/// Parses a field's `#[<attr_name>(with = path)]` annotation, if
+/// present. `Ok(None)` when the field carries no such attribute.
+///
+/// Shared by the `dsl_build` and `dsl_dump` sides so the two parsers
+/// cannot drift. A duplicated `with` — whether inside one attribute or
+/// across repeated attributes — is rejected rather than silently
+/// last-wins.
+fn with_attr(f: &syn::Field, attr_name: &str) -> syn::Result<Option<syn::Path>> {
     let mut with: Option<syn::Path> = None;
     for attr in &f.attrs {
-        if !attr.path().is_ident("dsl_build") {
+        if !attr.path().is_ident(attr_name) {
             continue;
         }
+        let mut seen_here = false;
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("with") {
+                if with.is_some() {
+                    return Err(meta.error(format!(
+                        "duplicate #[{attr_name}(with = ...)] — a field takes one converter"
+                    )));
+                }
                 with = Some(meta.value()?.parse::<syn::Path>()?);
+                seen_here = true;
                 Ok(())
             } else {
-                Err(meta.error("unsupported #[dsl_build(...)] key; expected `with = <path>`"))
+                Err(meta.error(format!(
+                    "unsupported #[{attr_name}(...)] key; expected `with = <path>`"
+                )))
             }
         })?;
-        if with.is_none() {
+        if !seen_here {
             return Err(syn::Error::new_spanned(
                 attr,
-                "#[dsl_build] requires `with = <path>`",
+                format!("#[{attr_name}] requires `with = <path>`"),
             ));
         }
     }
     Ok(with)
+}
+
+/// Parses a field's `#[dsl_dump(with = path)]` annotation, if present.
+/// `Ok(None)` when the field carries no `dsl_dump` attribute.
+fn dsl_dump_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
+    with_attr(f, "dsl_dump")
+}
+
+/// Parses a field's `#[dsl_build(with = path)]` annotation, if present.
+/// `Ok(None)` when the field carries no `dsl_build` attribute.
+fn dsl_build_with_attr(f: &syn::Field) -> syn::Result<Option<syn::Path>> {
+    with_attr(f, "dsl_build")
 }
 
 /// Collapses the whitespace that `TokenStream::to_string` inserts between

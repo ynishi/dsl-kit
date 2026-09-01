@@ -38,12 +38,18 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 pub mod allow;
+pub mod dump;
 pub mod example_gen;
 pub mod grammar_check;
 pub mod import;
 pub mod peg;
 pub mod schema_gen;
 pub mod serde_bridge;
+
+pub use dump::{
+    DslDump, dump_canonical_json, dump_canonical_json_with, dump_child_many, dump_child_map,
+    dump_child_one, dump_child_optional, dump_field, dump_field_optional, dump_scalar_map,
+};
 
 // ---------------------------------------------------------------------------
 // Span

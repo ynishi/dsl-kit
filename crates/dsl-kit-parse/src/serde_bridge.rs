@@ -93,6 +93,11 @@ pub mod serde_codes {
     /// text → JSON mapping, or the text failed to parse as that type.
     /// Emitted by [`to_canonical_json`](super::serde_bridge::to_canonical_json).
     pub const CANONICAL_TEXT: &str = "dsl_kit::parse::serde::canonical_text";
+    /// A typed AST payload failed `serde_json::to_value` on the dump
+    /// side (a map with non-string keys, a non-finite float, a failing
+    /// custom `Serialize`). Emitted by the
+    /// [`dump`](crate::dump) helpers behind `#[derive(DslDump)]`.
+    pub const DUMP_FIELD: &str = "dsl_kit::parse::serde::dump_field";
 }
 
 /// Parses a JSON string into a [`ParseTree`], using `schema` to
