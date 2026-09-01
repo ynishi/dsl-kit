@@ -30,7 +30,12 @@ use dsl_kit::{
 /// [`ExprSemantics`] supplies the handful of judgments the kit cannot
 /// derive (what "unit" is, what counts as true, how bindings store).
 #[derive(
-    Debug, DslNode, dsl_kit_macros::DslSchema, dsl_kit_macros::DslBuild, dsl_kit_macros::DslExec,
+    Debug,
+    DslNode,
+    dsl_kit_macros::DslSchema,
+    dsl_kit_macros::DslBuild,
+    dsl_kit_macros::DslDump,
+    dsl_kit_macros::DslExec,
 )]
 pub enum Expr {
     /// Integer literal.

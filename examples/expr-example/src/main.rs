@@ -10,7 +10,12 @@
 //!    from `Expr::schema()` at runtime — nobody wrote a grammar. Text
 //!    parses to a `ParseTree`, conformance-checks against the schema,
 //!    builds a typed `Expr` via `#[derive(DslBuild)]`, and evaluates.
-//! 3. The same program driven through the `DslHost` trait, proving
+//! 3. The reverse direction via `#[derive(DslDump)]`: the typed AST
+//!    serializes to canonical bridge JSON (`dump_canonical_json`),
+//!    the JSON re-parses through the serde front-end, rebuilds, and
+//!    evaluates to the same value — the round trip a cache or wire
+//!    transport of an in-memory program rests on.
+//! 4. The same program driven through the `DslHost` trait, proving
 //!    that the MCP handler works against DSLs whose shape is very
 //!    different from `flow-dsl`.
 //!
@@ -20,7 +25,9 @@
 
 use dsl_kit::{BreakCondition, BreakpointSet, IdGen, NodeId};
 use dsl_kit_mcp::host::DslHost;
-use dsl_kit_parse::{DslBuild, check_conformance, schema_gen};
+use dsl_kit_parse::{
+    DslBuild, check_conformance, dump_canonical_json, schema_gen, serde_bridge::from_json_value,
+};
 use dsl_kit_schema::DslSchema;
 use expr_dsl::{Expr, demo_program, evaluate_all, pretty};
 use expr_host::ExprHost;
@@ -80,6 +87,41 @@ fn run_schema_generated_grammar_demo() -> miette::Result<()> {
     Ok(())
 }
 
+/// Serializes the typed AST back to canonical bridge JSON with
+/// `#[derive(DslDump)]`, re-parses it through the serde front-end, and
+/// evaluates the rebuilt program — the reverse of
+/// [`run_schema_generated_grammar_demo`]'s text path. The value must
+/// match the original evaluation: that equality is the round-trip
+/// contract a cache or wire transport of an in-memory program rests
+/// on.
+fn run_dump_round_trip_demo(program: &Expr, expected: i64) -> miette::Result<()> {
+    let json = dump_canonical_json(program)
+        .map_err(|e| miette::miette!("dump failed: {:?}", e.diagnostics))?;
+    println!(
+        "dumped canonical JSON ({} bytes):\n{}",
+        json.to_string().len(),
+        serde_json::to_string_pretty(&json).expect("Value re-serializes"),
+    );
+
+    let tree = from_json_value(&json, &Expr::schema())
+        .map_err(|e| miette::miette!("re-parse failed: {:?}", e.diagnostics))?;
+    let rebuilt = Expr::from_parse_tree(&tree, &IdGen::new())
+        .map_err(|e| miette::miette!("typed rebuild failed: {:?}", e.diagnostics))?;
+    let value = evaluate_all(&rebuilt, |name| match name {
+        "y" => Some(5),
+        "z" => Some(2),
+        _ => None,
+    })?;
+    println!("re-parsed program with y=5, z=2 -> {value}");
+    if value != expected {
+        return Err(miette::miette!(
+            "round-trip drift: original evaluated to {expected}, rebuilt to {value}"
+        ));
+    }
+    println!("round trip holds: rebuilt program evaluates to {expected} as well");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     // ---- 1. Synchronous evaluation ---------------------------------
@@ -100,7 +142,11 @@ async fn main() -> miette::Result<()> {
     println!("\n=== Schema-generated grammar (text -> typed AST -> eval) ===");
     run_schema_generated_grammar_demo()?;
 
-    // ---- 3. Driving the same program through DslHost ---------------
+    // ---- 3. Reverse direction: typed AST -> canonical JSON -> eval --
+    println!("\n=== DslDump (typed AST -> canonical JSON -> re-parse -> eval) ===");
+    run_dump_round_trip_demo(&program, value)?;
+
+    // ---- 4. Driving the same program through DslHost ---------------
     println!("\n=== DslHost run ===");
     let mut host = ExprHost::new_with_default_program();
     let bp = BreakpointSet::new();
@@ -125,7 +171,7 @@ async fn main() -> miette::Result<()> {
         println!("  n{id}: {entry}");
     }
 
-    // ---- 4. Same host, but with a breakpoint on n1 (the Lit inside Let) --
+    // ---- 5. Same host, but with a breakpoint on n1 (the Lit inside Let) --
     println!("\n=== DslHost run with a breakpoint ===");
     host.reset();
     let mut bp = BreakpointSet::new();

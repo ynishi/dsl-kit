@@ -496,6 +496,7 @@ dependencies = [
  "expr-dsl",
  "expr-host",
  "miette",
+ "serde_json",
  "tokio",
 ]
 
