@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-parse` — new `dump` module: `DslDump`, the inverse of
+  `DslBuild`. A typed AST re-emits the `ParseTree` shape its own build
+  derive accepts (`to_parse_tree` / `to_parse_tree_with(&AllowTable)`,
+  the latter carrying `$allow` annotations back into the tree), and
+  `dump_canonical_json` chains the emitted tree through
+  `to_canonical_json` — the serde-bridge JSON serializer for an AST a
+  program built or transformed in memory (caching, transport, content
+  hashing). Emission rules are the duals of the build defaults: `id`
+  is never serialized (re-parsing mints fresh ids), absent `Option`s
+  omit their keys, `Vec` payloads/slots always emit (`[]` included),
+  empty keyed maps omit the slot, `BTreeMap` iteration order satisfies
+  the keyed-slot sortedness gate. Serialization failures report the
+  new `serde_codes::DUMP_FIELD` diagnostic.
+- `dsl-kit-macros` — `#[derive(DslDump)]` generates the reverse walk
+  for the same enum shape `DslBuild` accepts, so the pair round-trips
+  by construction (`from_parse_tree(&ast.to_parse_tree()?, &ids)`
+  rebuilds an equivalent AST modulo `NodeId`s). A field carrying
+  `#[dsl_build(with = ...)]` must carry the dual
+  `#[dsl_dump(with = path)]` serializer — enforced at compile time,
+  as is the rejection of custom converters on scalar keyed slots
+  (`BTreeMap<String, _>`), whose `with` output cannot conform.
+  Duplicate `with` annotations on one field are now a compile error
+  on both derives instead of silent last-wins.
+- `expr-example` — the demo now runs the reverse direction end to end:
+  the typed program dumps to canonical bridge JSON via
+  `#[derive(DslDump)]`, re-parses through the serde front-end, and
+  must evaluate to the same value.
 - `dsl-kit-macros` — `#[dsl_exec(call(..))]` can now name the effect's
   payload, so a derived DSL can hand its arguments to the host:
   `call(label, payload)` serialises every non-recursive field except
