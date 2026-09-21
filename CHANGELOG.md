@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `dsl-kit-parse` — `schema_gen` no longer lets a required argument be
+  omitted when a variant has optional payload fields. The free-order
+  argument list (whole list optional, every argument an alternative)
+  is now used only when *every* argument may be absent; otherwise
+  required arguments are mandatory at their schema position and each
+  omittable one — an optional field, or an `Optional` / `Many` / `Map`
+  slot not declared `non_empty` — is an optional clause at its own
+  position. `In()` for `In { field: String, values: Vec<String> }` is
+  a parse error instead of a later conformance failure, and
+  `example_gen`'s minimal examples for such variants build by
+  construction (they used to synthesize the empty argument list).
+  Optional arguments can still be omitted; they can no longer be
+  reordered.
+
 ### Added
 
 - `dsl-kit-parse` — new `dump` module: `DslDump`, the inverse of

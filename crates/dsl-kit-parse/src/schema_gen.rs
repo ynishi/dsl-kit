@@ -43,6 +43,16 @@
 //!   variant, rather than silently dropping the variant from the
 //!   grammar — unless a [`SyntaxOverrides`] entry supplies its value
 //!   production.
+//! - **Optional payload fields** (`Option<T>` / `Vec<T>`, i.e.
+//!   [`FieldSchema::optional`](dsl_kit_schema::FieldSchema::optional))
+//!   — may be omitted, at their schema position: `Row(name: "x")` and
+//!   `Row(name: "x", tags: ["a"])` both parse for
+//!   `Row { name: String, tags: Vec<String> }`. Required arguments are
+//!   enforced by the grammar itself, so `Row()` is a parse error, not
+//!   a later conformance failure — which keeps
+//!   [`example_gen`](crate::example_gen)'s synthesized examples
+//!   conformant by construction. A variant whose arguments are *all*
+//!   optional accepts them in any order.
 //!
 //! # Syntax overrides
 //!
@@ -470,77 +480,99 @@ fn check_scalar_shorthands(
     diags
 }
 
-/// Builds the rule for one variant. Two shapes:
+/// Builds the rule for one variant. Three shapes, all keeping schema
+/// order (payload fields, then child slots):
 ///
-/// - **Strict-order** (default, variant has no optional fields):
-///   `%kw:V "(" arg ("," arg)* ")"` with arguments emitted in schema
-///   order (fields, then children). Preserves the pre-0.3 canonical
-///   spelling for variants that never omit.
-/// - **Free-order** (variant has ≥ 1 optional field): `%kw:V "(" (arg
-///   ("," arg)*)? ")"` where each arg is `arg_1 | arg_2 | ...` and
-///   every alternative carries its own `%kw:name` prefix. Args are
-///   distinguishable by that name-keyword, so the DSL author may
-///   omit any subset of optional arguments (or even all of them),
-///   and `check_conformance` remains the authority on required /
-///   duplicate / unknown-slot diagnostics.
+/// - **Strict** (no optional fields): `%kw:V "(" arg ("," arg)* ")"`.
+///   Preserves the pre-0.3 canonical spelling for variants that never
+///   omit.
+/// - **Mixed** (some optional fields, at least one required argument):
+///   an argument is *omittable* exactly when `check_conformance`
+///   accepts its absence — an optional payload field, or an `Optional`
+///   / `Many` / `Map` child slot not declared `non_empty`. Required
+///   arguments stay mandatory at their position; each omittable one
+///   becomes an optional clause at *its* position with the separating
+///   comma folded in — `("," name ":" value)?` after a required
+///   argument, `(name ":" value ",")?` before the first one. The
+///   grammar itself rejects a missing required argument, so
+///   `example_gen`'s minimal derivation conforms by construction.
+/// - **All-omittable** (every argument may be absent): `%kw:V "(" (arg
+///   ("," arg)*)? ")"` where `arg` is `arg_1 | arg_2 | ...`, each
+///   alternative carrying its own `%kw:name` prefix. Nothing is
+///   required, so the free-order list is exact.
+///
+/// Child slots count as omittable only once a variant has an optional
+/// payload field: the strict shape keeps `items: []` / `body: none`
+/// mandatory, as it always has. `check_conformance` remains the
+/// authority on duplicate / unknown slot diagnostics in every shape.
 fn variant_rule(v: &VariantSchema, ids: &IdGen, overrides: &SyntaxOverrides) -> Peg {
-    let has_optional = v.fields.iter().any(|f| f.optional);
-    let mut args: Vec<Peg> = Vec::new();
-    for f in &v.fields {
-        let value = resolved_field_value_peg(&v.name, f, ids, overrides)
-            .expect("unsupported field types were rejected before rule generation");
-        args.push(seq(
-            ids,
-            vec![
-                token(ids, format!("%kw:{}", f.name)),
-                token(ids, ":"),
-                field(ids, f.name.clone(), value),
-            ],
-        ));
-    }
-    for c in &v.children {
-        args.push(child_arg_peg(c, ids));
-    }
+    // `(argument production, omittable?)` in schema order.
+    let build_args = |ids: &IdGen| -> Vec<(Peg, bool)> {
+        let mut args = Vec::new();
+        for f in &v.fields {
+            let value = resolved_field_value_peg(&v.name, f, ids, overrides)
+                .expect("unsupported field types were rejected before rule generation");
+            let arg = seq(
+                ids,
+                vec![
+                    token(ids, format!("%kw:{}", f.name)),
+                    token(ids, ":"),
+                    field(ids, f.name.clone(), value),
+                ],
+            );
+            args.push((arg, f.optional));
+        }
+        for c in &v.children {
+            let omittable = matches!(
+                c.multiplicity,
+                Multiplicity::Optional | Multiplicity::Many | Multiplicity::Map
+            ) && !c.non_empty;
+            args.push((child_arg_peg(c, ids), omittable));
+        }
+        args
+    };
+    let args = build_args(ids);
+    let has_optional_field = v.fields.iter().any(|f| f.optional);
+    let any_required = args.iter().any(|(_, opt)| !*opt);
 
     let mut items = vec![token(ids, format!("%kw:{}", v.name)), token(ids, "(")];
-    if has_optional && !args.is_empty() {
-        // Free-order: any of the argument shapes, comma-separated,
-        // whole list optional. Each argument-slot is a Field capture
-        // in its own right (built above), and the name-keyword prefix
-        // keeps the alternation unambiguous at the byte level.
-        let arg_choice = choice(ids, args);
-        // The tail repeats `("," arg_choice)`; we rebuild arg_choice
-        // per position so each Choice node gets a fresh id (Peg nodes
-        // are id-unique in a grammar).
-        let tail_alt = |ids: &IdGen| -> Peg {
-            let mut alts: Vec<Peg> = Vec::new();
-            for f in &v.fields {
-                let value = resolved_field_value_peg(&v.name, f, ids, overrides)
-                    .expect("unsupported field types were rejected before rule generation");
-                alts.push(seq(
-                    ids,
-                    vec![
-                        token(ids, format!("%kw:{}", f.name)),
-                        token(ids, ":"),
-                        field(ids, f.name.clone(), value),
-                    ],
-                ));
-            }
-            for c in &v.children {
-                alts.push(child_arg_peg(c, ids));
-            }
-            choice(ids, alts)
-        };
-        let tail = repeat(ids, seq(ids, vec![token(ids, ","), tail_alt(ids)]), 0, None);
-        let full = seq(ids, vec![arg_choice, tail]);
-        items.push(repeat(ids, full, 0, Some(1)));
-    } else {
-        for (i, arg) in args.into_iter().enumerate() {
+    if !has_optional_field {
+        // Strict.
+        for (i, (arg, _)) in args.into_iter().enumerate() {
             if i > 0 {
                 items.push(token(ids, ","));
             }
             items.push(arg);
         }
+    } else if any_required {
+        // Mixed: optional clauses carry their own comma, on the side
+        // facing the nearest required argument.
+        let mut seen_required = false;
+        for (arg, optional) in args {
+            if optional {
+                let clause = if seen_required {
+                    seq(ids, vec![token(ids, ","), arg])
+                } else {
+                    seq(ids, vec![arg, token(ids, ",")])
+                };
+                items.push(repeat(ids, clause, 0, Some(1)));
+            } else {
+                if seen_required {
+                    items.push(token(ids, ","));
+                }
+                items.push(arg);
+                seen_required = true;
+            }
+        }
+    } else {
+        // All-omittable: free-order list. The tail repeats `("," arg)`;
+        // arguments are rebuilt per position so each Peg node gets a
+        // fresh id (nodes are id-unique in a grammar).
+        let head = choice(ids, args.into_iter().map(|(a, _)| a).collect());
+        let tail_alt = choice(ids, build_args(ids).into_iter().map(|(a, _)| a).collect());
+        let tail = repeat(ids, seq(ids, vec![token(ids, ","), tail_alt]), 0, None);
+        let full = seq(ids, vec![head, tail]);
+        items.push(repeat(ids, full, 0, Some(1)));
     }
     items.push(token(ids, ")"));
 
@@ -1460,6 +1492,124 @@ mod tests {
                 "conformance clean for {t:?}",
             );
         }
+    }
+
+    /// Mixed shape: a required field next to optional ones. The
+    /// grammar itself enforces the required argument (no reliance on
+    /// `check_conformance`), optional arguments may be omitted at
+    /// their position, and the synthesized minimal example conforms.
+    #[test]
+    fn mixed_required_and_optional_fields_keep_required_in_the_grammar() {
+        let schema = NodeSchema {
+            name: "Q".into(),
+            variants: vec![VariantSchema {
+                name: "In".into(),
+                fields: vec![
+                    FieldSchema::required("field", "String"),
+                    FieldSchema::optional("values", "Vec<String>"),
+                ],
+                children: vec![],
+            }],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new()).expect("generates");
+        for ok in [
+            r#"In(field: "x")"#,
+            r#"In(field: "x", values: [])"#,
+            r#"In(field: "x", values: ["a", "b"])"#,
+        ] {
+            let t = g.parse(ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
+            assert!(check_conformance(&t, &schema).is_empty(), "{ok}");
+        }
+        // The required argument is a grammar-level obligation now.
+        let err = g.parse("In()").expect_err("required field omitted");
+        assert!(
+            err.diagnostics
+                .iter()
+                .all(|d| d.code == crate::peg::codes::UNEXPECTED),
+            "{:?}",
+            err.diagnostics
+        );
+        // Optional arguments live at their schema position; reordering
+        // is not part of the canonical spelling.
+        assert!(g.parse(r#"In(values: ["a"], field: "x")"#).is_err());
+
+        let ex = crate::example_gen::examples_from_grammar(&g).expect("examples");
+        assert_eq!(ex.per_rule[0].text, r#"In(field: "example")"#);
+        let t = g
+            .parse(&ex.per_rule[0].text)
+            .expect("minimal example parses");
+        assert!(check_conformance(&t, &schema).is_empty());
+    }
+
+    /// Mixed shape with the optional field *before* the required one
+    /// and a child slot after: the optional clause carries a trailing
+    /// comma, the child stays mandatory.
+    #[test]
+    fn mixed_shape_with_leading_optional_and_child_slot() {
+        let schema = NodeSchema {
+            name: "Q".into(),
+            variants: vec![
+                VariantSchema {
+                    name: "Row".into(),
+                    fields: vec![
+                        FieldSchema::optional("description", "Option<String>"),
+                        FieldSchema::required("name", "String"),
+                    ],
+                    children: vec![ChildSchema::recursive("items", Multiplicity::Many)],
+                },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
+            ],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new()).expect("generates");
+        for ok in [
+            r#"Row(name: "x", items: [])"#,
+            r#"Row(name: "x")"#,
+            r#"Row(description: "d", name: "x", items: [Unit()])"#,
+            r#"Row(description: none, name: "x", items: [])"#,
+        ] {
+            let t = g.parse(ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
+            assert!(check_conformance(&t, &schema).is_empty(), "{ok}");
+        }
+        assert!(g.parse(r#"Row(description: "d", items: [])"#).is_err());
+        let ex = crate::example_gen::examples_from_grammar(&g).expect("examples");
+        assert_eq!(ex.per_rule[0].text, r#"Row(name: "example")"#);
+    }
+
+    /// A `non_empty` child slot next to an optional field is required
+    /// by the grammar: its absence is a conformance failure, so the
+    /// mixed shape must not let it be omitted.
+    #[test]
+    fn non_empty_child_slot_is_required_in_the_mixed_shape() {
+        let mut items = ChildSchema::recursive("items", Multiplicity::Many);
+        items.non_empty = true;
+        let schema = NodeSchema {
+            name: "Q".into(),
+            variants: vec![
+                VariantSchema {
+                    name: "All".into(),
+                    fields: vec![FieldSchema::optional("label", "Option<String>")],
+                    children: vec![items],
+                },
+                VariantSchema {
+                    name: "Unit".into(),
+                    fields: vec![],
+                    children: vec![],
+                },
+            ],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new()).expect("generates");
+        assert!(g.parse("All(items: [Unit()])").is_ok());
+        assert!(g.parse(r#"All(label: "l", items: [Unit()])"#).is_ok());
+        assert!(g.parse("All()").is_err());
+        assert!(g.parse(r#"All(label: "l")"#).is_err());
+        let ex = crate::example_gen::examples_from_grammar(&g).expect("examples");
+        assert_eq!(ex.per_rule[0].text, "All(items: [Unit()])");
+        let t = g.parse(&ex.per_rule[0].text).unwrap();
+        assert!(check_conformance(&t, &schema).is_empty());
     }
 
     #[test]
