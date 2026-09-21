@@ -1,0 +1,43 @@
+# Pull-request gate. Two jobs:
+#
+# - `commits`: every commit header the PR adds is a Conventional Commit
+#   (same check as the local `commit-msg` hook, via .githooks/lint-range).
+#   Merges are rebase-only, so these headers land on main verbatim and
+#   drive release-plz's version bump and changelog.
+# - `test`: fmt / clippy / tests for the whole workspace.
+#
+# cargo-dist's `plan` job (release.yml) also runs on pull requests.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  commits:
+    name: Conventional commit headers
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Lint headers in the PR range
+        run: ./.githooks/lint-range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  test:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
