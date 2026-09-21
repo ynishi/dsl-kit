@@ -126,7 +126,7 @@ crate.
 | `dsl-kit` | facade — re-exports the kit surface |
 | `dsl-kit-core` | engine: frames, fan-out, cancellation, events, breakpoints, drive |
 | `dsl-kit-macros` | `#[derive(DslNode)]` / `#[derive(DslSchema)]` / `#[derive(DslBuild)]` / `#[derive(DslExec)]` |
-| `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients |
+| `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients; JSON Schema export |
 | `dsl-kit-parse` | `ParseTree`, conformance, JSON bridge, PEG interpreter, grammar generation, example synthesis |
 | `dsl-kit-lint` | walk-driven, schema-aware, author-extensible lints |
 | `dsl-kit-mcp` | stdio MCP framework over any `DslHost` |
@@ -137,6 +137,7 @@ crate.
 cargo run -p expr-example   # expression DSL: text + JSON round trips, schema-generated grammar
 cargo run -p flow-example   # orchestration DSL: fan-out, value-gated Branch, breakpoints, drive layer, text round trip
 cargo run -p cfg-example    # configuration DSL: keyed child slots (BTreeMap), override folds, host-resolved references
+cargo run -p query-example  # IR + parser only: a Web API query language, OpenAPI doc, SQL lowering — no engine
 ```
 
 The examples double as reference implementations: `flow-dsl` shows the
@@ -145,6 +146,30 @@ the plain derive-only path end to end, and `cfg-dsl` shows keyed child
 slots — named children rather than positional ones — through both
 front-ends and over MCP (see
 [examples/cfg-example](examples/cfg-example/README.md)).
+
+## IR + parser only
+
+The engine is optional. A DSL that is really an *interface* — a query
+language for a Web API, a configuration format, a request schema — can
+stop at the typed AST: derive `DslNode + DslSchema + DslBuild +
+DslDump`, and the kit still supplies both front-ends, conformance, the
+canonical dump, machine-derived examples, and the schema in the
+standard dialect:
+
+```rust
+use dsl_kit_schema::json_schema::{RefStyle, TypeMap};
+
+// JSON Schema 2020-12 of the JSON front-end's document shape — one
+// `oneOf` arm per variant, `type` pinned, recursion through `$ref`.
+// It is rendered from the same derived schema the parser enforces,
+// so a published OpenAPI contract cannot drift from the enum.
+let component = Query::schema().to_json_schema(&TypeMap::new(), RefStyle::OpenApiComponent)?;
+```
+
+Whatever consumes the typed AST afterwards is yours — `query-example`
+lowers it to a parameterized SQL `WHERE` clause and serves the schema
+as an OpenAPI request body (see
+[examples/query-example](examples/query-example/README.md)).
 
 ## Documentation
 

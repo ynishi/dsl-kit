@@ -21,3 +21,6 @@ serde_json = "1"
 
 [dev-dependencies]
 dsl-kit-fuzzy = { workspace = true }
+# Pins the accept / reject agreement between `serde_bridge` and the
+# JSON Schema `dsl-kit-schema` renders (tests/json_schema_agreement.rs).
+jsonschema = { version = "0.56", default-features = false }

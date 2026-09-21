@@ -12,7 +12,10 @@
 //! The shape is intentionally small and self-contained — no external
 //! JSON-Schema tool feeds it, no runtime introspection re-derives it.
 //! Consumers walk [`NodeSchema`] directly or serialize it with
-//! [`NodeSchema::to_json`].
+//! [`NodeSchema::to_json`]. For an external interface — an OpenAPI
+//! request body, editor validation, a structured-output schema —
+//! [`NodeSchema::to_json_schema`] renders the standard JSON Schema
+//! dialect of the JSON front-end's document shape ([`json_schema`]).
 //!
 //! ## Example
 //!
@@ -29,6 +32,8 @@
 #![warn(missing_docs)]
 
 use serde_json::{Value, json};
+
+pub mod json_schema;
 
 /// Compile-time schema reflection contract for a DSL AST type.
 ///

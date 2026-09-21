@@ -7,7 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `dsl-kit-parse` — `schema_gen` no longer lets a required argument be
+  omitted when a variant has optional payload fields. The free-order
+  argument list (whole list optional, every argument an alternative)
+  is now used only when *every* argument may be absent; otherwise
+  required arguments are mandatory at their schema position and each
+  omittable one — an optional field, or an `Optional` / `Many` / `Map`
+  slot not declared `non_empty` — is an optional clause at its own
+  position. `In()` for `In { field: String, values: Vec<String> }` is
+  a parse error instead of a later conformance failure, and
+  `example_gen`'s minimal examples for such variants build by
+  construction (they used to synthesize the empty argument list).
+  Optional arguments can still be omitted; they can no longer be
+  reordered.
+- `dsl-kit-parse` — `example_gen` renders `%str_raw` (the built-in
+  `Vec<String>` production) as a string literal instead of leaking the
+  token name into the example, and reports any other unknown `%`
+  pattern with the new `example_gen::unknown_token` diagnostic.
+
 ### Added
+
+- `dsl-kit-schema` — new `json_schema` module:
+  `NodeSchema::to_json_schema(&TypeMap, RefStyle)` renders the JSON
+  front-end's document shape as JSON Schema 2020-12 — one `oneOf` arm
+  per variant with `type` pinned by `const`, `additionalProperties:
+  false`, `required` from the conformance rules, payload fields
+  through the built-in mapping (`String` / integers / `bool` /
+  `Option<..>` / `Vec<String>`) or a caller-supplied `TypeMap`, child
+  slots by multiplicity (`non_empty` → `minItems` / `minProperties`
+  + required), declared scalar shorthands as extra alternatives.
+  `RefStyle::Defs` wraps a standalone document; `OpenApiComponent`
+  yields the bare union for `components.schemas`. An unmapped payload
+  type is a loud `Error::UnsupportedField`. A `dsl-kit-parse`
+  integration test pins accept / reject agreement with `serde_bridge`.
+- `query-example` — the "IR + parser only" reference: a query DSL as a
+  Web API query language, received as a JSON body or a `?q=` text
+  parameter, documented through an OpenAPI 3.1 document built on
+  `to_json_schema`, lowered to a parameterized SQL `WHERE` clause. No
+  engine, no MCP. Its `Eq.value` shows the heterogeneous-scalar hook
+  pair (`SyntaxOverrides` + `#[dsl_build(with)]` /
+  `#[dsl_dump(with)]` + `TypeMap`) in the parser-only setting.
 
 - `dsl-kit-parse` — new `dump` module: `DslDump`, the inverse of
   `DslBuild`. A typed AST re-emits the `ParseTree` shape its own build

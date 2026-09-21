@@ -24,6 +24,7 @@ members = [
     "examples/cfg-example/crates/cfg-host",
     "examples/cfg-example/crates/cfg-mcp",
     "examples/custom-mcp-example",
+    "examples/query-example",
 ]
 
 [workspace.package]
