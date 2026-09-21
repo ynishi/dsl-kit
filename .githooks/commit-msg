@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# git commit-msg hook — installed by `just setup` (core.hooksPath=.githooks).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=conventional.sh
+source "$here/conventional.sh"
+header="$(sed -n '1p' "$1")"
+if ! check_header "$header"; then
+  explain_header "$header"
+  exit 1
+fi

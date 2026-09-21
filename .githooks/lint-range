@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Lint every commit header in a git range: `lint-range <base>..<head>`.
+# Used by CI on pull requests and by `just lint-commits`.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=conventional.sh
+source "$here/conventional.sh"
+range="${1:?usage: lint-range <base>..<head>}"
+bad=0
+while IFS= read -r line; do
+  sha="${line%% *}"; header="${line#* }"
+  if check_header "$header"; then
+    echo "ok    $sha $header"
+  else
+    echo "BAD   $sha $header"
+    explain_header "$header"
+    bad=1
+  fi
+done < <(git log --no-merges --format='%h %s' "$range")
+exit $bad
