@@ -39,6 +39,10 @@ pub mod codes {
     pub const NO_FINITE_DERIVATION: &str = "dsl_kit::example_gen::no_finite_derivation";
     /// A `RuleRef` names a rule the grammar does not define.
     pub const UNKNOWN_RULE: &str = "dsl_kit::example_gen::unknown_rule";
+    /// A `Token` uses a `%`-prefixed pattern this module has no input
+    /// text for. Reported rather than rendered verbatim, so a new PEG
+    /// primitive cannot silently leak its own name into an example.
+    pub const UNKNOWN_TOKEN: &str = "dsl_kit::example_gen::unknown_token";
 }
 
 /// Rich-mode depth budget used by [`examples_from_grammar`] for the
@@ -196,7 +200,7 @@ impl<'g> Synth<'g> {
     fn emit(&self, peg: &Peg, rich_depth: u32, out: &mut Vec<String>) -> Result<(), BuildError> {
         match peg {
             Peg::Token { pat, .. } => {
-                out.push(token_input(pat));
+                out.push(token_input(pat)?);
                 Ok(())
             }
             Peg::Seq { items, .. } => {
@@ -264,7 +268,7 @@ impl<'g> Synth<'g> {
     ) -> Result<(), BuildError> {
         match peg {
             Peg::Token { pat, .. } => {
-                out.push(keyed_token_input(pat, n));
+                out.push(keyed_token_input(pat, n)?);
                 Ok(())
             }
             Peg::Seq { items, .. } => {
@@ -380,26 +384,39 @@ fn peg_cost(peg: &Peg, costs: &HashMap<String, u64>) -> u64 {
 /// Only the two key spellings `schema_gen` emits are disambiguated;
 /// every other pattern (a literal separator like `:`) renders as
 /// usual.
-fn keyed_token_input(pat: &str, n: u32) -> String {
+fn keyed_token_input(pat: &str, n: u32) -> Result<String, BuildError> {
     match pat {
-        "%str" => format!("\"key{n}\""),
-        "%ident" => format!("key{n}"),
+        "%str" | "%str_raw" => Ok(format!("\"key{n}\"")),
+        "%ident" => Ok(format!("key{n}")),
         other => token_input(other),
     }
 }
 
 /// Input text matching one token pattern.
-fn token_input(pat: &str) -> String {
+///
+/// Every `%` primitive the PEG runtime defines has an entry here;
+/// `%str_raw` matches exactly like `%str` and only differs in what it
+/// *contributes* downstream, so it renders the same. A `%` pattern with
+/// no entry is a [`codes::UNKNOWN_TOKEN`] error — the alternative,
+/// emitting the pattern name as text, would produce an example the
+/// grammar itself rejects.
+fn token_input(pat: &str) -> Result<String, BuildError> {
     if let Some(kw) = pat.strip_prefix("%kw:") {
-        return kw.to_string();
+        return Ok(kw.to_string());
     }
-    match pat {
+    Ok(match pat {
         "%int" => "1".to_string(),
-        "%str" => "\"example\"".to_string(),
+        "%str" | "%str_raw" => "\"example\"".to_string(),
         "%ident" => "x".to_string(),
         "%ws" => " ".to_string(),
+        unknown if unknown.starts_with('%') => {
+            return Err(BuildError::single(Diagnostic::error(
+                codes::UNKNOWN_TOKEN,
+                format!("token pattern `{unknown}` has no example input text"),
+            )));
+        }
         literal => literal.to_string(),
-    }
+    })
 }
 
 /// Joins tokens with canonical-syntax spacing: no space before
@@ -672,6 +689,58 @@ mod tests {
             "composite has child structure: {}",
             ex.composite
         );
+    }
+
+    /// `%str_raw` (the built-in `Vec<String>` production and any
+    /// `SyntaxOverrides` entry that wants quotes preserved) renders
+    /// like `%str`; the synthesized text must parse and conform, not
+    /// carry the token name.
+    #[test]
+    fn str_raw_token_renders_as_a_string_literal() {
+        let schema = NodeSchema {
+            name: "Meta".into(),
+            variants: vec![VariantSchema {
+                name: "Row".into(),
+                fields: vec![
+                    FieldSchema::required("name", "String"),
+                    FieldSchema::optional("tags", "Vec<String>"),
+                ],
+                children: vec![],
+            }],
+        };
+        let g = checked_grammar_from_schema(&schema, &IdGen::new()).unwrap();
+        let ex = examples_from_grammar(&g).unwrap();
+        // Rich mode expands the optional `tags` list, reaching `%str_raw`.
+        assert_eq!(
+            ex.composite,
+            "Row(name: \"example\", tags: [\"example\", \"example\", \"example\"])"
+        );
+        for text in ex.per_rule.iter().map(|e| &e.text).chain([&ex.composite]) {
+            assert!(!text.contains("%str_raw"), "{text}");
+            let tree = g.parse(text).unwrap_or_else(|e| panic!("`{text}`: {e:?}"));
+            assert!(check_conformance(&tree, &schema).is_empty(), "{text}");
+        }
+    }
+
+    /// A `%` pattern this module has no input text for is a diagnostic,
+    /// not text — otherwise the token name would leak into an example
+    /// the grammar rejects.
+    #[test]
+    fn unknown_token_pattern_is_a_diagnostic() {
+        use crate::peg::{Grammar, field, node, rule, token};
+        let ids = IdGen::new();
+        let g = Grammar::new(
+            vec![rule(
+                &ids,
+                "Lit",
+                node(&ids, "Lit", field(&ids, "value", token(&ids, "%float"))),
+            )],
+            "Lit",
+        );
+        let err = examples_from_grammar(&g).expect_err("unknown token");
+        assert_eq!(err.diagnostics.len(), 1);
+        assert_eq!(err.diagnostics[0].code, codes::UNKNOWN_TOKEN);
+        assert!(err.diagnostics[0].message.contains("%float"));
     }
 
     #[test]

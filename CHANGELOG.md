@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction (they used to synthesize the empty argument list).
   Optional arguments can still be omitted; they can no longer be
   reordered.
+- `dsl-kit-parse` — `example_gen` renders `%str_raw` (the built-in
+  `Vec<String>` production) as a string literal instead of leaking the
+  token name into the example, and reports any other unknown `%`
+  pattern with the new `example_gen::unknown_token` diagnostic.
 
 ### Added
 
