@@ -1,0 +1,25 @@
+[package]
+name = "query-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "IR + parser only: a query DSL exposed as a Web API query language (JSON body / text param), documented via OpenAPI, lowered to SQL. No engine, no MCP."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "query-example"
+path = "src/main.rs"
+
+[dependencies]
+dsl-kit-core   = { workspace = true }
+dsl-kit-macros = { workspace = true }
+dsl-kit-schema = { workspace = true }
+dsl-kit-parse  = { workspace = true }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+
+[dev-dependencies]
+jsonschema = { version = "0.56", default-features = false }

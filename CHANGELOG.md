@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   yields the bare union for `components.schemas`. An unmapped payload
   type is a loud `Error::UnsupportedField`. A `dsl-kit-parse`
   integration test pins accept / reject agreement with `serde_bridge`.
+- `query-example` — the "IR + parser only" reference: a query DSL as a
+  Web API query language, received as a JSON body or a `?q=` text
+  parameter, documented through an OpenAPI 3.1 document built on
+  `to_json_schema`, lowered to a parameterized SQL `WHERE` clause. No
+  engine, no MCP. Its `Eq.value` shows the heterogeneous-scalar hook
+  pair (`SyntaxOverrides` + `#[dsl_build(with)]` /
+  `#[dsl_dump(with)]` + `TypeMap`) in the parser-only setting.
+
 - `dsl-kit-parse` — new `dump` module: `DslDump`, the inverse of
   `DslBuild`. A typed AST re-emits the `ParseTree` shape its own build
   derive accepts (`to_parse_tree` / `to_parse_tree_with(&AllowTable)`,
