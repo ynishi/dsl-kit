@@ -126,7 +126,7 @@ crate.
 | `dsl-kit` | facade — re-exports the kit surface |
 | `dsl-kit-core` | engine: frames, fan-out, cancellation, events, breakpoints, drive |
 | `dsl-kit-macros` | `#[derive(DslNode)]` / `#[derive(DslSchema)]` / `#[derive(DslBuild)]` / `#[derive(DslExec)]` |
-| `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients |
+| `dsl-kit-schema` | type-level schema consumed by parsers, editors, AI clients; JSON Schema export |
 | `dsl-kit-parse` | `ParseTree`, conformance, JSON bridge, PEG interpreter, grammar generation, example synthesis |
 | `dsl-kit-lint` | walk-driven, schema-aware, author-extensible lints |
 | `dsl-kit-mcp` | stdio MCP framework over any `DslHost` |

@@ -29,6 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `dsl-kit-schema` — new `json_schema` module:
+  `NodeSchema::to_json_schema(&TypeMap, RefStyle)` renders the JSON
+  front-end's document shape as JSON Schema 2020-12 — one `oneOf` arm
+  per variant with `type` pinned by `const`, `additionalProperties:
+  false`, `required` from the conformance rules, payload fields
+  through the built-in mapping (`String` / integers / `bool` /
+  `Option<..>` / `Vec<String>`) or a caller-supplied `TypeMap`, child
+  slots by multiplicity (`non_empty` → `minItems` / `minProperties`
+  + required), declared scalar shorthands as extra alternatives.
+  `RefStyle::Defs` wraps a standalone document; `OpenApiComponent`
+  yields the bare union for `components.schemas`. An unmapped payload
+  type is a loud `Error::UnsupportedField`. A `dsl-kit-parse`
+  integration test pins accept / reject agreement with `serde_bridge`.
 - `dsl-kit-parse` — new `dump` module: `DslDump`, the inverse of
   `DslBuild`. A typed AST re-emits the `ParseTree` shape its own build
   derive accepts (`to_parse_tree` / `to_parse_tree_with(&AllowTable)`,
